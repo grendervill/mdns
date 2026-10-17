@@ -46,6 +46,11 @@ cd "$(dirname "$0")/.."
 PROJECT=mdns-e2e-pebble
 COMPOSE=(docker compose -p "$PROJECT" -f e2e/pebble/docker-compose.yml)
 CERT_WAIT=60
+# HEAL_WAIT bounds the self-heal phases (B and D): autocert keeps the
+# failed state for createCertRetryAfter (1 minute), so a transient
+# failure floors the next attempt at ~60s — the window has to exceed
+# that, not just the daemon's own MDNS_ACME_BACKOFF_MIN/MAX (5s/30s).
+HEAL_WAIT=120
 
 # The linux binary is built here, exactly like scripts/docker-smoke.sh
 # does, so the test does not depend on a Makefile target.
@@ -494,8 +499,8 @@ CLIENT
   # bound is ~1 minute from the daemon start regardless of the backoff.
   # The retry loop here is 1s, so the certificate appears within a
   # second of that state expiring.
-  echo "--- wait for the certificate to appear on its own (self-heal, <= 120s) ---"
-  if ! wait_tls_verified 120; then
+  echo "--- wait for the certificate to appear on its own (self-heal, <= ${HEAL_WAIT}s) ---"
+  if ! wait_tls_verified "$HEAL_WAIT"; then
     echo "the daemon did not heal itself; last attempt:" >&2
     cat /tmp/e2e-pebble-cert.log >&2
     echo "--- status API ---" >&2
@@ -647,8 +652,13 @@ cat /tmp/put.json; echo
 grep -q '"status":"applied"' /tmp/put.json
 CLIENT
 
-  echo "--- the :443 handshake now verifies against the pebble root (<= 60s) ---"
-  if ! wait_tls_verified 60; then
+  # Same bound as phase B: if the first post-switch order fails
+  # transiently (TLS-ALPN-01 validation is the flaky part, and pebble
+  # retries authz/order itself), autocert keeps the failed state for
+  # createCertRetryAfter (1 minute), so the next attempt is floored at
+  # ~60s — the window has to cover that floor, not just the backoff.
+  echo "--- the :443 handshake now verifies against the pebble root (<= ${HEAL_WAIT}s) ---"
+  if ! wait_tls_verified "$HEAL_WAIT"; then
     echo "the switched daemon did not serve a pebble certificate; last attempt:" >&2
     cat /tmp/e2e-pebble-cert.log >&2
     echo "--- status API ---" >&2
