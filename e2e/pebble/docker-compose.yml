@@ -11,14 +11,18 @@
 # against an unresolvable name would cost a multi-minute backoff).
 # scripts/e2e-pebble.sh picks a subnet that no existing network uses.
 #
-# Both images are deliberately unpinned: the e2e follows the current
-# pebble release, which is what catches client-side protocol drift.
+# Both images are deliberately unpinned and pulled on every run
+# (pull_policy: always), so the e2e always exercises the current pebble
+# release instead of a stale cached image.
 
 services:
   # Authoritative DNS for the test domain (and the management API the
   # script uses to aim mdns.test at the daemon container).
   challtestsrv:
     image: ghcr.io/letsencrypt/pebble-challtestsrv
+    # Always pull: the e2e must run against the current release, not a
+    # stale cached image.
+    pull_policy: always
     # No AAAA by default: pebble must not pick a broken IPv6 path.
     command: ["-defaultIPv6", ""]
     ports:
@@ -31,6 +35,9 @@ services:
   # 443 and http-01 to 80.
   pebble:
     image: ghcr.io/letsencrypt/pebble
+    # Always pull: the e2e must run against the current release, not a
+    # stale cached image.
+    pull_policy: always
     depends_on:
       - challtestsrv
     command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "challtestsrv:8053"]

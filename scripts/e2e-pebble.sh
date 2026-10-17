@@ -72,6 +72,15 @@ export E2E_SUBNET E2E_DAEMON_IP
 cleanup() {
   status=$?
   echo
+  if [ "$status" -ne 0 ]; then
+    # Keep the evidence: the containers are about to be removed, so a
+    # failure anywhere (probe, DoH, status API) still leaves readable
+    # logs behind.
+    echo "--- post-mortem (exit $status) ---"
+    "${COMPOSE[@]}" logs --tail 40 daemon >&2 || true
+    "${COMPOSE[@]}" logs --tail 40 pebble >&2 || true
+    "${COMPOSE[@]}" logs --tail 20 client >&2 || true
+  fi
   echo "--- teardown ---"
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   exit "$status"
@@ -174,11 +183,13 @@ daemon_log=$("${COMPOSE[@]}" logs daemon 2>&1)
 printf '%s\n' "$daemon_log" | grep 'DoH listening for ACME TLS-ALPN-01 ahead of the certificate'
 eager_line=$(printf '%s\n' "$daemon_log" | grep -n 'DoH listening for ACME TLS-ALPN-01' | head -1 | cut -d: -f1)
 
-# Wait for the certificate so the DoT/DoQ lines exist, then check that
-# they came after the eager 443 listener. Note that the readiness gate
-# opens on the first successful certificate lookup, which is the
-# TLS-ALPN-01 challenge handshake itself: what the ordering proves is
-# that DoT/DoQ were down while the daemon had no certificate at all.
+# Wait for the DoT/DoQ lines, then check that they came after the eager
+# 443 listener. The readiness gate opens on a real serving-certificate
+# lookup (the TLS-ALPN-01 challenge handshake no longer counts, see
+# commit 3c07edf), so the ordering also shows the listeners coming up
+# with the certificate: both "acme: certificate ready" and
+# "app: TLS listeners started mode=acme issuer=…" carry the CA issuer,
+# while the eager 443 listener logged ahead of the certificate.
 for _ in $(seq 1 "$CERT_WAIT"); do
   printf '%s\n' "$("${COMPOSE[@]}" logs daemon 2>&1)" | grep -q 'DoT listening' && break
   sleep 1
@@ -263,35 +274,47 @@ echo "$out"
 CLIENT
 
 echo "--- DoT (kdig +tls, :853) ---"
-# kdig is the reference client; when it cannot handshake with the CA's
-# certificate (GnuTLS rejects pebble's empty-subject leaves), the probe
-# performs the same verified query with crypto/tls.
-kdig_out=$("${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
+# kdig is the reference client, and it counts as the result only when it
+# exits 0 *and* prints an answer line: the query is "example.com A", so a
+# bare IP address is the expected shape. Anything else — a FATAL from an
+# unsupported flag, a GnuTLS refusal of the CA's certificate, a missing
+# binary, an empty reply — falls back to the probe, which makes the same
+# verified query with crypto/tls.
+if kdig_out=$("${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
 set -uo pipefail
 kdig @daemon -p 853 +tls +tls-ca=/tmp/pebble-root.pem +tls-hostname=mdns.test \
   +timeout=5 example.com A +short 2>&1
 CLIENT
-) || true
-if [ -n "$kdig_out" ] && ! printf '%s\n' "$kdig_out" | grep -q 'ERROR'; then
+); then
+  kdig_status=0
+else
+  kdig_status=$?
+fi
+if [ "$kdig_status" -eq 0 ] && printf '%s\n' "$kdig_out" | grep -qE '^[0-9a-fA-F:.]+$'; then
   printf '%s\n' "$kdig_out"
 else
-  echo "kdig could not handshake; falling back to the probe:"
-  printf '%s\n' "$kdig_out" | grep -E 'WARNING|ERROR' | head -2
+  echo "kdig did not answer (exit status $kdig_status); falling back to the probe:"
+  printf '%s\n' "$kdig_out" | grep -E 'FATAL|WARNING|ERROR' | head -2 || true
   probe_retry dot
 fi
 
 echo "--- DoQ (kdig +quic, :853/udp) ---"
-kdig_out=$("${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
+# Same success criterion as DoT: exit status 0 plus an answer line.
+if kdig_out=$("${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
 set -uo pipefail
 kdig @daemon -p 853 +quic +tls-ca=/tmp/pebble-root.pem +tls-hostname=mdns.test \
   +timeout=5 example.com A +short 2>&1
 CLIENT
-) || true
-if [ -n "$kdig_out" ] && ! printf '%s\n' "$kdig_out" | grep -q 'ERROR'; then
+); then
+  kdig_status=0
+else
+  kdig_status=$?
+fi
+if [ "$kdig_status" -eq 0 ] && printf '%s\n' "$kdig_out" | grep -qE '^[0-9a-fA-F:.]+$'; then
   printf '%s\n' "$kdig_out"
 else
-  echo "kdig could not handshake; falling back to the probe:"
-  printf '%s\n' "$kdig_out" | grep -E 'WARNING|ERROR' | head -2
+  echo "kdig did not answer (exit status $kdig_status); falling back to the probe:"
+  printf '%s\n' "$kdig_out" | grep -E 'FATAL|WARNING|ERROR' | head -2 || true
   probe_retry doq
 fi
 
