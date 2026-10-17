@@ -26,7 +26,7 @@ func (s *Server) startPlain() error {
 			limiter:     s.limiter,
 		},
 	}
-	s.track(udpSrv)
+	s.trackPlain(udpSrv)
 	go s.serve(udpSrv, "udp", port)
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -41,7 +41,7 @@ func (s *Server) startPlain() error {
 			limiter:     s.limiter,
 		},
 	}
-	s.track(tcpSrv)
+	s.trackPlain(tcpSrv)
 	go s.serve(tcpSrv, "tcp", port)
 
 	s.logger.Info("plain DNS listening", "port", port)

@@ -5,6 +5,7 @@ package dnsserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -23,35 +24,42 @@ import (
 )
 
 // Server owns every enabled listener. Configure it before Start;
-// Start and Shutdown are not meant to race each other.
+// Start and Shutdown are not meant to race each other. The TLS
+// listeners additionally wait for the certificate source to become
+// ready and are then brought up by StartTLS.
 type Server struct {
 	cfg     *config.Config
 	core    *core.Core
-	certs   *tlscert.Store
+	certs   tlscert.Source
 	limiter *ratelimit.Limiter
 	logger  *slog.Logger
 
-	mu      sync.Mutex
-	started bool
-	servers []*dns.Server
-	httpSrv *http.Server
-	h3Srv   *http3.Server
-	quicLn  *quic.Listener
-	baseCtx context.Context
-	cancel  context.CancelFunc
+	mu         sync.Mutex
+	started    bool
+	tlsStarted bool
+	plainSrv   []*dns.Server
+	tlsSrv     []*dns.Server
+	httpSrv    *http.Server
+	h3Srv      *http3.Server
+	quicLn     *quic.Listener
+	challenge  *http.Server
+	baseCtx    context.Context
+	cancel     context.CancelFunc
 }
 
 // New builds the server; a nil logger falls back to slog.Default.
-func New(cfg *config.Config, c *core.Core, certs *tlscert.Store, lim *ratelimit.Limiter, logger *slog.Logger) *Server {
+func New(cfg *config.Config, c *core.Core, certs tlscert.Source, lim *ratelimit.Limiter, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Server{cfg: cfg, core: c, certs: certs, limiter: lim, logger: logger}
 }
 
-// Start binds and serves every enabled listener. A bind failure stops
-// the listeners already started and returns the error, so a partial
-// start never lingers.
+// Start binds and serves the enabled listeners: plain DNS always, the
+// TLS trio (DoT, DoH, DoQ) only once the certificate source is ready.
+// Without a certificate the TLS listeners wait for StartTLS. A bind
+// failure stops the listeners already started and returns the error,
+// so a partial start never lingers.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,27 +75,145 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
+
+	if s.certs != nil && s.certs.Ready() {
+		if err := s.startTLS(); err != nil {
+			_ = s.stopLocked(context.Background())
+			return err
+		}
+		s.tlsStarted = true
+	} else {
+		s.logger.Info("TLS listeners waiting for the certificate")
+	}
+
+	s.started = true
+	return nil
+}
+
+// StartTLS brings the TLS trio (DoT, DoH, DoQ) up on demand, e.g. once
+// the ACME manager obtained the first certificate. It is idempotent
+// and safe to call from another goroutine after Start; on a partial
+// failure the TLS listeners started so far are rolled back and the
+// plain listener is left running.
+func (s *Server) StartTLS() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.tlsStarted {
+		return nil
+	}
+	if !s.started {
+		return fmt.Errorf("dnsserver: Start must run before StartTLS")
+	}
+	if s.certs == nil || !s.certs.Ready() {
+		return fmt.Errorf("dnsserver: TLS listeners need a ready certificate")
+	}
+
+	if err := s.startTLS(); err != nil {
+		_ = s.stopTLSLocked(context.Background())
+		return err
+	}
+	s.tlsStarted = true
+	return nil
+}
+
+// TLSStarted reports whether the TLS listeners are up.
+func (s *Server) TLSStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tlsStarted
+}
+
+// startTLS binds the enabled TLS listeners in order: DoT, DoH, DoQ.
+// The caller must hold s.mu and have set s.baseCtx.
+func (s *Server) startTLS() error {
 	if s.cfg.Protocols.DoT.Enabled {
 		if err := s.startDoT(); err != nil {
-			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
 	if s.cfg.Protocols.DoH.Enabled {
 		if err := s.startDoH(); err != nil {
-			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
 	if s.cfg.Protocols.DoQ.Enabled {
 		if err := s.startDoQ(); err != nil {
-			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
-
-	s.started = true
 	return nil
+}
+
+// Listeners reports the listeners actually running as "proto:port",
+// ordered plain, doh, dot, doq. A listener is listed only when it is
+// enabled and started: the TLS entries appear once StartTLS ran. The
+// result is a fresh slice the caller may keep.
+func (s *Server) Listeners() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []string
+	if s.cfg.Protocols.Plain.Enabled && len(s.plainSrv) > 0 {
+		out = append(out, fmt.Sprintf("plain:%d", s.cfg.Protocols.Plain.Port))
+	}
+	if s.tlsStarted {
+		if s.cfg.Protocols.DoH.Enabled {
+			out = append(out, fmt.Sprintf("doh:%d", s.cfg.Protocols.DoH.Port))
+		}
+		if s.cfg.Protocols.DoT.Enabled {
+			out = append(out, fmt.Sprintf("dot:%d", s.cfg.Protocols.DoT.Port))
+		}
+		if s.cfg.Protocols.DoQ.Enabled {
+			out = append(out, fmt.Sprintf("doq:%d", s.cfg.Protocols.DoQ.Port))
+		}
+	}
+	return out
+}
+
+// StartChallengeHTTP binds a plain HTTP responder on 0.0.0.0:port and
+// serves handler on it (the ACME HTTP-01 challenge, port 80). It is
+// independent of Start and StartTLS; a second call while one is
+// running is an error.
+func (s *Server) StartChallengeHTTP(handler http.Handler, port int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.challenge != nil {
+		return fmt.Errorf("dnsserver: challenge listener already running")
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return fmt.Errorf("challenge http :%d: %w", port, err)
+	}
+
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: dohReadHeaderTimeout,
+		ReadTimeout:       dohReadTimeout,
+		WriteTimeout:      dohWriteTimeout,
+		IdleTimeout:       dohIdleTimeout,
+		MaxHeaderBytes:    dohMaxHeaderBytes,
+	}
+	s.challenge = srv
+
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Warn("challenge HTTP listener stopped", "port", port, "error", err)
+		}
+	}()
+
+	s.logger.Info("ACME HTTP challenge listener listening", "port", port)
+	return nil
+}
+
+// StopChallengeHTTP shuts the challenge responder down; stopping when
+// none runs is a no-op.
+func (s *Server) StopChallengeHTTP(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopChallengeLocked(ctx)
 }
 
 // Shutdown stops every listener and cancels the base context given to
@@ -98,6 +224,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	err := s.stopLocked(ctx)
+	if cerr := s.stopChallengeLocked(ctx); cerr != nil && err == nil {
+		err = cerr
+	}
 	s.started = false
 	return err
 }
@@ -111,12 +240,30 @@ func (s *Server) stopLocked(ctx context.Context) error {
 	}
 
 	var firstErr error
-	for _, srv := range s.servers {
+	for _, srv := range s.plainSrv {
 		if err := srv.ShutdownContext(ctx); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	s.servers = nil
+	s.plainSrv = nil
+
+	if err := s.stopTLSLocked(ctx); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+// stopTLSLocked stops the TLS listeners (DoT, DoH, DoQ) and marks the
+// group down, without touching the base context or the plain listener.
+// The caller must hold s.mu.
+func (s *Server) stopTLSLocked(ctx context.Context) error {
+	var firstErr error
+	for _, srv := range s.tlsSrv {
+		if err := srv.ShutdownContext(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.tlsSrv = nil
 
 	if s.httpSrv != nil {
 		if err := s.httpSrv.Shutdown(ctx); err != nil && firstErr == nil {
@@ -136,12 +283,30 @@ func (s *Server) stopLocked(ctx context.Context) error {
 		}
 		s.quicLn = nil
 	}
+
+	s.tlsStarted = false
 	return firstErr
 }
 
-// track registers a listener for shutdown.
-func (s *Server) track(srv *dns.Server) {
-	s.servers = append(s.servers, srv)
+// stopChallengeLocked stops the ACME HTTP-01 responder if one runs.
+// The caller must hold s.mu.
+func (s *Server) stopChallengeLocked(ctx context.Context) error {
+	if s.challenge == nil {
+		return nil
+	}
+	err := s.challenge.Shutdown(ctx)
+	s.challenge = nil
+	return err
+}
+
+// trackPlain registers a plain listener for shutdown.
+func (s *Server) trackPlain(srv *dns.Server) {
+	s.plainSrv = append(s.plainSrv, srv)
+}
+
+// trackTLS registers a TLS (DoT) listener for shutdown.
+func (s *Server) trackTLS(srv *dns.Server) {
+	s.tlsSrv = append(s.tlsSrv, srv)
 }
 
 // serve runs one listener loop and logs failures that are not part of
