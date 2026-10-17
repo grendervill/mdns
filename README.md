@@ -72,10 +72,49 @@ section:
   address is an IP; `insecure_skip_verify` allows self-signed upstreams.
 - `strategy` — `fastest` (default), `failover`, `round_robin` or
   `random`.
-- `cache` — entry count and TTL clamp.
+- `cache` — entry count (at least 1) and TTL clamp.
 - `limits` — plain-DNS per-IP rate limit and trusted CIDRs
   (exempt from it).
 - `log` — in-memory entry count and an optional JSONL file.
+- `data_dir` — where persistent data lives (filter list caches);
+  defaults to `/var/lib/mdns`.
+
+### Filtering (block lists)
+
+The own block-list engine is off by default; turn it on in the config:
+
+```json
+"filter": {
+  "enabled": true,
+  "mode": "zero",
+  "update_interval_hours": 24,
+  "lists": [
+    { "id": "oisd-small" },
+    { "id": "custom", "url": "https://example.com/my-list.txt" }
+  ],
+  "user_allow": ["allowed.example.com"],
+  "user_block": ["manual.example.com"]
+}
+```
+
+- `mode` — how blocked names are answered: `zero` (A → `0.0.0.0`,
+  AAAA → `::`, other types NODATA), `nxdomain` or `refused`.
+- `lists` — catalog IDs or your own HTTPS URLs. Each list refreshes
+  every `update_interval_hours` (0 = fetch once at startup) with
+  conditional requests; cached copies live in `<data_dir>/filters` and
+  keep working when a list server is down.
+- Catalog: `adguard-dns-filter`, `adguard-base`, `ublock-filters`,
+  `easylist`, `peter-lowe`, `oisd-small`, `oisd-full`, `hagezi-pro`,
+  `hagezi-proplus`, `stevenblack-unified`, `1hosts-lite`. The setup
+  wizard's `basic` and `strict` presets arrive with the control plan.
+- `user_allow` / `user_block` — your own rules; each covers the domain
+  and its subdomains. A user allow beats everything, then user blocks,
+  then list exceptions (`@@`), then list rules.
+- Lists may be adblock-style (`||domain^`, `@@||domain^`), hosts files
+  (`0.0.0.0 domain`) or plain domain lists; cosmetic rules, modifiers
+  and junk lines are skipped and counted.
+- Filtering happens in the core before cache and upstream, so blocked
+  names are answered the same way over plain DNS, DoT, DoH and DoQ.
 
 ## Tests
 
