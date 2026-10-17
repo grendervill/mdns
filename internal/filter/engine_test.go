@@ -157,6 +157,31 @@ func TestHitsSurviveListReplacement(t *testing.T) {
 	}
 }
 
+// TestSetUserRules checks live replacement of the user's own rules.
+func TestSetUserRules(t *testing.T) {
+	e := filter.NewEngine(filter.EngineOptions{})
+	e.SetList(filter.CompiledList{ID: "l1", Block: []string{"ads.example.com"}})
+
+	if blocked, _ := e.Check("ads.example.com"); !blocked {
+		t.Fatalf("Check(ads.example.com) = false, want the list rule")
+	}
+
+	e.SetUserRules(nil, []string{"ads.example.com"})
+	if blocked, source := e.Check("ads.example.com"); !blocked || source != "user" {
+		t.Errorf("after user block = (%v, %q), want (true, user)", blocked, source)
+	}
+
+	e.SetUserRules([]string{"ads.example.com"}, nil)
+	if blocked, _ := e.Check("ads.example.com"); blocked {
+		t.Errorf("after user allow = true, want false")
+	}
+
+	e.SetUserRules(nil, nil)
+	if blocked, source := e.Check("ads.example.com"); !blocked || source != "l1" {
+		t.Errorf("after clearing rules = (%v, %q), want (true, l1)", blocked, source)
+	}
+}
+
 // TestCheckConcurrentReload exercises concurrent checks while the
 // index is swapped: the point is the race detector, not the outcome.
 func TestCheckConcurrentReload(t *testing.T) {

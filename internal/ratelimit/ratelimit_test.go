@@ -121,6 +121,43 @@ func TestDisabled(t *testing.T) {
 	}
 }
 
+// TestReload checks that new parameters apply immediately and a bad
+// CIDR leaves the previous ones in place.
+func TestReload(t *testing.T) {
+	l, _ := newTestLimiter(t, 10)
+	ip := netip.MustParseAddr("192.0.2.10")
+
+	for i := 0; i < 10; i++ {
+		if !l.Allow(ip) {
+			t.Fatalf("Allow() #%d = false under 10 rps", i+1)
+		}
+	}
+
+	if err := l.Reload(1, nil); err != nil {
+		t.Fatalf("Reload(1) = %v, want nil", err)
+	}
+	if !l.Allow(ip) {
+		t.Fatalf("first Allow after Reload = false, want true (fresh bucket)")
+	}
+	if l.Allow(ip) {
+		t.Fatalf("second Allow after Reload = true, want false (1 rps)")
+	}
+
+	if err := l.Reload(1, []string{"10.0.0.0/8"}); err != nil {
+		t.Fatalf("Reload(trusted) = %v, want nil", err)
+	}
+	if !l.Exempt(netip.MustParseAddr("10.1.2.3")) {
+		t.Errorf("Exempt(10.1.2.3) = false after Reload")
+	}
+
+	if err := l.Reload(1, []string{"bad/33"}); err == nil {
+		t.Errorf("Reload(bad CIDR) = nil, want an error")
+	}
+	if !l.Exempt(netip.MustParseAddr("10.1.2.3")) {
+		t.Errorf("trusted list lost after a failed Reload")
+	}
+}
+
 // TestRejectsInvalidCIDR checks that a broken CIDR is reported at
 // construction time.
 func TestRejectsInvalidCIDR(t *testing.T) {

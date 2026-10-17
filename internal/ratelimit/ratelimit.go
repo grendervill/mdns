@@ -43,19 +43,49 @@ func New(rpsPerIP int, trustedCIDRs []string, now func() time.Time) (*Limiter, e
 		now = time.Now
 	}
 
-	l := &Limiter{
+	trusted, err := parsePrefixes(trustedCIDRs)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Limiter{
 		rps:     float64(rpsPerIP),
 		now:     now,
+		trusted: trusted,
 		buckets: make(map[netip.Addr]*bucket),
+	}, nil
+}
+
+// Reload replaces the limit and the trusted CIDRs immediately; buckets
+// start fresh, so the new rate applies to the very next query. A bad
+// CIDR leaves the previous settings untouched.
+func (l *Limiter) Reload(rpsPerIP int, trustedCIDRs []string) error {
+	trusted, err := parsePrefixes(trustedCIDRs)
+	if err != nil {
+		return err
 	}
-	for _, s := range trustedCIDRs {
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.rps = float64(rpsPerIP)
+	l.trusted = trusted
+	l.buckets = make(map[netip.Addr]*bucket)
+	l.lastGC = time.Time{}
+	return nil
+}
+
+// parsePrefixes parses trusted CIDR strings.
+func parsePrefixes(cidrs []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(cidrs))
+	for _, s := range cidrs {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
 			return nil, fmt.Errorf("ratelimit: invalid trusted CIDR %q: %w", s, err)
 		}
-		l.trusted = append(l.trusted, p)
+		out = append(out, p)
 	}
-	return l, nil
+	return out, nil
 }
 
 // Exempt reports whether addr falls inside a trusted CIDR. IPv4

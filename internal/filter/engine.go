@@ -116,6 +116,17 @@ func (e *Engine) SetList(l CompiledList) {
 	e.logger.Debug("filter list installed", "id", l.ID, "block", len(l.Block), "except", len(l.Except))
 }
 
+// SetUserRules replaces the user's allow/block rules and atomically
+// republishes the index.
+func (e *Engine) SetUserRules(allow, block []string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.userAllow = allow
+	e.userBlock = block
+	e.rebuildLocked()
+}
+
 // RemoveList drops a list and republishes the index.
 func (e *Engine) RemoveList(id string) {
 	e.mu.Lock()

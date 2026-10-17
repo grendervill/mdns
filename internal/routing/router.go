@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/miekg/dns"
 
@@ -15,8 +16,10 @@ import (
 var ErrNoUpstreams = errors.New("routing: no upstreams available")
 
 // Router resolves queries through the ordered upstreams of its
-// strategy, failing over on transport errors and SERVFAIL replies.
+// strategy, failing over on transport errors and SERVFAIL replies. The
+// strategy can be swapped live with SetStrategy.
 type Router struct {
+	mu        sync.RWMutex
 	strategy  Strategy
 	upstreams []*upstream.Upstream
 }
@@ -30,13 +33,30 @@ func New(ups []*upstream.Upstream, strategyName string) (*Router, error) {
 	return &Router{strategy: st, upstreams: ups}, nil
 }
 
+// SetStrategy swaps the routing strategy without touching listeners or
+// connections; in-flight queries finish on the previous one.
+func (r *Router) SetStrategy(name string) error {
+	st, err := NewStrategy(name)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.strategy = st
+	r.mu.Unlock()
+	return nil
+}
+
 // Exchange walks the strategy's order and returns the first usable
 // reply: a transport error or a SERVFAIL moves on to the next
 // upstream, while any other reply (NOERROR, NXDOMAIN, REFUSED) is
 // final. The upstream that produced the reply is returned alongside
 // it. When every candidate fails, the error wraps the last failure.
 func (r *Router) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
-	order := r.strategy.Order(r.upstreams)
+	r.mu.RLock()
+	st := r.strategy
+	r.mu.RUnlock()
+
+	order := st.Order(r.upstreams)
 	if len(order) == 0 {
 		return nil, nil, ErrNoUpstreams
 	}

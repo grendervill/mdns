@@ -169,6 +169,52 @@ func TestGetStripsCookies(t *testing.T) {
 	}
 }
 
+// TestSetSizeEvicts checks that shrinking the cache drops the least
+// recently used entries.
+func TestSetSizeEvicts(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 86400)
+
+	for i := 0; i < 10; i++ {
+		q := query(fmt.Sprintf("d%d.example.com", i))
+		c.Put(q, reply(q, 300))
+	}
+	c.Get(query("d8.example.com"))
+	c.Get(query("d9.example.com"))
+
+	c.SetSize(2)
+	if got := c.Stats().Size; got != 2 {
+		t.Fatalf("Size after SetSize(2) = %d, want 2", got)
+	}
+	for _, keep := range []string{"d8.example.com", "d9.example.com"} {
+		if _, ok := c.Get(query(keep)); !ok {
+			t.Errorf("Get(%s) = miss, want hit (most recently used survive)", keep)
+		}
+	}
+	if _, ok := c.Get(query("d0.example.com")); ok {
+		t.Errorf("Get(d0) = hit, want miss (evicted)")
+	}
+}
+
+// TestSetLimits checks that a new clamp applies to later stores.
+func TestSetLimits(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 60)
+
+	q := query("long.example.com")
+	c.Put(q, reply(q, 999999))
+	got, ok := c.Get(query("long.example.com"))
+	if !ok || got.Answer[0].Header().Ttl != 60 {
+		t.Fatalf("served TTL = %v (ok=%v), want the 60s clamp", got, ok)
+	}
+
+	c.SetLimits(0, 10)
+	q2 := query("long.example.com")
+	c.Put(q2, reply(q2, 999999))
+	got, ok = c.Get(query("long.example.com"))
+	if !ok || got.Answer[0].Header().Ttl != 10 {
+		t.Fatalf("served TTL after SetLimits = %v, want 10", got.Answer[0].Header().Ttl)
+	}
+}
+
 // TestPutGet checks the happy path and TTL countdown: the stored answer
 // comes back with its TTL reduced by the elapsed seconds, never raised.
 func TestPutGet(t *testing.T) {

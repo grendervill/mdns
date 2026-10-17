@@ -152,6 +152,34 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 	c.entries[k] = c.lru.PushFront(e)
 }
 
+// SetSize changes the entry bound and immediately evicts the least
+// recently used entries beyond it.
+func (c *Cache) SetSize(size int) {
+	if size < 1 {
+		size = 1
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.size = size
+	for len(c.entries) > size {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		c.removeElement(back)
+	}
+}
+
+// SetLimits replaces the TTL clamp for future stores and serves.
+func (c *Cache) SetLimits(minTTL, maxTTL uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.minTTL = minTTL
+	c.maxTTL = maxTTL
+}
+
 // Flush drops every entry. Cumulative hit and miss counters survive.
 func (c *Cache) Flush() {
 	c.mu.Lock()

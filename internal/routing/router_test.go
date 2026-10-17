@@ -186,6 +186,40 @@ func TestRouterAllFailReturnsError(t *testing.T) {
 	}
 }
 
+// TestSetStrategy checks that the router swaps strategies live:
+// priority order (failover) and latency order (fastest) pick different
+// upstreams.
+func TestSetStrategy(t *testing.T) {
+	fastLowPri, _ := newScriptedUpstream(t, "fast-low-pri", 1, func(req *dns.Msg) (*dns.Msg, error) {
+		return answer(req), nil
+	})
+	slowHighPri, _ := newScriptedUpstream(t, "slow-high-pri", 0, func(req *dns.Msg) (*dns.Msg, error) {
+		return answer(req), nil
+	})
+	fastLowPri.ObserveProbe(true, 1*time.Millisecond)
+	slowHighPri.ObserveProbe(true, 50*time.Millisecond)
+
+	r, err := routing.New([]*upstream.Upstream{fastLowPri, slowHighPri}, "failover")
+	if err != nil {
+		t.Fatalf("routing.New() = %v, want nil", err)
+	}
+
+	if _, used, _ := r.Exchange(context.Background(), query("example.com")); used != slowHighPri {
+		t.Fatalf("failover used %q, want %q (priority)", used.ID, slowHighPri.ID)
+	}
+
+	if err := r.SetStrategy("fastest"); err != nil {
+		t.Fatalf("SetStrategy(fastest) = %v, want nil", err)
+	}
+	if _, used, _ := r.Exchange(context.Background(), query("example.com")); used != fastLowPri {
+		t.Errorf("fastest used %q, want %q (latency)", used.ID, fastLowPri.ID)
+	}
+
+	if err := r.SetStrategy("bogus"); err == nil {
+		t.Errorf("SetStrategy(bogus) = nil, want an error")
+	}
+}
+
 // TestRouterNilResponseIsFailure checks that a transport answering
 // (nil, nil) counts as a failure instead of crashing the router.
 func TestRouterNilResponseIsFailure(t *testing.T) {
