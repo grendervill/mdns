@@ -17,7 +17,11 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/tlscert"
 )
+
+// certExpiry is the fixed leaf expiry the certificate tests render.
+var certExpiry = time.Date(2027, 1, 15, 10, 30, 0, 0, time.UTC)
 
 // stubClient is a scripted tui.Client for model tests.
 type stubClient struct {
@@ -189,6 +193,93 @@ func TestUpstreamsEventUpdatesStatus(t *testing.T) {
 	}
 	if !strings.Contains(view, "33.3") {
 		t.Errorf("View() misses the live latency:\n%s", view)
+	}
+}
+
+// TestStatusShowsCertStates checks the certificate line of the status
+// screen for every state the daemon reports.
+func TestStatusShowsCertStates(t *testing.T) {
+	cases := []struct {
+		name string
+		cert tlscert.Status
+		want []string
+		miss []string
+	}{
+		{
+			name: "ok",
+			cert: tlscert.Status{Mode: "acme", State: "ok", Issuer: "Let's Encrypt", NotAfter: certExpiry},
+			want: []string{"Сертификат:", "Let's Encrypt", "15.01.2027"},
+		},
+		{
+			name: "ok without issuer falls back to the mode",
+			cert: tlscert.Status{Mode: "self-signed", State: "ok", NotAfter: certExpiry},
+			want: []string{"Сертификат:", "self-signed", "15.01.2027"},
+		},
+		{
+			name: "waiting",
+			cert: tlscert.Status{Mode: "acme", State: "waiting"},
+			want: []string{"Сертификат:", "ожидание выпуска"},
+		},
+		{
+			name: "error",
+			cert: tlscert.Status{Mode: "acme", State: "error", Error: "acme: no account"},
+			want: []string{"Сертификат:", "ошибка", "acme: no account"},
+		},
+		{
+			name: "no certificate information",
+			cert: tlscert.Status{},
+			miss: []string{"Сертификат:"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := &stubClient{}
+			m := New(sc, Options{})
+
+			st := sampleStatus()
+			st.Cert = tc.cert
+			m = step(m, statusLoadedMsg{st: st})
+
+			view := m.View()
+			for _, want := range tc.want {
+				if !strings.Contains(view, want) {
+					t.Errorf("View() does not contain %q:\n%s", want, view)
+				}
+			}
+			for _, miss := range tc.miss {
+				if strings.Contains(view, miss) {
+					t.Errorf("View() unexpectedly contains %q:\n%s", miss, view)
+				}
+			}
+		})
+	}
+}
+
+// TestCertEventUpdatesStatus checks that a live cert event updates the
+// certificate line without a fresh status fetch.
+func TestCertEventUpdatesStatus(t *testing.T) {
+	sc := &stubClient{}
+	m := New(sc, Options{})
+
+	st := sampleStatus()
+	st.Cert = tlscert.Status{Mode: "acme", State: "waiting"}
+	m = step(m, statusLoadedMsg{st: st})
+
+	cert := tlscert.Status{Mode: "acme", State: "ok", Issuer: "Let's Encrypt", NotAfter: certExpiry}
+	m = step(m, eventMsg{e: api.Event{Type: "cert", Data: cert}})
+
+	if m.status.Cert.State != "ok" {
+		t.Fatalf("status.Cert.State = %q, want ok", m.status.Cert.State)
+	}
+	view := m.View()
+	for _, want := range []string{"Сертификат:", "Let's Encrypt", "15.01.2027"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() does not contain %q after the cert event:\n%s", want, view)
+		}
+	}
+	if sc.statusCalls != 0 {
+		t.Errorf("status calls = %d, want 0 (the event carried the status)", sc.statusCalls)
 	}
 }
 

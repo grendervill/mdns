@@ -11,6 +11,7 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/filter"
 	"mydns/internal/qlog"
+	"mydns/internal/tlscert"
 )
 
 // screen identifies one top-level view.
@@ -543,6 +544,8 @@ func (m *Model) applyEvent(e api.Event) {
 			m.requests = m.requests[1:]
 		}
 		m.requestsScroll = 0 // follow the tail
+	case tlscert.Status:
+		m.status.Cert = data
 	}
 }
 
