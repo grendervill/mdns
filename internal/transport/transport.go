@@ -25,8 +25,8 @@ type Transport interface {
 	Close() error
 }
 
-// New returns the Transport named by cfg.Transport. Only "plain",
-// "dot" and "doh" are implemented so far; the doq transport follows.
+// New returns the Transport named by cfg.Transport: "plain", "dot",
+// "doh" or "doq".
 func New(cfg config.UpstreamConfig) (Transport, error) {
 	switch cfg.Transport {
 	case "plain":
@@ -35,6 +35,8 @@ func New(cfg config.UpstreamConfig) (Transport, error) {
 		return newDoT(cfg), nil
 	case "doh":
 		return newDoH(cfg), nil
+	case "doq":
+		return newDoQ(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}
