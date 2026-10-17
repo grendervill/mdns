@@ -127,3 +127,13 @@ make vet
 The end-to-end test (`internal/app/e2e_test.go`) brings up the whole
 server in-process on high ports with fake upstreams and exercises all
 four protocols, the cache and failover.
+
+A Docker smoke test runs the built linux binary in real target images
+(`ubuntu:24.04` and `debian:trixie`), starts every protocol with the
+filter engine on a real block list, and checks plain DNS, DoT, DoQ,
+DoH and the persisted rules:
+
+```sh
+scripts/docker-smoke.sh            # both images
+scripts/docker-smoke.sh ubuntu:24.04
+```
