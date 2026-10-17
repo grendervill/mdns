@@ -236,10 +236,10 @@ func TestTLSSwitchInvalidACMERejected(t *testing.T) {
 }
 
 // TestCertStatusACMEMode checks the ACME branch end to end without a
-// CA: the app builds the manager (mode acme, never ok), keeps the TLS
-// listeners deferred and does not bind :80, because DoH is configured on
-// :443, where the tls-alpn-01 challenge is served. A bogus directory
-// makes the manager fail fast against a closed local port.
+// CA: the app builds the manager (mode acme, never ok), keeps DoT/DoQ
+// deferred, starts the DoH listener on :443 eagerly (Ruling R6, where
+// the tls-alpn-01 challenge is served), and does not bind :80. A bogus
+// directory makes the manager fail fast against a closed local port.
 func TestCertStatusACMEMode(t *testing.T) {
 	fake := newFakeUpstream(t)
 	plainPort := freePort(t)
@@ -266,9 +266,14 @@ func TestCertStatusACMEMode(t *testing.T) {
 	if st.Cert.State == "ok" {
 		t.Errorf("Cert.State = %q, want not ok without a CA", st.Cert.State)
 	}
-	want := []string{fmt.Sprintf("plain:%d", plainPort)}
+	want := []string{
+		fmt.Sprintf("plain:%d", plainPort),
+		// Ruling R6: the DoH listener on the TLS-ALPN port starts
+		// eagerly, before any certificate exists; DoT and DoQ wait.
+		"doh:443",
+	}
 	if !slices.Equal(st.Listeners, want) {
-		t.Errorf("Listeners = %v, want %v (TLS still waiting)", st.Listeners, want)
+		t.Errorf("Listeners = %v, want %v (only the TLS-ALPN listener is eager)", st.Listeners, want)
 	}
 
 	cl := &dns.Client{Net: "udp", Timeout: time.Second}

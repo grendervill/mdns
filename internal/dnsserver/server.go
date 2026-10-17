@@ -23,10 +23,17 @@ import (
 	"mydns/internal/tlscert"
 )
 
+// acmeALPNPort is the port ACME TLS-ALPN-01 validation lands on
+// (RFC 8737): an HTTPS listener there has to be running before the
+// first certificate exists, or the order could never be validated.
+const acmeALPNPort = 443
+
 // Server owns every enabled listener. Configure it before Start;
 // Start and Shutdown are not meant to race each other. The TLS
 // listeners additionally wait for the certificate source to become
-// ready and are then brought up by StartTLS.
+// ready and are then brought up by StartTLS — except the DoH listener
+// on the ACME TLS-ALPN port, which starts eagerly when the source
+// serves TLS-ALPN challenges.
 type Server struct {
 	cfg     *config.Config
 	core    *core.Core
@@ -34,17 +41,24 @@ type Server struct {
 	limiter *ratelimit.Limiter
 	logger  *slog.Logger
 
-	mu         sync.Mutex
-	started    bool
-	tlsStarted bool
-	plainSrv   []*dns.Server
-	tlsSrv     []*dns.Server
-	httpSrv    *http.Server
-	h3Srv      *http3.Server
-	quicLn     *quic.Listener
-	challenge  *http.Server
-	baseCtx    context.Context
-	cancel     context.CancelFunc
+	// alpnPort is the TCP port ACME TLS-ALPN-01 validation uses; it is
+	// acmeALPNPort and only a test overrides it, so the eager-DoH path
+	// can be exercised on an unprivileged port.
+	alpnPort int
+
+	mu        sync.Mutex
+	started   bool
+	dotUp     bool
+	dohUp     bool
+	doqUp     bool
+	plainSrv  []*dns.Server
+	tlsSrv    []*dns.Server
+	httpSrv   *http.Server
+	h3Srv     *http3.Server
+	quicLn    *quic.Listener
+	challenge *http.Server
+	baseCtx   context.Context
+	cancel    context.CancelFunc
 }
 
 // New builds the server; a nil logger falls back to slog.Default.
@@ -52,14 +66,25 @@ func New(cfg *config.Config, c *core.Core, certs tlscert.Source, lim *ratelimit.
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, core: c, certs: certs, limiter: lim, logger: logger}
+	return &Server{cfg: cfg, core: c, certs: certs, limiter: lim, logger: logger, alpnPort: acmeALPNPort}
 }
 
-// Start binds and serves the enabled listeners: plain DNS always, the
-// TLS trio (DoT, DoH, DoQ) only once the certificate source is ready.
-// Without a certificate the TLS listeners wait for StartTLS. A bind
-// failure stops the listeners already started and returns the error,
-// so a partial start never lingers.
+// needsEagerDoH reports whether the DoH listener must start before the
+// certificate exists: an ACME source that serves TLS-ALPN-01
+// challenges on the DoH port would otherwise never get its first
+// certificate. The caller passes the validation port so it can be
+// driven from tests.
+func needsEagerDoH(certs tlscert.Source, cfg *config.Config, alpnPort int) bool {
+	return certs != nil && certs.ACMEALPN() && cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == alpnPort
+}
+
+// Start binds and serves the enabled listeners: plain DNS always and
+// the TLS trio (DoT, DoH, DoQ) once the certificate source is ready.
+// Without a certificate the TLS listeners wait for StartTLS, except
+// the DoH listener on the ACME TLS-ALPN port, which starts eagerly so
+// the first TLS-ALPN-01 challenge can be answered. A bind failure
+// stops the listeners already started and returns the error, so a
+// partial start never lingers.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -76,13 +101,23 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
-	if s.certs != nil && s.certs.Ready() {
+	switch {
+	case s.certs != nil && s.certs.Ready():
 		if err := s.startTLS(); err != nil {
 			_ = s.stopLocked(context.Background())
 			return err
 		}
-		s.tlsStarted = true
-	} else {
+	case needsEagerDoH(s.certs, s.cfg, s.alpnPort):
+		// The challenge handshake arrives at the DoH listener itself,
+		// so it must be up; until a certificate is issued normal HTTPS
+		// handshakes fail through GetCertificate.
+		if err := s.startDoH(); err != nil {
+			_ = s.stopLocked(context.Background())
+			return err
+		}
+		s.dohUp = true
+		s.logger.Info("DoH listening for ACME TLS-ALPN-01 ahead of the certificate", "port", s.cfg.Protocols.DoH.Port)
+	default:
 		s.logger.Info("TLS listeners waiting for the certificate")
 	}
 
@@ -90,65 +125,91 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// StartTLS brings the TLS trio (DoT, DoH, DoQ) up on demand, e.g. once
-// the ACME manager obtained the first certificate. It is idempotent
-// and safe to call from another goroutine after Start; on a partial
-// failure the TLS listeners started so far are rolled back and the
-// plain listener is left running.
+// StartTLS starts the enabled TLS listeners that are not up yet, e.g.
+// once the ACME manager obtained its first certificate; a DoH listener
+// already running eagerly is left alone. It is idempotent, safe to
+// call from another goroutine after Start, and on a bind failure it
+// rolls back only the listeners this call started, leaving the plain
+// listener and any earlier TLS listener running.
 func (s *Server) StartTLS() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.tlsStarted {
-		return nil
-	}
 	if !s.started {
 		return fmt.Errorf("dnsserver: Start must run before StartTLS")
+	}
+	if s.tlsUpLocked() {
+		return nil
 	}
 	if s.certs == nil || !s.certs.Ready() {
 		return fmt.Errorf("dnsserver: TLS listeners need a ready certificate")
 	}
 
+	before := s.tlsUpState()
 	if err := s.startTLS(); err != nil {
-		_ = s.stopTLSLocked(context.Background())
+		_ = s.rollbackTLS(before, context.Background())
 		return err
 	}
-	s.tlsStarted = true
 	return nil
 }
 
-// TLSStarted reports whether the TLS listeners are up.
+// TLSStarted reports whether the whole TLS group is up, i.e. every
+// enabled TLS listener (DoT, DoH, DoQ) is running. It is true when no
+// TLS protocol is enabled, so it answers "is there any TLS listener
+// still waiting to start?" rather than "was StartTLS called?".
 func (s *Server) TLSStarted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.tlsStarted
+	return s.tlsUpLocked()
 }
 
-// startTLS binds the enabled TLS listeners in order: DoT, DoH, DoQ.
-// The caller must hold s.mu and have set s.baseCtx.
+// tlsUpLocked reports whether every enabled TLS listener is up. The
+// caller must hold s.mu.
+func (s *Server) tlsUpLocked() bool {
+	return (!s.cfg.Protocols.DoT.Enabled || s.dotUp) &&
+		(!s.cfg.Protocols.DoH.Enabled || s.dohUp) &&
+		(!s.cfg.Protocols.DoQ.Enabled || s.doqUp)
+}
+
+// tlsUpState snapshots which TLS listeners are up.
+func (s *Server) tlsUpState() tlsState {
+	return tlsState{dot: s.dotUp, doh: s.dohUp, doq: s.doqUp}
+}
+
+// tlsState records which TLS listeners were up at a point in time.
+type tlsState struct {
+	dot, doh, doq bool
+}
+
+// startTLS binds the enabled TLS listeners that are not up yet, in
+// order DoT, DoH, DoQ. The caller must hold s.mu and have set s.baseCtx.
 func (s *Server) startTLS() error {
-	if s.cfg.Protocols.DoT.Enabled {
+	if s.cfg.Protocols.DoT.Enabled && !s.dotUp {
 		if err := s.startDoT(); err != nil {
 			return err
 		}
+		s.dotUp = true
 	}
-	if s.cfg.Protocols.DoH.Enabled {
+	if s.cfg.Protocols.DoH.Enabled && !s.dohUp {
 		if err := s.startDoH(); err != nil {
 			return err
 		}
+		s.dohUp = true
 	}
-	if s.cfg.Protocols.DoQ.Enabled {
+	if s.cfg.Protocols.DoQ.Enabled && !s.doqUp {
 		if err := s.startDoQ(); err != nil {
 			return err
 		}
+		s.doqUp = true
 	}
 	return nil
 }
 
 // Listeners reports the listeners actually running as "proto:port",
 // ordered plain, doh, dot, doq. A listener is listed only when it is
-// enabled and started: the TLS entries appear once StartTLS ran. The
-// result is a fresh slice the caller may keep.
+// enabled and started, so in ACME mode the eagerly started DoH
+// listener appears before the rest of the TLS group does. The result
+// is a fresh slice the caller may keep.
 func (s *Server) Listeners() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -157,16 +218,14 @@ func (s *Server) Listeners() []string {
 	if s.cfg.Protocols.Plain.Enabled && len(s.plainSrv) > 0 {
 		out = append(out, fmt.Sprintf("plain:%d", s.cfg.Protocols.Plain.Port))
 	}
-	if s.tlsStarted {
-		if s.cfg.Protocols.DoH.Enabled {
-			out = append(out, fmt.Sprintf("doh:%d", s.cfg.Protocols.DoH.Port))
-		}
-		if s.cfg.Protocols.DoT.Enabled {
-			out = append(out, fmt.Sprintf("dot:%d", s.cfg.Protocols.DoT.Port))
-		}
-		if s.cfg.Protocols.DoQ.Enabled {
-			out = append(out, fmt.Sprintf("doq:%d", s.cfg.Protocols.DoQ.Port))
-		}
+	if s.dohUp {
+		out = append(out, fmt.Sprintf("doh:%d", s.cfg.Protocols.DoH.Port))
+	}
+	if s.dotUp {
+		out = append(out, fmt.Sprintf("dot:%d", s.cfg.Protocols.DoT.Port))
+	}
+	if s.doqUp {
+		out = append(out, fmt.Sprintf("doq:%d", s.cfg.Protocols.DoQ.Port))
 	}
 	return out
 }
@@ -253,10 +312,43 @@ func (s *Server) stopLocked(ctx context.Context) error {
 	return firstErr
 }
 
-// stopTLSLocked stops the TLS listeners (DoT, DoH, DoQ) and marks the
-// group down, without touching the base context or the plain listener.
-// The caller must hold s.mu.
+// stopTLSLocked stops every TLS listener (DoT, DoH, DoQ), without
+// touching the base context or the plain listener. The caller must
+// hold s.mu.
 func (s *Server) stopTLSLocked(ctx context.Context) error {
+	var firstErr error
+	for _, stop := range []func(context.Context) error{s.stopDoTLocked, s.stopDoHLocked, s.stopDoQLocked} {
+		if err := stop(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// rollbackTLS stops the TLS listeners that came up since the snapshot
+// before, i.e. exactly the ones a failed StartTLS call started. The
+// caller must hold s.mu.
+func (s *Server) rollbackTLS(before tlsState, ctx context.Context) error {
+	var firstErr error
+	merge := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.dotUp && !before.dot {
+		merge(s.stopDoTLocked(ctx))
+	}
+	if s.dohUp && !before.doh {
+		merge(s.stopDoHLocked(ctx))
+	}
+	if s.doqUp && !before.doq {
+		merge(s.stopDoQLocked(ctx))
+	}
+	return firstErr
+}
+
+// stopDoTLocked stops the DoT listener. The caller must hold s.mu.
+func (s *Server) stopDoTLocked(ctx context.Context) error {
 	var firstErr error
 	for _, srv := range s.tlsSrv {
 		if err := srv.ShutdownContext(ctx); err != nil && firstErr == nil {
@@ -264,7 +356,14 @@ func (s *Server) stopTLSLocked(ctx context.Context) error {
 		}
 	}
 	s.tlsSrv = nil
+	s.dotUp = false
+	return firstErr
+}
 
+// stopDoHLocked stops the DoH listeners, HTTPS over TCP and HTTP/3.
+// The caller must hold s.mu.
+func (s *Server) stopDoHLocked(ctx context.Context) error {
+	var firstErr error
 	if s.httpSrv != nil {
 		if err := s.httpSrv.Shutdown(ctx); err != nil && firstErr == nil {
 			firstErr = err
@@ -277,14 +376,20 @@ func (s *Server) stopTLSLocked(ctx context.Context) error {
 		}
 		s.h3Srv = nil
 	}
+	s.dohUp = false
+	return firstErr
+}
+
+// stopDoQLocked stops the DoQ endpoint. The caller must hold s.mu.
+func (s *Server) stopDoQLocked(ctx context.Context) error {
+	var firstErr error
 	if s.quicLn != nil {
 		if err := s.quicLn.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		s.quicLn = nil
 	}
-
-	s.tlsStarted = false
+	s.doqUp = false
 	return firstErr
 }
 

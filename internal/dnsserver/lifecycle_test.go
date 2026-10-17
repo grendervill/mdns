@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -55,6 +57,13 @@ func newFakeSource(t *testing.T, ready bool) *fakeSource {
 }
 
 func (f *fakeSource) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.ready {
+		// An ACME manager without a certificate fails the handshake,
+		// which is what the eagerly started DoH listener must survive.
+		return nil, errors.New("no certificate yet")
+	}
 	return f.cert, nil
 }
 
@@ -442,6 +451,63 @@ func TestChallengeHTTP01(t *testing.T) {
 	}
 }
 
+// TestStartTLSRollbackKeepsEagerDoH checks that a failed StartTLS
+// rolls back only the listeners that call started: the eagerly
+// started DoH listener stays up for later TLS-ALPN challenges.
+func TestStartTLSRollbackKeepsEagerDoH(t *testing.T) {
+	dohPort, dotPort := freePort(t), freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoH: config.Protocol{Enabled: true, Port: dohPort},
+		DoT: config.Protocol{Enabled: true, Port: dotPort},
+	}
+
+	certs := newFakeSource(t, false)
+	certs.acmeALPN = true
+	srv, _ := pipeline(t, cfg, certs, nil)
+	srv.alpnPort = dohPort
+	start(t, srv)
+
+	// Hold the DoT port so the first listener StartTLS adds cannot bind.
+	holder, err := net.Listen("tcp", fmt.Sprintf(":%d", dotPort))
+	if err != nil {
+		t.Fatalf("Listen(hold :%d) = %v, want nil", dotPort, err)
+	}
+	defer holder.Close()
+
+	certs.SetReady(true)
+	if err := srv.StartTLS(); err == nil {
+		t.Fatal("StartTLS() with the DoT port taken = nil, want an error")
+	}
+
+	want := []string{fmt.Sprintf("doh:%d", dohPort)}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Errorf("Listeners() after a failed StartTLS = %v, want %v (the eager DoH listener survives)", got, want)
+	}
+	// The listener still answers over TLS now that a certificate exists.
+	hresp, err := dohClient().Get(fmt.Sprintf("https://127.0.0.1:%d/dns-query", dohPort))
+	if err != nil {
+		t.Fatalf("DoH GET = %v, want nil (the eager listener must still be serving)", err)
+	}
+	defer hresp.Body.Close()
+	if hresp.StatusCode != http.StatusBadRequest {
+		t.Errorf("DoH GET without ?dns= = %d, want 400", hresp.StatusCode)
+	}
+
+	// Freeing the port lets the retry complete the group.
+	if err := holder.Close(); err != nil {
+		t.Fatalf("Close(holder) = %v, want nil", err)
+	}
+	if err := srv.StartTLS(); err != nil {
+		t.Fatalf("StartTLS() retry = %v, want nil", err)
+	}
+	want = append(want, fmt.Sprintf("dot:%d", dotPort))
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Errorf("Listeners() after the retry = %v, want %v", got, want)
+	}
+}
+
 // TestStartTLSPartialFailureRollsBack checks that a TLS bind failure
 // leaves no half-started TLS listeners behind: the failed group reports
 // down and the port it did bind is released for a later retry.
@@ -483,6 +549,168 @@ func TestStartTLSPartialFailureRollsBack(t *testing.T) {
 	}
 	if !srv.TLSStarted() {
 		t.Error("TLSStarted() = false after the retry, want true")
+	}
+	if resp := dotQuery(t, dotPort); resp.Rcode != dns.RcodeSuccess {
+		t.Errorf("DoT reply rcode = %d, want NOERROR", resp.Rcode)
+	}
+}
+
+// quietStdLog mutes the standard logger for a test that deliberately
+// provokes an HTTPS handshake error: net/http reports those through
+// log.Default, not through the test's slog logger.
+func quietStdLog(t *testing.T) {
+	t.Helper()
+
+	prev := log.Writer()
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(prev) })
+}
+
+// TestNeedsEagerDoH pins the eager-DoH predicate: only an ACME source
+// serving TLS-ALPN challenges on the validation port needs the DoH
+// listener before a certificate exists.
+func TestNeedsEagerDoH(t *testing.T) {
+	acme := &fakeSource{acmeALPN: true}
+	plain := newFakeSource(t, true) // ACMEALPN false
+
+	doh := func(enabled bool, port int) *config.Config {
+		cfg := config.Default()
+		cfg.Protocols = config.Protocols{DoH: config.Protocol{Enabled: enabled, Port: port}}
+		return cfg
+	}
+
+	tests := []struct {
+		name  string
+		certs tlscert.Source
+		cfg   *config.Config
+		port  int
+		want  bool
+	}{
+		{"acme source on the ALPN port", acme, doh(true, 443), 443, true},
+		{"acme source on another port", acme, doh(true, 8443), 443, false},
+		{"plain source on the ALPN port", plain, doh(true, 443), 443, false},
+		{"DoH disabled on the ALPN port", acme, doh(false, 443), 443, false},
+		{"no certificate source", nil, doh(true, 443), 443, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := needsEagerDoH(tc.certs, tc.cfg, tc.port); got != tc.want {
+				t.Errorf("needsEagerDoH() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEagerDoHOn443ForACME checks R6: in ACME mode the DoH listener on
+// the TLS-ALPN port starts before the certificate exists, so the
+// challenge handshake can reach GetCertificate. Normal handshakes fail
+// until a certificate is issued, and DoT keeps waiting.
+func TestEagerDoHOn443ForACME(t *testing.T) {
+	dohPort, dotPort := freePort(t), freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoH: config.Protocol{Enabled: true, Port: dohPort},
+		DoT: config.Protocol{Enabled: true, Port: dotPort},
+	}
+
+	certs := newFakeSource(t, false)
+	certs.acmeALPN = true
+	logs := &syncBuffer{}
+	srv, _ := pipeline(t, cfg, certs, slog.New(slog.NewTextHandler(logs, nil)))
+	srv.alpnPort = dohPort // stands in for 443, which tests cannot bind
+	start(t, srv)
+
+	// The DoH listener is up although no certificate exists yet.
+	conn, err := net.DialTimeout("tcp", loopback(dohPort), time.Second)
+	if err != nil {
+		t.Fatalf("dial doh :%d = %v, want the eager listener up", dohPort, err)
+	}
+	_ = conn.Close()
+
+	quietStdLog(t)
+	if conn, err := tls.Dial("tcp", loopback(dohPort), &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2"},
+	}); err == nil {
+		_ = conn.Close()
+		t.Error("tls.Dial(doh) = nil, want a handshake error before the certificate exists")
+	}
+
+	// Only the eager listener is up; DoT still waits for the certificate.
+	want := []string{fmt.Sprintf("doh:%d", dohPort)}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Errorf("Listeners() = %v, want %v", got, want)
+	}
+	if srv.TLSStarted() {
+		t.Error("TLSStarted() = true, want false (DoT still waits for the certificate)")
+	}
+	wantClosed(t, dotPort, "before StartTLS")
+	if !strings.Contains(logs.String(), "DoH listening for ACME TLS-ALPN-01") {
+		t.Errorf("log = %q, want the eager-DoH notice", logs.String())
+	}
+}
+
+// TestStartTLSStartsOnlyMissing checks R6 from the partial state: with
+// DoH already up from the eager start, StartTLS brings up only DoT and
+// DoQ and later calls are no-ops.
+func TestStartTLSStartsOnlyMissing(t *testing.T) {
+	dohPort, dotPort, doqPort := freePort(t), freePort(t), freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoH: config.Protocol{Enabled: true, Port: dohPort},
+		DoT: config.Protocol{Enabled: true, Port: dotPort},
+		DoQ: config.Protocol{Enabled: true, Port: doqPort},
+	}
+
+	certs := newFakeSource(t, false)
+	certs.acmeALPN = true
+	srv, _ := pipeline(t, cfg, certs, nil)
+	srv.alpnPort = dohPort
+	start(t, srv)
+
+	want := []string{fmt.Sprintf("doh:%d", dohPort)}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Fatalf("Listeners() after Start = %v, want %v (only the eager DoH listener)", got, want)
+	}
+	if got := srv.TLSStarted(); got {
+		t.Errorf("TLSStarted() after Start = %v, want false", got)
+	}
+
+	certs.SetReady(true)
+	if err := srv.StartTLS(); err != nil {
+		t.Fatalf("StartTLS() = %v, want nil", err)
+	}
+
+	want = []string{
+		fmt.Sprintf("doh:%d", dohPort),
+		fmt.Sprintf("dot:%d", dotPort),
+		fmt.Sprintf("doq:%d", doqPort),
+	}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Errorf("Listeners() after StartTLS = %v, want %v", got, want)
+	}
+	if !srv.TLSStarted() {
+		t.Error("TLSStarted() = false after StartTLS, want true")
+	}
+
+	// The eagerly started DoH listener serves normally now.
+	hresp, err := dohClient().Get(fmt.Sprintf("https://127.0.0.1:%d/dns-query", dohPort))
+	if err != nil {
+		t.Fatalf("DoH GET = %v, want nil (the eager listener must be serving)", err)
+	}
+	defer hresp.Body.Close()
+	if hresp.StatusCode != http.StatusBadRequest {
+		t.Errorf("DoH GET without ?dns= = %d, want 400 (the listener answered over TLS)", hresp.StatusCode)
+	}
+
+	// A second call is a no-op: no error and no duplicate listeners.
+	if err := srv.StartTLS(); err != nil {
+		t.Fatalf("second StartTLS() = %v, want nil", err)
+	}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Errorf("Listeners() after the second StartTLS = %v, want %v", got, want)
 	}
 	if resp := dotQuery(t, dotPort); resp.Rcode != dns.RcodeSuccess {
 		t.Errorf("DoT reply rcode = %d, want NOERROR", resp.Rcode)
