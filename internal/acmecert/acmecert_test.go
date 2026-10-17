@@ -15,10 +15,13 @@ import (
 	"io"
 	"log/slog"
 	"math/big"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/acme"
 
 	"mydns/internal/tlscert"
 )
@@ -393,5 +396,111 @@ func TestNewValidatesOptions(t *testing.T) {
 	}
 	if m.Ready() {
 		t.Error("Ready() = true before the first certificate, want false")
+	}
+}
+
+// ecdsaCipherSuites are the suites autocert's supportsECDSA accepts; a
+// hello without one of them makes autocert issue an RSA certificate.
+var ecdsaCipherSuites = []uint16{
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+}
+
+func TestRunUsesECDSAClientHello(t *testing.T) {
+	cert := testCertificate(t, time.Now().Add(90*24*time.Hour))
+
+	hellos := make(chan *tls.ClientHelloInfo, 1)
+	g := getterFunc(func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		select {
+		case hellos <- hello:
+		default:
+		}
+		return cert, nil
+	})
+
+	m, err := newWithGetter(g, Options{Domain: "example.com", CacheDir: t.TempDir(), Logger: discardLogger()}, time.Now)
+	if err != nil {
+		t.Fatalf("newWithGetter() = %v, want nil", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.Run(ctx, nil)
+	}()
+
+	var hello *tls.ClientHelloInfo
+	select {
+	case hello = <-hellos:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not ask for a certificate")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the context was cancelled")
+	}
+
+	if hello.ServerName != "example.com" {
+		t.Errorf("ServerName = %q, want %q", hello.ServerName, "example.com")
+	}
+	if !slices.Contains(hello.SupportedCurves, tls.CurveP256) {
+		t.Errorf("SupportedCurves = %v, want P-256 so autocert issues an ECDSA certificate", hello.SupportedCurves)
+	}
+	ecdsaOK := false
+	for _, suite := range ecdsaCipherSuites {
+		if slices.Contains(hello.CipherSuites, suite) {
+			ecdsaOK = true
+			break
+		}
+	}
+	if !ecdsaOK {
+		t.Errorf("CipherSuites = %#v, want at least one ECDSA suite so autocert does not issue an RSA certificate", hello.CipherSuites)
+	}
+}
+
+func TestChallengeHandshakeDoesNotFlipReady(t *testing.T) {
+	cert := testCertificate(t, time.Now().Add(90*24*time.Hour))
+	m, err := newWithGetter(getterFunc(func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return cert, nil
+	}), Options{Domain: "example.com", CacheDir: t.TempDir(), Logger: discardLogger()}, time.Now)
+	if err != nil {
+		t.Fatalf("newWithGetter() = %v, want nil", err)
+	}
+
+	challenge := &tls.ClientHelloInfo{ServerName: "example.com", SupportedProtos: []string{acme.ALPNProto}}
+	gotCert, err := m.GetCertificate(challenge)
+	if err != nil {
+		t.Fatalf("GetCertificate(challenge) = %v, want nil", err)
+	}
+	if gotCert != cert {
+		t.Error("GetCertificate(challenge) did not return the certificate from the source")
+	}
+	if m.Ready() {
+		t.Error("Ready() = true after a challenge handshake, want false")
+	}
+	if got := m.Status(); got.State != "waiting" || !got.LastCheck.IsZero() {
+		t.Errorf("Status() = %+v, want the untouched {acme, waiting} status", got)
+	}
+	if closed(m.ReadyChan()) {
+		t.Error("ReadyChan() is closed after a challenge handshake, want open")
+	}
+
+	// A regular handshake, i.e. a real client, flips the state.
+	if _, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "example.com"}); err != nil {
+		t.Fatalf("GetCertificate(client) = %v, want nil", err)
+	}
+	if !m.Ready() {
+		t.Error("Ready() = false after a regular handshake, want true")
+	}
+	if got := m.Status(); got.State != "ok" {
+		t.Errorf("Status().State = %q after a regular handshake, want ok", got.State)
+	}
+	if !closed(m.ReadyChan()) {
+		t.Error("ReadyChan() is open after a regular handshake, want closed")
 	}
 }

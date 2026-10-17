@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -161,8 +162,15 @@ func newWithGetter(g getter, opts Options, now func() time.Time) (*Manager, erro
 
 // GetCertificate returns the certificate for the TLS handshake: the
 // cached one when autocert holds it, a freshly issued one otherwise.
-// The outcome is recorded in Status.
+// The outcome is recorded in Status, except for a CA challenge
+// handshake, which carries no certificate the server will ever serve.
 func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	if hello != nil && slices.Contains(hello.SupportedProtos, acme.ALPNProto) {
+		// tls-alpn-01: autocert answers with a temporary challenge
+		// certificate, so this says nothing about readiness.
+		return m.getter.GetCertificate(hello)
+	}
+
 	cert, _, err := m.fetch(hello)
 	if err != nil {
 		return nil, err
@@ -240,13 +248,32 @@ func (m *Manager) Status() tlscert.Status {
 	return m.status
 }
 
+// clientHello describes the TLS client Run fetches the certificate for:
+// a modern ECDSA-capable one. autocert picks the certificate key type
+// from the hello (supportsECDSA needs an ECDSA cipher suite and P-256),
+// so a bare hello would make it order a second, RSA certificate next to
+// the ECDSA one the real clients get. The project issues ECDSA P-256
+// certificates only.
+func clientHello(domain string) *tls.ClientHelloInfo {
+	return &tls.ClientHelloInfo{
+		ServerName:      domain,
+		SupportedCurves: []tls.CurveID{tls.CurveP256},
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+		SupportedVersions: []uint16{tls.VersionTLS13, tls.VersionTLS12},
+	}
+}
+
 // Run obtains the certificate proactively and then checks it once a
 // day. A failed attempt is retried with an exponential backoff and
 // ±20% jitter that grows until the first success; every status change
 // is passed to onState (which may be nil). Run returns when ctx is done,
 // so the caller starts it in a goroutine, once.
 func (m *Manager) Run(ctx context.Context, onState func(tlscert.Status)) {
-	hello := &tls.ClientHelloInfo{ServerName: m.domain}
+	hello := clientHello(m.domain)
 	attempt := 0
 
 	for {
