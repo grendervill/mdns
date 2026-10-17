@@ -7,6 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"mydns/internal/api"
+	"mydns/internal/qlog"
 )
 
 // screen identifies one top-level view.
@@ -59,6 +60,10 @@ type Model struct {
 	statusErr error
 
 	events <-chan api.Event
+
+	requests       []qlog.Entry
+	requestsPaused bool
+	requestsScroll int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -186,6 +191,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "r":
 		return m, fetchStatus(m.client)
+	case " ":
+		m.requestsPaused = !m.requestsPaused
+	case "x":
+		m.requests = nil
+		m.requestsScroll = 0
+	case "up", "k":
+		if m.requestsScroll < len(m.requests) {
+			m.requestsScroll++
+		}
+	case "down", "j":
+		if m.requestsScroll > 0 {
+			m.requestsScroll--
+		}
 	case "1", "2", "3", "4", "5", "6", "7":
 		idx := int(msg.String()[0] - '1')
 		m.screen = screenTabs[idx].screen
@@ -200,8 +218,16 @@ func (m *Model) applyEvent(e api.Event) {
 		m.status.Upstreams = data
 	case api.FilterSnapshot:
 		m.status.Filter = data
+	case qlog.Entry:
+		if m.requestsPaused {
+			return
+		}
+		m.requests = append(m.requests, data)
+		if len(m.requests) > requestsCap {
+			m.requests = m.requests[1:]
+		}
+		m.requestsScroll = 0 // follow the tail
 	}
-	// qlog.Entry events feed the requests screen (next task).
 }
 
 // View implements tea.Model.
@@ -213,6 +239,10 @@ func (m Model) View() string {
 	switch m.screen {
 	case screenStatus:
 		b.WriteString(m.statusView())
+	case screenRequests:
+		b.WriteString(m.requestsView())
+	case screenUpstreams:
+		b.WriteString(m.upstreamsView())
 	case screenHelp:
 		b.WriteString(m.helpView())
 	default:
@@ -222,7 +252,7 @@ func (m Model) View() string {
 
 	if m.width > 0 {
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("q — выход · r — обновить · 1-7 — экраны"))
+		b.WriteString(dimStyle.Render("q — выход · r — обновить · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"))
 	}
 	return b.String()
 }
