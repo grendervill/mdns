@@ -143,15 +143,18 @@ func (s *Server) serve(srv *dns.Server, proto string, port int) {
 // coreHandler answers one decoded query through the core pipeline; the
 // plain and DoT listeners share it.
 type coreHandler struct {
-	core  *core.Core
-	proto string
-	ctx   context.Context
+	core   *core.Core
+	proto  string
+	ctx    context.Context
+	logger *slog.Logger
 }
 
 // ServeDNS implements dns.Handler.
 func (h *coreHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	resp := h.core.Resolve(h.ctx, req, core.Meta{Proto: h.proto, ClientIP: remoteIP(w.RemoteAddr())})
-	_ = w.WriteMsg(resp)
+	if err := w.WriteMsg(resp); err != nil {
+		h.logger.Warn("write reply failed", "proto", h.proto, "error", err)
+	}
 }
 
 // remoteIP extracts the client address of a connection.

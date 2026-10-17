@@ -25,7 +25,7 @@ func (s *Server) startDoT() error {
 	}
 	srv := &dns.Server{
 		Listener: tls.NewListener(ln, tlsCfg),
-		Handler:  &coreHandler{core: s.core, proto: "dot", ctx: s.baseCtx},
+		Handler:  &coreHandler{core: s.core, proto: "dot", ctx: s.baseCtx, logger: s.logger},
 	}
 	s.track(srv)
 	go s.serve(srv, "dot", port)

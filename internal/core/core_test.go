@@ -86,6 +86,28 @@ func newTestCore(t *testing.T, res core.Resolver) (*core.Core, *cache.Cache, *ql
 	return core.New(res, c, l, discardLogger()), c, l
 }
 
+// TestCacheHitRewritesID checks that an answer served from the cache
+// carries the querying client's message ID, not the ID of whoever
+// populated the cache first.
+func TestCacheHitRewritesID(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return answer(req), testUpstream(t), nil
+	}}
+	c, cacheStore, _ := newTestCore(t, res)
+
+	seed := query("example.com")
+	seed.Id = 1111
+	cached := answer(seed) // carries ID 1111
+	cacheStore.Put(seed, cached)
+
+	q := query("example.com")
+	q.Id = 2222
+	resp := c.Resolve(context.Background(), q, core.Meta{Proto: "udp"})
+	if resp.Id != 2222 {
+		t.Errorf("cached reply ID = %d, want 2222 (the client's ID)", resp.Id)
+	}
+}
+
 // TestCacheHitSkipsResolver checks that a cached answer is served
 // without touching the resolver.
 func TestCacheHitSkipsResolver(t *testing.T) {

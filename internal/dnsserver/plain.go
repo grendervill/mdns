@@ -21,7 +21,7 @@ func (s *Server) startPlain() error {
 	udpSrv := &dns.Server{
 		PacketConn: pc,
 		Handler: &plainHandler{
-			coreHandler: coreHandler{core: s.core, proto: "udp", ctx: s.baseCtx},
+			coreHandler: coreHandler{core: s.core, proto: "udp", ctx: s.baseCtx, logger: s.logger},
 			limiter:     s.limiter,
 		},
 	}
@@ -36,7 +36,7 @@ func (s *Server) startPlain() error {
 	tcpSrv := &dns.Server{
 		Listener: ln,
 		Handler: &plainHandler{
-			coreHandler: coreHandler{core: s.core, proto: "tcp", ctx: s.baseCtx},
+			coreHandler: coreHandler{core: s.core, proto: "tcp", ctx: s.baseCtx, logger: s.logger},
 			limiter:     s.limiter,
 		},
 	}
@@ -58,6 +58,7 @@ type plainHandler struct {
 // ServeDNS implements dns.Handler.
 func (h *plainHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if !h.limiter.Allow(remoteIP(w.RemoteAddr())) {
+		h.logger.Debug("query dropped by rate limit", "proto", h.proto, "client", w.RemoteAddr().String())
 		if h.proto == "udp" {
 			return
 		}
