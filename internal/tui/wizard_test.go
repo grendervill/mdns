@@ -58,6 +58,40 @@ func typeWizard(t *testing.T, w WizardModel, s string) WizardModel {
 	return w
 }
 
+// newWizardAtTLS returns a wizard sitting on the certificate step, past
+// the domain input.
+func newWizardAtTLS(t *testing.T, b *fakeWizardBackend) WizardModel {
+	t.Helper()
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w = typeWizard(t, w, "dns.example.com")
+	w = wizardStep(t, w, enterKey())
+	if w.stage != stageTLS {
+		t.Fatalf("stage = %v, want TLS", w.stage)
+	}
+	return w
+}
+
+// tlsCursor moves the certificate step's cursor onto an option.
+func tlsCursor(t *testing.T, w WizardModel, option int) WizardModel {
+	t.Helper()
+	if w.stage != stageTLS {
+		t.Fatalf("stage = %v, want TLS", w.stage)
+	}
+	for w.cursor > option {
+		w = wizardStep(t, w, key('k'))
+	}
+	for w.cursor < option {
+		w = wizardStep(t, w, key('j'))
+	}
+	if w.cursor != option {
+		t.Fatalf("cursor = %d, want option %d", w.cursor, option)
+	}
+	return w
+}
+
 // TestWizardFlow walks the wizard through every step, including a
 // back-and-forth that must not lose earlier answers, and checks the
 // saved configuration.
@@ -78,7 +112,8 @@ func TestWizardFlow(t *testing.T) {
 		t.Fatalf("stage = %v, want TLS", w.stage)
 	}
 
-	// Step 2: self-signed certificate (first option).
+	// Step 2: self-signed certificate.
+	w = tlsCursor(t, w, tlsOptionSelfSigned)
 	w = wizardStep(t, w, enterKey())
 	if w.cfg.TLS.Mode != "self-signed" {
 		t.Fatalf("tls mode = %q, want self-signed", w.cfg.TLS.Mode)
@@ -154,6 +189,245 @@ func TestWizardFlow(t *testing.T) {
 	}
 }
 
+// TestWizardTLSLetsEncrypt walks the Let's Encrypt branch: the email
+// becomes the ACME contact and a malformed address stays in the input.
+func TestWizardTLSLetsEncrypt(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	w := newWizardAtTLS(t, b)
+
+	w = tlsCursor(t, w, tlsOptionLetsEncrypt)
+	w = wizardStep(t, w, enterKey())
+	if !w.inputActive || w.inputTarget != inputACMEEmail {
+		t.Fatalf("input = (%v, %q), want the ACME email input", w.inputActive, w.inputTarget)
+	}
+
+	// A malformed email is refused and keeps the input open.
+	w = typeWizard(t, w, "not-an-email")
+	w = wizardStep(t, w, enterKey())
+	if !w.inputActive {
+		t.Fatalf("an invalid email closed the input")
+	}
+	if w.err == nil || !strings.Contains(w.err.Error(), "email") {
+		t.Fatalf("err = %v, want an email error", w.err)
+	}
+
+	// An email with a space is refused too.
+	w = wizardStep(t, w, tea.KeyMsg{Type: tea.KeyEsc})
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "a b@example.com")
+	w = wizardStep(t, w, enterKey())
+	if w.err == nil {
+		t.Fatalf("an email with a space was accepted")
+	}
+
+	w = wizardStep(t, w, tea.KeyMsg{Type: tea.KeyEsc})
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "admin@example.com")
+	w = wizardStep(t, w, enterKey())
+
+	if w.inputActive {
+		t.Fatalf("the email input stayed open after a valid address")
+	}
+	if w.cfg.TLS.Mode != "acme" {
+		t.Fatalf("tls mode = %q, want acme", w.cfg.TLS.Mode)
+	}
+	if w.cfg.TLS.ACME.Provider != "letsencrypt" {
+		t.Errorf("provider = %q, want letsencrypt", w.cfg.TLS.ACME.Provider)
+	}
+	if w.cfg.TLS.ACME.Email != "admin@example.com" {
+		t.Errorf("email = %q, want admin@example.com", w.cfg.TLS.ACME.Email)
+	}
+	if err := w.cfg.Validate(); err != nil {
+		t.Errorf("the resulting config does not validate: %v", err)
+	}
+}
+
+// TestWizardTLSZeroSSL walks the ZeroSSL branch: the EAB credentials
+// are required and land in the config.
+func TestWizardTLSZeroSSL(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	w := newWizardAtTLS(t, b)
+
+	w = tlsCursor(t, w, tlsOptionZeroSSL)
+	w = wizardStep(t, w, enterKey())
+	if w.inputTarget != inputACMEEmail {
+		t.Fatalf("input target = %q, want the ACME email input", w.inputTarget)
+	}
+	w = typeWizard(t, w, "admin@example.com")
+	w = wizardStep(t, w, enterKey())
+	if w.inputTarget != inputACMEEABKeyID {
+		t.Fatalf("input target = %q, want the EAB Key ID input", w.inputTarget)
+	}
+
+	// The EAB fields are mandatory.
+	w = wizardStep(t, w, enterKey())
+	if w.err == nil || w.inputTarget != inputACMEEABKeyID {
+		t.Fatalf("an empty EAB Key ID was accepted: err=%v target=%q", w.err, w.inputTarget)
+	}
+	w = typeWizard(t, w, "kid-123")
+	w = wizardStep(t, w, enterKey())
+	if w.inputTarget != inputACMEEABHMAC {
+		t.Fatalf("input target = %q, want the EAB HMAC input", w.inputTarget)
+	}
+	w = wizardStep(t, w, enterKey())
+	if w.err == nil || w.inputTarget != inputACMEEABHMAC {
+		t.Fatalf("an empty EAB HMAC was accepted: err=%v target=%q", w.err, w.inputTarget)
+	}
+	w = typeWizard(t, w, "hmac-secret")
+	w = wizardStep(t, w, enterKey())
+
+	if w.inputActive {
+		t.Fatalf("an input stayed open after the EAB credentials")
+	}
+	acme := w.cfg.TLS.ACME
+	if w.cfg.TLS.Mode != "acme" || acme.Provider != "zerossl" {
+		t.Fatalf("tls = %+v, want acme/zerossl", w.cfg.TLS)
+	}
+	if acme.Email != "admin@example.com" || acme.EABKeyID != "kid-123" || acme.EABHMAC != "hmac-secret" {
+		t.Errorf("acme = %+v, want email, eab kid and hmac set", acme)
+	}
+	if err := w.cfg.Validate(); err != nil {
+		t.Errorf("the resulting config does not validate: %v", err)
+	}
+}
+
+// TestWizardTLSCustom walks the custom ACME server branch: directory
+// URL, an optional email and the insecure-skip-verify answer.
+func TestWizardTLSCustom(t *testing.T) {
+	// enterCustom walks the branch up to the y/N answer.
+	enterCustom := func(t *testing.T, w WizardModel, dir, email, answer string) WizardModel {
+		t.Helper()
+		w = tlsCursor(t, w, tlsOptionCustom)
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEDirectory {
+			t.Fatalf("input target = %q, want the directory URL input", w.inputTarget)
+		}
+		w = typeWizard(t, w, dir)
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEEmail {
+			t.Fatalf("input target = %q, want the ACME email input", w.inputTarget)
+		}
+		w = typeWizard(t, w, email)
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEInsecure {
+			t.Fatalf("input target = %q, want the insecure-skip-verify input", w.inputTarget)
+		}
+		w = typeWizard(t, w, answer)
+		return wizardStep(t, w, enterKey())
+	}
+
+	t.Run("insecure yes", func(t *testing.T) {
+		w := enterCustom(t, newWizardAtTLS(t, newFakeWizardBackend(t)), "https://acme.internal/dir", "", "y")
+
+		acme := w.cfg.TLS.ACME
+		if w.cfg.TLS.Mode != "acme" || acme.Provider != "custom" {
+			t.Fatalf("tls = %+v, want acme/custom", w.cfg.TLS)
+		}
+		if acme.DirectoryURL != "https://acme.internal/dir" {
+			t.Errorf("directory = %q", acme.DirectoryURL)
+		}
+		if acme.Email != "" {
+			t.Errorf("email = %q, want it left empty on a bare Enter", acme.Email)
+		}
+		if !acme.InsecureSkipVerify {
+			t.Errorf("insecure_skip_verify = false, want true for a y answer")
+		}
+		if err := w.cfg.Validate(); err != nil {
+			t.Errorf("the resulting config does not validate: %v", err)
+		}
+	})
+
+	t.Run("insecure no", func(t *testing.T) {
+		w := enterCustom(t, newWizardAtTLS(t, newFakeWizardBackend(t)), "https://acme.internal/dir", "ops@example.com", "n")
+
+		if w.cfg.TLS.ACME.InsecureSkipVerify {
+			t.Errorf("insecure_skip_verify = true, want false for an n answer")
+		}
+		if w.cfg.TLS.ACME.Email != "ops@example.com" {
+			t.Errorf("email = %q, want ops@example.com", w.cfg.TLS.ACME.Email)
+		}
+	})
+
+	t.Run("directory must be https", func(t *testing.T) {
+		w := newWizardAtTLS(t, newFakeWizardBackend(t))
+		w = tlsCursor(t, w, tlsOptionCustom)
+		w = wizardStep(t, w, enterKey())
+
+		w = typeWizard(t, w, "ftp://acme.internal/dir")
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEDirectory || w.err == nil {
+			t.Fatalf("a non-https directory passed: err=%v target=%q", w.err, w.inputTarget)
+		}
+
+		w = wizardStep(t, w, tea.KeyMsg{Type: tea.KeyEsc})
+		w = wizardStep(t, w, enterKey())
+		w = typeWizard(t, w, "acme.internal/dir")
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEDirectory || w.err == nil {
+			t.Fatalf("a directory without a scheme passed: err=%v target=%q", w.err, w.inputTarget)
+		}
+
+		// A valid retry clears the error and moves the chain on.
+		w = wizardStep(t, w, tea.KeyMsg{Type: tea.KeyEsc})
+		w = wizardStep(t, w, enterKey())
+		w = typeWizard(t, w, "https://acme.internal/dir")
+		w = wizardStep(t, w, enterKey())
+		if w.inputTarget != inputACMEEmail || w.err != nil {
+			t.Fatalf("a valid retry left err=%v target=%q", w.err, w.inputTarget)
+		}
+	})
+}
+
+// TestWizardSummaryWarnsHTTP01 checks that an ACME certificate is
+// announced in the summary and that the HTTP-01 port-80 caveat appears
+// unless DoH already occupies 443.
+func TestWizardSummaryWarnsHTTP01(t *testing.T) {
+	acmeCfg := func() *fakeWizardBackend {
+		b := newFakeWizardBackend(t)
+		b.cfg.TLS = config.TLS{
+			Mode: "acme",
+			ACME: config.ACME{Provider: "letsencrypt", Email: "admin@example.com"},
+		}
+		return b
+	}
+
+	// DoH elsewhere than 443: the challenge has to use HTTP-01 on 80.
+	b := acmeCfg()
+	b.cfg.Protocols.DoH.Port = 8443
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w.enterStage(stageSummary)
+
+	view := w.View()
+	for _, want := range []string{"HTTP-01", "порт 80", "выпущен после запуска", "Let's Encrypt"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("the summary view misses %q:\n%s", want, view)
+		}
+	}
+	if sum := w.Summary(); !strings.Contains(sum, "HTTP-01") {
+		t.Errorf("Summary() misses the HTTP-01 warning:\n%s", sum)
+	}
+
+	// DoH on 443 serves the challenge over TLS-ALPN-01: no port-80
+	// warning.
+	w2, err := NewWizard(acmeCfg())
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w2.enterStage(stageSummary)
+	view2 := w2.View()
+	for _, want := range []string{"выпущен после запуска", "Let's Encrypt"} {
+		if !strings.Contains(view2, want) {
+			t.Errorf("the summary view misses %q:\n%s", want, view2)
+		}
+	}
+	if strings.Contains(view2, "HTTP-01") {
+		t.Errorf("the summary view warns about HTTP-01 with DoH on 443:\n%s", view2)
+	}
+}
+
 // TestWizardRequiresProvider checks that saving without providers is
 // refused with a clear error.
 func TestWizardRequiresProvider(t *testing.T) {
@@ -165,6 +439,7 @@ func TestWizardRequiresProvider(t *testing.T) {
 
 	w = typeWizard(t, w, "dns.example.com")
 	w = wizardStep(t, w, enterKey()) // -> tls
+	w = tlsCursor(t, w, tlsOptionSelfSigned)
 	w = wizardStep(t, w, enterKey()) // select self-signed
 	w = wizardStep(t, w, key('n'))   // -> protocols
 	w = wizardStep(t, w, key('n'))   // -> providers
@@ -218,6 +493,7 @@ func TestSetupSummary(t *testing.T) {
 
 	w = typeWizard(t, w, "dns.example.com")
 	w = wizardStep(t, w, enterKey())
+	w = tlsCursor(t, w, tlsOptionSelfSigned)
 	w = wizardStep(t, w, enterKey()) // self-signed
 	w = wizardStep(t, w, key('n'))
 	w = wizardStep(t, w, key('n'))   // providers

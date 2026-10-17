@@ -42,6 +42,7 @@ func TestAPIWizardSave(t *testing.T) {
 
 	w = typeWizard(t, w, "api.example.com")
 	w = wizardStep(t, w, enterKey()) // -> tls
+	w = tlsCursor(t, w, tlsOptionSelfSigned)
 	w = wizardStep(t, w, enterKey()) // self-signed
 	w = wizardStep(t, w, key('n'))   // -> protocols
 	w = wizardStep(t, w, key('n'))   // -> providers
@@ -83,6 +84,7 @@ func TestAPIWizardSaveEmbedded(t *testing.T) {
 
 	w = typeWizard(t, w, "api.example.com")
 	w = wizardStep(t, w, enterKey())
+	w = tlsCursor(t, w, tlsOptionSelfSigned)
 	w = wizardStep(t, w, enterKey())
 	w = wizardStep(t, w, key('n'))
 	w = wizardStep(t, w, key('n'))
