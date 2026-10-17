@@ -154,6 +154,13 @@ func TestValidateTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "disabled protocol with zero port",
+			mutate: func(c *config.Config) {
+				c.Protocols.DoQ = config.Protocol{Enabled: false, Port: 0}
+			},
+			wantErr: false,
+		},
+		{
 			name: "duplicate upstream id",
 			mutate: func(c *config.Config) {
 				c.Upstreams = append(c.Upstreams, config.UpstreamConfig{

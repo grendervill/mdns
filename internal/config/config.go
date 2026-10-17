@@ -173,6 +173,9 @@ func (c *Config) Validate() error {
 		{"dot", c.Protocols.DoT},
 		{"doq", c.Protocols.DoQ},
 	} {
+		if !p.proto.Enabled {
+			continue // a disabled protocol's port is irrelevant
+		}
 		if p.proto.Port < 1 || p.proto.Port > 65535 {
 			return fmt.Errorf("protocols.%s: port %d out of range 1-65535", p.name, p.proto.Port)
 		}
