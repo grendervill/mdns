@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 
 	"mydns/internal/config"
@@ -35,6 +36,7 @@ type Server struct {
 	servers []*dns.Server
 	httpSrv *http.Server
 	h3Srv   *http3.Server
+	quicLn  *quic.Listener
 	baseCtx context.Context
 	cancel  context.CancelFunc
 }
@@ -77,7 +79,12 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	// The DoQ listener joins here in the following task.
+	if s.cfg.Protocols.DoQ.Enabled {
+		if err := s.startDoQ(); err != nil {
+			s.stopLocked(context.Background())
+			return err
+		}
+	}
 
 	s.started = true
 	return nil
@@ -113,6 +120,10 @@ func (s *Server) stopLocked(ctx context.Context) {
 	if s.h3Srv != nil {
 		_ = s.h3Srv.Close()
 		s.h3Srv = nil
+	}
+	if s.quicLn != nil {
+		_ = s.quicLn.Close()
+		s.quicLn = nil
 	}
 }
 
