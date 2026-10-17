@@ -159,9 +159,9 @@ func TestPlainContextTimeout(t *testing.T) {
 }
 
 // TestNewUnsupportedTransport checks that New rejects every transport
-// except plain and dot until the doh and doq transports land.
+// except plain, dot and doh until the doq transport lands.
 func TestNewUnsupportedTransport(t *testing.T) {
-	for _, name := range []string{"doh", "doq", "tcp", ""} {
+	for _, name := range []string{"doq", "tcp", ""} {
 		tr, err := transport.New(config.UpstreamConfig{
 			ID:        "test",
 			Name:      "Test upstream",
