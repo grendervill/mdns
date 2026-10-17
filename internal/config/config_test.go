@@ -71,6 +71,27 @@ func TestDefaultValid(t *testing.T) {
 	}
 }
 
+func TestFilterDefaults(t *testing.T) {
+	c := config.Default()
+
+	if got := c.DataDir; got != "/var/lib/mdns" {
+		t.Errorf("data_dir = %q, want %q", got, "/var/lib/mdns")
+	}
+	f := c.Filter
+	if f.Enabled {
+		t.Errorf("filter enabled = true, want false by default")
+	}
+	if f.Mode != "zero" {
+		t.Errorf("filter mode = %q, want %q", f.Mode, "zero")
+	}
+	if f.UpdateIntervalHours != 24 {
+		t.Errorf("filter update interval = %d, want 24", f.UpdateIntervalHours)
+	}
+	if len(f.Lists) != 0 || len(f.UserAllow) != 0 || len(f.UserBlock) != 0 {
+		t.Errorf("filter lists/rules = %+v, want empty by default", f)
+	}
+}
+
 func TestSaveLoadRoundtrip(t *testing.T) {
 	// Non-default values everywhere, including the omitempty fields.
 	c := config.Default()
@@ -89,6 +110,18 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	}
 	c.Limits.TrustedCIDRs = []string{"10.0.0.0/8", "192.168.0.0/16"}
 	c.Log.File = filepath.Join(t.TempDir(), "requests.jsonl")
+	c.DataDir = "/var/lib/mdns-test"
+	c.Filter = config.FilterConfig{
+		Enabled:             true,
+		Mode:                "nxdomain",
+		UpdateIntervalHours: 6,
+		Lists: []config.FilterList{
+			{ID: "oisd-small"},
+			{ID: "custom", URL: "https://lists.example.com/custom.txt"},
+		},
+		UserAllow: []string{"allowed.example.com"},
+		UserBlock: []string{"blocked.example.com"},
+	}
 
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := c.Save(path); err != nil {
@@ -223,6 +256,95 @@ func TestValidateTable(t *testing.T) {
 				})
 			},
 			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			tt.mutate(c)
+			err := c.Validate()
+			switch {
+			case tt.wantErr && err == nil:
+				t.Errorf("Validate() = nil, want error")
+			case !tt.wantErr && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestValidateFilterTable(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*config.Config)
+		wantErr bool
+	}{
+		{
+			name:    "filter defaults",
+			mutate:  func(c *config.Config) {},
+			wantErr: false,
+		},
+		{
+			name: "filter enabled with catalog list",
+			mutate: func(c *config.Config) {
+				c.Filter.Enabled = true
+				c.Filter.Lists = []config.FilterList{{ID: "oisd-small"}}
+			},
+			wantErr: false,
+		},
+		{
+			name: "manual updates only",
+			mutate: func(c *config.Config) {
+				c.Filter.UpdateIntervalHours = 0
+			},
+			wantErr: false,
+		},
+		{
+			name:    "unknown mode",
+			mutate:  func(c *config.Config) { c.Filter.Mode = "bogus" },
+			wantErr: true,
+		},
+		{
+			name:    "negative interval",
+			mutate:  func(c *config.Config) { c.Filter.UpdateIntervalHours = -1 },
+			wantErr: true,
+		},
+		{
+			name: "duplicate list ids",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{ID: "a"}, {ID: "a"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty list id",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{URL: "https://x/y.txt"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "list url not https",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{ID: "custom", URL: "http://x/y.txt"}}
+			},
+			wantErr: true,
+		},
+		{
+			name:    "user rule with space",
+			mutate:  func(c *config.Config) { c.Filter.UserBlock = []string{"two words"} },
+			wantErr: true,
+		},
+		{
+			name:    "user rule with scheme",
+			mutate:  func(c *config.Config) { c.Filter.UserAllow = []string{"https://x.com"} },
+			wantErr: true,
+		},
+		{
+			name:    "empty data dir",
+			mutate:  func(c *config.Config) { c.DataDir = "" },
+			wantErr: true,
 		},
 	}
 

@@ -74,6 +74,26 @@ type LogConfig struct {
 	MaxFileSizeBytes int64  `json:"max_file_size_bytes"`
 }
 
+// FilterList is one block-list source. URL is optional: with an empty
+// URL the list is looked up in the built-in catalog by ID.
+type FilterList struct {
+	ID  string `json:"id"`
+	URL string `json:"url,omitempty"`
+}
+
+// FilterConfig configures the block-list engine: whether it runs, how
+// blocked queries are answered, how often lists refresh (0 = manual
+// only) and the user's own allow/block rules. A user rule covers the
+// domain itself and all of its subdomains.
+type FilterConfig struct {
+	Enabled             bool         `json:"enabled"`
+	Mode                string       `json:"mode"`                  // zero | nxdomain | refused
+	UpdateIntervalHours int          `json:"update_interval_hours"` // 0 = manual only
+	Lists               []FilterList `json:"lists"`
+	UserAllow           []string     `json:"user_allow"`
+	UserBlock           []string     `json:"user_block"`
+}
+
 // Config is the versioned server configuration, stored as JSON with
 // 0600 permissions.
 type Config struct {
@@ -86,6 +106,8 @@ type Config struct {
 	Cache     Cache            `json:"cache"`
 	Limits    Limits           `json:"limits"`
 	Log       LogConfig        `json:"log"`
+	DataDir   string           `json:"data_dir"`
+	Filter    FilterConfig     `json:"filter"`
 }
 
 // strategies is the set of routing strategy names.
@@ -115,9 +137,10 @@ var tlsTransports = map[string]bool{
 // Default returns the built-in defaults: all four protocols enabled on
 // their standard ports (53, 443, 853, 853), a self-signed certificate,
 // the fastest routing strategy, a 10000-entry cache with TTL clamp
-// 0..86400, 50 rps per IP on plain DNS and a 10000-entry in-memory
-// query log (JSONL file off, rotation at 10 MB). The domain is a
-// placeholder; the setup wizard sets the real one.
+// 0..86400, 50 rps per IP on plain DNS, a 10000-entry in-memory query
+// log (JSONL file off, rotation at 10 MB), data under /var/lib/mdns and
+// the filter engine off (dnsserver-style zero answers once enabled).
+// The domain is a placeholder; the setup wizard sets the real one.
 func Default() *Config {
 	return &Config{
 		Version: 1,
@@ -133,6 +156,11 @@ func Default() *Config {
 		Cache:    Cache{Size: 10000, MinTTL: 0, MaxTTL: 86400},
 		Limits:   Limits{PlainRPSPerIP: 50},
 		Log:      LogConfig{MemoryEntries: 10000, MaxFileSizeBytes: 10 * 1024 * 1024},
+		DataDir:  "/var/lib/mdns",
+		Filter: FilterConfig{
+			Mode:                "zero",
+			UpdateIntervalHours: 24,
+		},
 	}
 }
 
@@ -151,8 +179,9 @@ func Load(path string) (*Config, error) {
 }
 
 // Validate checks the config for consistency: domain shape, port ranges,
-// known strategy and TLS mode, and upstream fields. Disabled upstreams
-// are exempt from address validation.
+// known strategy and TLS mode, upstream fields, data directory and the
+// filter settings. Disabled upstreams are exempt from address
+// validation.
 func (c *Config) Validate() error {
 	if c.Domain == "" {
 		return errors.New("domain must not be empty")
@@ -189,6 +218,51 @@ func (c *Config) Validate() error {
 	case "files", "self-signed":
 	default:
 		return fmt.Errorf("tls: unknown mode %q (want files or self-signed)", c.TLS.Mode)
+	}
+
+	if c.DataDir == "" {
+		return errors.New("data_dir must not be empty")
+	}
+
+	switch c.Filter.Mode {
+	case "zero", "nxdomain", "refused":
+	default:
+		return fmt.Errorf("filter: unknown mode %q (want zero, nxdomain or refused)", c.Filter.Mode)
+	}
+	if c.Filter.UpdateIntervalHours < 0 {
+		return fmt.Errorf("filter: update_interval_hours %d must not be negative", c.Filter.UpdateIntervalHours)
+	}
+
+	seenLists := make(map[string]bool, len(c.Filter.Lists))
+	for i, l := range c.Filter.Lists {
+		if l.ID == "" {
+			return fmt.Errorf("filter.lists[%d]: id must not be empty", i)
+		}
+		if seenLists[l.ID] {
+			return fmt.Errorf("filter list %q: duplicate id", l.ID)
+		}
+		seenLists[l.ID] = true
+
+		if l.URL != "" {
+			u, err := url.Parse(l.URL)
+			if err != nil {
+				return fmt.Errorf("filter list %q: url %q is not valid: %w", l.ID, l.URL, err)
+			}
+			if u.Scheme != "https" || u.Host == "" {
+				return fmt.Errorf("filter list %q: url %q must be an https URL", l.ID, l.URL)
+			}
+		}
+	}
+
+	for _, rules := range [][]string{c.Filter.UserAllow, c.Filter.UserBlock} {
+		for _, r := range rules {
+			if r == "" || strings.ContainsAny(r, " \t\r\n") {
+				return fmt.Errorf("filter rule %q must not be empty or contain whitespace", r)
+			}
+			if strings.Contains(r, "://") {
+				return fmt.Errorf("filter rule %q must not contain a scheme", r)
+			}
+		}
 	}
 
 	seen := make(map[string]bool, len(c.Upstreams))
