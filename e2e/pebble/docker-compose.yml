@@ -1,9 +1,9 @@
 # Local ACME end-to-end environment for mdns.
 #
 # pebble plays the CA, pebble-challtestsrv is its DNS server, the daemon
-# under test runs `mdns serve` in ACME mode and the client container
-# holds the tools the checks need. The script scripts/e2e-pebble.sh
-# drives the whole thing with the fixed project name mdns-e2e-pebble.
+# under test runs `mdns serve` and the client container holds the tools
+# the checks need. The script scripts/e2e-pebble.sh drives the whole
+# thing with the fixed project name mdns-e2e-pebble.
 #
 # MDNS_BIN must point at the linux binary the script builds; E2E_SUBNET
 # and E2E_DAEMON_IP give the daemon a fixed address, so challtestsrv can
@@ -50,16 +50,32 @@ services:
     networks:
       - e2e
 
-  # The server under test: starts with no certificate at all, obtains
-  # one over ACME and only then brings up the DoT/DoQ listeners.
+  # The server under test. The e2e phases pick a config file with
+  # MDNS_CONFIG_FILE (default: the ACME one) and the command copies it
+  # to /etc/mdns/config.json, which is writable on purpose: a PUT
+  # /api/v1/config has to persist the applied configuration. The e2e
+  # shrinks the ACME retry backoff through the test hooks
+  # MDNS_ACME_BACKOFF_MIN/MAX so a failed order retries every few
+  # seconds instead of every few minutes.
   daemon:
     image: ubuntu:24.04
     depends_on:
       - pebble
-    command: ["/mnt/mdns", "serve", "--config", "/etc/mdns/config.json"]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /etc/mdns
+        cp "/mnt/pebble-config/$${MDNS_CONFIG_FILE:-daemon-config.json}" /etc/mdns/config.json
+        exec /mnt/mdns serve --config /etc/mdns/config.json
+    environment:
+      MDNS_CONFIG_FILE: ${MDNS_CONFIG_FILE:-daemon-config.json}
+      MDNS_ACME_BACKOFF_MIN: "5s"
+      MDNS_ACME_BACKOFF_MAX: "30s"
     volumes:
       - ${MDNS_BIN:?MDNS_BIN must point at the linux mdns binary}:/mnt/mdns:ro
-      - ./daemon-config.json:/etc/mdns/config.json:ro
+      - ./daemon-config.json:/mnt/pebble-config/daemon-config.json:ro
+      - ./daemon-config-selfsigned.json:/mnt/pebble-config/daemon-config-selfsigned.json:ro
       - mdns-data:/var/lib/mdns
       - sock:/run/mdns
     networks:
@@ -67,7 +83,8 @@ services:
         ipv4_address: ${E2E_DAEMON_IP:?E2E_DAEMON_IP must be set}
 
   # Test client: shares the control socket with the daemon and speaks
-  # DNS/TLS/HTTPS to it over the compose network.
+  # DNS/TLS/HTTPS to it over the compose network. It also carries the
+  # ACME config file the phase D live switch PUTs over the unix socket.
   client:
     build:
       context: .
@@ -78,6 +95,7 @@ services:
     volumes:
       - sock:/run/mdns
       - ${DNSPROBE_BIN:?DNSPROBE_BIN must point at the linux dnsprobe binary}:/mnt/dnsprobe:ro
+      - ./daemon-config.json:/mnt/pebble-config/daemon-config.json:ro
     networks:
       - e2e
 
