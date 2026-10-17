@@ -22,7 +22,7 @@
 
 ## Review Focus
 
-1. Сертификат не получен: демон жив, plain DNS работает, TLS-порты закрыты, ошибка видна и повторяется с бэкоффом; после появления ACME-сервера TLS поднимается сам (Tasks 5, 9).
+1. Сертификат не получен: демон жив, plain DNS работает, DoT/DoQ закрыты, обычный TLS на 443 недоступен (но ACME-челлендж на 443 обслуживается при DoH-на-443 — см. Ruling R6), ошибка видна и повторяется с бэкоффом; после появления ACME-сервера TLS поднимается сам (Tasks 5, 9).
 2. Установщик не оставляет полусостояний: ошибка визарда/невалидные флаги — сервис не запущен, конфиг не тронут; повторный запуск идемпотентен (Tasks 11, 14).
 3. Смена TLS на живом демоне (self-signed↔files, *→acme) транзакционна; при сбое старая конфигурация продолжает отвечать (Tasks 5, 9).
 4. Валидный кэшированный сертификат переиспользуется: рестарт без ACME-сервера не заказывает новый сертификат, TLS продолжает работать (Task 9).
@@ -160,8 +160,10 @@
   func (s *Server) StopChallengeHTTP(ctx context.Context) error
   func (s *Server) Listeners() []string             // реально запущенные: "plain:53", "doh:443", …
   ```
-- `Start`: plain (если включён) всегда; TLS — только если `certs.Ready()`, иначе `logger.Info("TLS listeners waiting for the certificate")`. DoH-листенер добавляет `acme-tls/1` в `NextProtos`, когда `certs.ACMEALPN()`.
+- `Start`: plain (если включён) всегда; TLS — только если `certs.Ready()`, иначе `logger.Info("TLS listeners waiting for the certificate")`. ИСКЛЮЧЕНИЕ (Ruling R6): в ACME-режиме (`certs.ACMEALPN()`) при DoH на порту 443 DoH-листенер поднимается сразу, даже без сертификата — он нужен для TLS-ALPN-01 (иначе выдача невозможна: листенер ждёт сертификат, а сертификат требует листенер). До выдачи обычные HTTPS-хендшейки падают (GetCertificate возвращает ошибку), ACME-челлендж обслуживается. DoT/DoQ ждут сертификат. DoH на других портах — тоже ждёт.
+- `StartTLS()` дозапускает только недостающие TLS-листенеры (может быть запущен один DoH-443, а DoT/DoQ ещё ждут); идемпотентен.
 
+- [ ] **Step 0 (R6, после Task 5): доработка T4** — eager-443 в ACME-режиме (см. Ruling R6 в ledger): DoH-443 поднимается сразу; `StartTLS` дозапускает недостающие листенеры (трекинг по протоколам, не один флаг); тесты: `TestEagerDoHOn443ForACMESLP`, `TestStartTLSStartsOnlyMissing`.
 - [ ] **Step 1: Падающие тесты** (`lifecycle_test.go`, заглушка Source с управляемым `ready`): `TestDeferredTLSStart` (неготовый источник: `Start` → plain отвечает, TLS-порт закрыт; `ready=true; StartTLS()` → TLS отвечает); `TestStartTLSIdempotent`; `TestListenersReflectsStart` (до StartTLS — без tls-записей, после — с ними); `TestChallengeHTTP01` (handler отвечает на `/.well-known/acme-challenge/x`, StopChallenge закрывает порт).
 - [ ] **Step 2: целевые тесты — FAIL**.
 - [ ] **Step 3: реализовать** (хранение tls-серверов отдельно от plain, mutex тот же; challenge — отдельный `http.Server`).
