@@ -265,3 +265,50 @@ func TestWizardTransportCycle(t *testing.T) {
 		t.Errorf("transport did not cycle: %q", got)
 	}
 }
+
+// TestWizardPreselectsExistingUpstreams checks that re-running the
+// wizard keeps providers configured by catalog ID.
+func TestWizardPreselectsExistingUpstreams(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	b.cfg.Upstreams = []config.UpstreamConfig{{
+		ID: "cloudflare", Name: "Cloudflare", Transport: "doh",
+		Address: "https://cloudflare-dns.com/dns-query", Enabled: true,
+	}}
+
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	if !w.selected["cloudflare"] {
+		t.Errorf("cloudflare was not pre-selected from the current config")
+	}
+	if got := w.transport["cloudflare"]; got != "doh" {
+		t.Errorf("pre-selected transport = %q, want doh", got)
+	}
+}
+
+// TestWizardKeepsCustomUpstreams checks that hand-configured upstreams
+// survive a wizard run.
+func TestWizardKeepsCustomUpstreams(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	b.cfg.Upstreams = []config.UpstreamConfig{{
+		ID: "my-custom", Name: "My resolver", Transport: "plain",
+		Address: "10.0.0.1:53", Enabled: true,
+	}}
+
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+
+	w.enterStage(stageProviders)
+	w = wizardStep(t, w, enterKey()) // select the first catalog provider
+
+	ups := w.buildUpstreams()
+	if len(ups) != 2 {
+		t.Fatalf("buildUpstreams() = %d entries, want 2 (selected + custom)", len(ups))
+	}
+	if ups[1].ID != "my-custom" {
+		t.Errorf("custom upstream = %q, want my-custom kept", ups[1].ID)
+	}
+}

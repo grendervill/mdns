@@ -239,7 +239,7 @@ func (m *Model) settingsView() string {
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Настройки"))
-	b.WriteString(dimStyle.Render("  (enter — изменить/переключить, ctrl+s — применить)") + "\n\n")
+	b.WriteString(dimStyle.Render("  (enter — изменить/переключить, ctrl+s — применить, w — мастер)") + "\n\n")
 
 	fields := m.settingsFields()
 	for i, f := range fields {

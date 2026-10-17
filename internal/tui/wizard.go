@@ -69,10 +69,17 @@ type wizardProbeMsg struct{ byID map[string]probe.Result }
 // wizardProbeTickMsg re-runs the probes.
 type wizardProbeTickMsg struct{}
 
+// wizardDoneMsg ends an embedded wizard; saved is false on cancel.
+type wizardDoneMsg struct{ saved bool }
+
 // WizardModel is the setup wizard.
 type WizardModel struct {
 	backend   WizardBackend
 	providers []providers.Provider
+
+	// embedded means the wizard runs inside the TUI and reports its
+	// end with wizardDoneMsg instead of quitting the program.
+	embedded bool
 
 	cfg    *config.Config
 	stage  stage
@@ -105,6 +112,18 @@ func NewWizard(b WizardBackend) (WizardModel, error) {
 		selected:  make(map[string]bool),
 		transport: make(map[string]string),
 		probes:    make(map[string]probe.Result),
+	}
+	// Pre-select upstreams that come from the catalog so re-running the
+	// wizard keeps the current provider choice.
+	for _, u := range w.cfg.Upstreams {
+		for _, p := range w.providers {
+			if p.ID == u.ID {
+				w.selected[p.ID] = true
+				if w.transport[p.ID] == "" {
+					w.transport[p.ID] = u.Transport
+				}
+			}
+		}
 	}
 	w.stage = stageDomain
 	w.inputActive = true
@@ -199,6 +218,9 @@ func (w WizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch msg.String() {
 	case "ctrl+c":
+		if w.embedded {
+			return w, func() tea.Msg { return wizardDoneMsg{} }
+		}
 		return w, tea.Quit
 	case "esc":
 		if w.stage > stageDomain {
@@ -650,7 +672,28 @@ func (w *WizardModel) buildUpstreams() []config.UpstreamConfig {
 		prio++
 		ups = append(ups, uc)
 	}
+
+	// Keep upstreams that are not catalog providers (custom servers the
+	// user configured by hand).
+	for _, u := range w.cfg.Upstreams {
+		if w.isCatalogID(u.ID) {
+			continue
+		}
+		u.Priority = prio
+		prio++
+		ups = append(ups, u)
+	}
 	return ups
+}
+
+// isCatalogID reports whether id belongs to a catalog provider.
+func (w *WizardModel) isCatalogID(id string) bool {
+	for _, p := range w.providers {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // save validates and writes the configuration.
@@ -669,6 +712,9 @@ func (w WizardModel) save() (tea.Model, tea.Cmd) {
 		return w, nil
 	}
 	w.saved = true
+	if w.embedded {
+		return w, func() tea.Msg { return wizardDoneMsg{saved: true} }
+	}
 	return w, tea.Quit
 }
 

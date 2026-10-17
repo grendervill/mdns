@@ -80,6 +80,10 @@ type Model struct {
 	inputField  int
 	input       string
 
+	wizard        *WizardModel
+	wizardLoading bool
+	wizardNote    string
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -172,10 +176,52 @@ func (m Model) Init() tea.Cmd {
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// The embedded wizard owns keys while its tab is active; its probes
+	// keep refreshing even when the user looks at other screens.
+	if m.wizard != nil {
+		switch msg := msg.(type) {
+		case tea.WindowSizeMsg:
+			m.width, m.height = msg.Width, msg.Height
+			return m.forwardToWizard(msg)
+
+		case wizardProbeMsg, wizardProbeTickMsg:
+			return m.forwardToWizard(msg)
+
+		case tea.KeyMsg:
+			if m.screen == screenWizard {
+				s := msg.String()
+				if !m.wizard.inputActive && (s == "q" || isScreenDigit(s)) {
+					break // navigation and quit stay global
+				}
+				return m.forwardToWizard(msg)
+			}
+		}
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
+
+	case wizardOpenedMsg:
+		m.wizardLoading = false
+		if msg.err != nil {
+			m.wizardNote = "Не удалось открыть мастер: " + msg.err.Error()
+			return m, nil
+		}
+		m.wizard = &msg.w
+		return m, nil
+
+	case wizardDoneMsg:
+		m.wizard = nil
+		if !msg.saved {
+			m.wizardNote = "Мастер закрыт без сохранения — настройки не изменены."
+			return m, nil
+		}
+		m.wizardNote = "Мастер: настройки сохранены и применены."
+		m.settingsCfg = nil // the settings screen reloads the fresh config
+		m.screen = screenStatus
+		return m, fetchStatus(m.client)
 
 	case statusLoadedMsg:
 		if msg.err != nil {
@@ -278,6 +324,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "1", "2", "3", "4", "5", "6", "7":
 		idx := int(msg.String()[0] - '1')
 		m.screen = screenTabs[idx].screen
+		if m.screen == screenWizard {
+			return m.openWizard()
+		}
 		return m, m.lazyLoadCmd()
 	}
 
@@ -354,9 +403,36 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, applySettingsCmd(m.client, cloneConfig(m.settingsCfg))
+		case "w":
+			return m.openWizard()
 		}
 	}
 	return m, nil
+}
+
+// openWizard opens (or re-shows) the embedded wizard over the control
+// API.
+func (m Model) openWizard() (tea.Model, tea.Cmd) {
+	m.screen = screenWizard
+	if m.wizard != nil || m.wizardLoading {
+		return m, nil
+	}
+	m.wizardNote = ""
+	m.wizardLoading = true
+	return m, openWizardCmd(m.client)
+}
+
+// forwardToWizard hands a message to the embedded wizard.
+func (m Model) forwardToWizard(msg tea.Msg) (tea.Model, tea.Cmd) {
+	updated, cmd := m.wizard.Update(msg)
+	wm := updated.(WizardModel)
+	m.wizard = &wm
+	return m, cmd
+}
+
+// isScreenDigit reports whether s selects a screen tab (1-7).
+func isScreenDigit(s string) bool {
+	return len(s) == 1 && s[0] >= '1' && s[0] <= '7'
 }
 
 // handleInputKey processes keys while an input line is open.
@@ -426,6 +502,12 @@ func (m *Model) applyEvent(e api.Event) {
 
 // View implements tea.Model.
 func (m Model) View() string {
+	// The embedded wizard takes the whole screen (it has its own header
+	// and footer).
+	if m.screen == screenWizard && m.wizard != nil {
+		return m.wizard.View()
+	}
+
 	var b strings.Builder
 	b.WriteString(m.tabsView())
 	b.WriteString("\n\n")
@@ -433,6 +515,8 @@ func (m Model) View() string {
 	switch m.screen {
 	case screenStatus:
 		b.WriteString(m.statusView())
+	case screenWizard:
+		b.WriteString(m.wizardView())
 	case screenRequests:
 		b.WriteString(m.requestsView())
 	case screenUpstreams:
@@ -446,6 +530,11 @@ func (m Model) View() string {
 	default:
 		b.WriteString(dimStyle.Render("Этот экран появится в следующем обновлении."))
 		b.WriteString("\n")
+	}
+
+	if m.wizardNote != "" {
+		b.WriteString("\n")
+		b.WriteString(titleStyle.Render(m.wizardNote))
 	}
 
 	if m.width > 0 {

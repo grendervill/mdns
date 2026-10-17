@@ -25,6 +25,7 @@ type stubClient struct {
 	statusCalls int
 	events      chan api.Event
 
+	cfg       *config.Config
 	filters   []string
 	updateErr error
 	updates   []*config.Config
@@ -35,6 +36,9 @@ func (s *stubClient) Status(context.Context) (api.Status, error) {
 	return s.status, s.statusErr
 }
 func (s *stubClient) Config(context.Context) (*config.Config, error) {
+	if s.cfg != nil {
+		return s.cfg, nil
+	}
 	return config.Default(), nil
 }
 func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
