@@ -62,7 +62,7 @@ func serveCmd(args []string) int {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	a, err := app.New(cfg, app.Options{SocketPath: *socketPath}, logger)
+	a, err := app.New(cfg, serveOptions(*configPath, *socketPath), logger)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mdns serve:", err)
 		return 1
@@ -87,6 +87,12 @@ func serveCmd(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// serveOptions assembles the app options for the serve command; the
+// config path is what UpdateConfig persists to.
+func serveOptions(configPath, socketPath string) app.Options {
+	return app.Options{ConfigPath: configPath, SocketPath: socketPath}
 }
 
 // checkCmd validates the configuration and reports "ok".
