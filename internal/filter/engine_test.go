@@ -138,6 +138,25 @@ func TestStatsCounters(t *testing.T) {
 	}
 }
 
+// TestHitsSurviveListReplacement checks that per-list hit counters
+// keep accumulating across list updates, where the rules are replaced
+// but the list identity stays.
+func TestHitsSurviveListReplacement(t *testing.T) {
+	e := filter.NewEngine(filter.EngineOptions{})
+	e.SetList(filter.CompiledList{ID: "l1", Block: []string{"a.com"}})
+	e.Check("a.com")
+
+	e.SetList(filter.CompiledList{ID: "l1", Block: []string{"b.com"}}) // daily refresh
+
+	st := e.Stats()
+	if len(st.Lists) != 1 {
+		t.Fatalf("len(Lists) = %d, want 1", len(st.Lists))
+	}
+	if st.Lists[0].Hits != 1 {
+		t.Errorf("Hits after replacement = %d, want 1 (counters survive updates)", st.Lists[0].Hits)
+	}
+}
+
 // TestCheckConcurrentReload exercises concurrent checks while the
 // index is swapped: the point is the race detector, not the outcome.
 func TestCheckConcurrentReload(t *testing.T) {

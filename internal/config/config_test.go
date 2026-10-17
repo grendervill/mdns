@@ -355,6 +355,16 @@ func TestValidateFilterTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "user rule single label",
+			mutate:  func(c *config.Config) { c.Filter.UserBlock = []string{"com"} },
+			wantErr: true,
+		},
+		{
+			name:    "user rule with path",
+			mutate:  func(c *config.Config) { c.Filter.UserAllow = []string{"x.com/path"} },
+			wantErr: true,
+		},
+		{
 			name:    "empty data dir",
 			mutate:  func(c *config.Config) { c.DataDir = "" },
 			wantErr: true,
@@ -373,6 +383,46 @@ func TestValidateFilterTable(t *testing.T) {
 				t.Errorf("Validate() = %v, want nil", err)
 			}
 		})
+	}
+}
+
+func TestLoadBackwardCompatDefaults(t *testing.T) {
+	// A config written before the filter fields existed: version 1,
+	// no data_dir, no filter section. Loading it must fill the new
+	// fields with defaults instead of failing validation.
+	path := filepath.Join(t.TempDir(), "old.json")
+	old := `{
+  "version": 1,
+  "domain": "dns.example.com",
+  "protocols": {
+    "plain": {"enabled": false, "port": 0},
+    "doh": {"enabled": false, "port": 0},
+    "dot": {"enabled": false, "port": 0},
+    "doq": {"enabled": false, "port": 0}
+  },
+  "tls": {"mode": "self-signed"},
+  "upstreams": [],
+  "strategy": "fastest",
+  "cache": {"size": 100, "min_ttl": 0, "max_ttl": 3600},
+  "limits": {"plain_rps_per_ip": 10, "trusted_cidrs": []},
+  "log": {"memory_entries": 100, "file": "", "max_file_size_bytes": 0}
+}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+	if c.DataDir != "/var/lib/mdns" {
+		t.Errorf("DataDir = %q, want the default for old configs", c.DataDir)
+	}
+	if c.Filter.Mode != "zero" {
+		t.Errorf("Filter.Mode = %q, want %q for old configs", c.Filter.Mode, "zero")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil (old configs must keep loading)", err)
 	}
 }
 

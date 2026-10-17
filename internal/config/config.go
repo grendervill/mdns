@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"mydns/internal/dnsname"
 )
 
 // Protocol enables one listener protocol and selects its port. DoT is
@@ -164,8 +166,10 @@ func Default() *Config {
 	}
 }
 
-// Load reads and parses the JSON config at path. It applies no defaults
-// and runs no validation; callers validate what they loaded.
+// Load reads and parses the JSON config at path. It fills the fields
+// added after the first schema version with their defaults, so older
+// configs keep loading; it runs no validation and leaves everything
+// else as written. Callers validate what they loaded.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -175,7 +179,19 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	c.applyDefaults()
 	return &c, nil
+}
+
+// applyDefaults fills the fields introduced after the first config
+// version with their defaults, keeping older configs loadable.
+func (c *Config) applyDefaults() {
+	if c.DataDir == "" {
+		c.DataDir = "/var/lib/mdns"
+	}
+	if c.Filter.Mode == "" {
+		c.Filter.Mode = "zero"
+	}
 }
 
 // Validate checks the config for consistency: domain shape, port ranges,
@@ -263,11 +279,8 @@ func (c *Config) Validate() error {
 
 	for _, rules := range [][]string{c.Filter.UserAllow, c.Filter.UserBlock} {
 		for _, r := range rules {
-			if r == "" || strings.ContainsAny(r, " \t\r\n") {
-				return fmt.Errorf("filter rule %q must not be empty or contain whitespace", r)
-			}
-			if strings.Contains(r, "://") {
-				return fmt.Errorf("filter rule %q must not contain a scheme", r)
+			if !dnsname.Valid(dnsname.Normalize(r)) {
+				return fmt.Errorf("filter rule %q must be a domain with at least two labels", r)
 			}
 		}
 	}

@@ -1,6 +1,10 @@
 package filter
 
-import "testing"
+import (
+	"testing"
+
+	"mydns/internal/dnsname"
+)
 
 // TestSuffixSetExactAndSub checks the core semantics: a rule for a
 // domain covers the domain itself and every subdomain, but never its
@@ -10,12 +14,12 @@ func TestSuffixSetExactAndSub(t *testing.T) {
 	set.add("b.c.com", struct{}{})
 
 	for _, name := range []string{"b.c.com", "a.b.c.com", "x.y.b.c.com", "b.c.com."} {
-		if _, ok := set.value(labels(name)); !ok {
+		if _, ok := set.value(dnsname.Labels(name)); !ok {
 			t.Errorf("value(%q) = miss, want hit", name)
 		}
 	}
 	for _, name := range []string{"c.com", "other.com", "com"} {
-		if _, ok := set.value(labels(name)); ok {
+		if _, ok := set.value(dnsname.Labels(name)); ok {
 			t.Errorf("value(%q) = hit, want miss", name)
 		}
 	}
@@ -27,7 +31,7 @@ func TestSuffixSetCaseAndDot(t *testing.T) {
 	set := suffixSet[int]{}
 	set.add("Example.COM", 7)
 
-	if v, ok := set.value(labels("A.B.example.com.")); !ok || v != 7 {
+	if v, ok := set.value(dnsname.Labels("A.B.example.com.")); !ok || v != 7 {
 		t.Errorf("value(A.B.example.com.) = (%v, %v), want (7, true)", v, ok)
 	}
 }
@@ -38,10 +42,10 @@ func TestSuffixSetLongestValue(t *testing.T) {
 	set.add("c.com", "outer")
 	set.add("b.c.com", "inner")
 
-	if v, ok := set.value(labels("a.b.c.com")); !ok || v != "inner" {
+	if v, ok := set.value(dnsname.Labels("a.b.c.com")); !ok || v != "inner" {
 		t.Errorf("value(a.b.c.com) = (%q, %v), want (inner, true)", v, ok)
 	}
-	if v, ok := set.value(labels("x.c.com")); !ok || v != "outer" {
+	if v, ok := set.value(dnsname.Labels("x.c.com")); !ok || v != "outer" {
 		t.Errorf("value(x.c.com) = (%q, %v), want (outer, true)", v, ok)
 	}
 }
@@ -49,12 +53,12 @@ func TestSuffixSetLongestValue(t *testing.T) {
 // TestSuffixSetMiss checks the empty set and unrelated names.
 func TestSuffixSetMiss(t *testing.T) {
 	set := suffixSet[int]{}
-	if _, ok := set.value(labels("example.com")); ok {
+	if _, ok := set.value(dnsname.Labels("example.com")); ok {
 		t.Errorf("value on an empty set = hit, want miss")
 	}
 
 	set.add("a.com", 1)
-	if _, ok := set.value(labels("b.org")); ok {
+	if _, ok := set.value(dnsname.Labels("b.org")); ok {
 		t.Errorf("value(b.org) = hit, want miss")
 	}
 }

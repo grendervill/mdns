@@ -3,23 +3,14 @@ package filter
 import (
 	"bufio"
 	"io"
-	"regexp"
 	"strings"
+
+	"mydns/internal/dnsname"
 )
 
 // maxRuleLine is the longest list line considered; longer lines are
 // counted as skipped so one pathological row cannot bloat parsing.
 const maxRuleLine = 1 << 20
-
-// domainRe matches a normalized domain with at least two labels; each
-// label is 1-63 chars of [a-z0-9-] and does not start or end with a
-// dash.
-var domainRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$`)
-
-// validDomain reports whether s is a plausible block-list domain.
-func validDomain(s string) bool {
-	return len(s) <= 253 && domainRe.MatchString(s)
-}
 
 // hostIPs are the loopback/zero addresses a hosts-format line may use
 // to point a domain away.
@@ -106,8 +97,8 @@ func Parse(r io.Reader) (Parsed, error) {
 				out.Skipped++
 				return
 			}
-			d := normalizeName(strings.TrimSuffix(body[2:], "^"))
-			if !validDomain(d) {
+			d := dnsname.Normalize(strings.TrimSuffix(body[2:], "^"))
+			if !dnsname.Valid(d) {
 				out.Skipped++
 				return
 			}
@@ -119,8 +110,8 @@ func Parse(r io.Reader) (Parsed, error) {
 			return
 		}
 		if except {
-			d := normalizeName(body)
-			if !validDomain(d) {
+			d := dnsname.Normalize(body)
+			if !dnsname.Valid(d) {
 				out.Skipped++
 				return
 			}
@@ -134,8 +125,8 @@ func Parse(r io.Reader) (Parsed, error) {
 
 		fields := strings.Fields(line)
 		if len(fields) == 2 && hostIPs[fields[0]] {
-			d := normalizeName(fields[1])
-			if !validDomain(d) {
+			d := dnsname.Normalize(fields[1])
+			if !dnsname.Valid(d) {
 				out.Skipped++
 				return
 			}
@@ -143,7 +134,7 @@ func Parse(r io.Reader) (Parsed, error) {
 			return
 		}
 		if len(fields) == 1 {
-			if d := normalizeName(fields[0]); validDomain(d) {
+			if d := dnsname.Normalize(fields[0]); dnsname.Valid(d) {
 				addBlock(d)
 				return
 			}

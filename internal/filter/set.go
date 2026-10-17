@@ -4,7 +4,11 @@
 // fetches lists over HTTPS.
 package filter
 
-import "strings"
+import (
+	"strings"
+
+	"mydns/internal/dnsname"
+)
 
 // suffixSet stores domains with suffix semantics: a rule for "d"
 // covers d itself and every subdomain of d. A lookup walks the query
@@ -14,7 +18,7 @@ type suffixSet[T any] map[string]T
 
 // add stores v for domain, normalized; empty domains are ignored.
 func (s suffixSet[T]) add(domain string, v T) {
-	name := normalizeName(domain)
+	name := dnsname.Normalize(domain)
 	if name == "" {
 		return
 	}
@@ -31,18 +35,4 @@ func (s suffixSet[T]) value(numLabels []string) (T, bool) {
 	}
 	var zero T
 	return zero, false
-}
-
-// normalizeName lowercases a DNS name and drops its trailing dot.
-func normalizeName(name string) string {
-	return strings.ToLower(strings.TrimSuffix(name, "."))
-}
-
-// labels splits a name into its normalized labels; the root is empty.
-func labels(name string) []string {
-	name = normalizeName(name)
-	if name == "" {
-		return nil
-	}
-	return strings.Split(name, ".")
 }

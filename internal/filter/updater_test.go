@@ -174,6 +174,38 @@ func TestUpdateTooLarge(t *testing.T) {
 	}
 }
 
+// TestUpdateRefusesEmptyList checks that a 200 response carrying no
+// usable rules (an HTML error page, say) is treated as a failure and
+// never wipes the working rules.
+func TestUpdateRefusesEmptyList(t *testing.T) {
+	var broken atomic.Bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if broken.Load() {
+			fmt.Fprint(w, "<html><body>temporarily unavailable</body></html>")
+			return
+		}
+		fmt.Fprint(w, "||sticky.example.com^\n")
+	}))
+	defer srv.Close()
+
+	e := filter.NewEngine(filter.EngineOptions{})
+	u, _ := newTestUpdater(t, e, []filter.ListSpec{{ID: "t1", URL: srv.URL + "/list.txt"}})
+	u.Update(context.Background())
+	if blocked, _ := e.Check("sticky.example.com"); !blocked {
+		t.Fatalf("Check(sticky.example.com) = false before the garbage reply, want true")
+	}
+
+	broken.Store(true)
+	u.Update(context.Background())
+
+	if blocked, _ := e.Check("sticky.example.com"); !blocked {
+		t.Errorf("Check(sticky.example.com) = false after a 200-with-garbage reply, want the old rules")
+	}
+	if st := u.Status()[0]; st.Error == "" {
+		t.Errorf("Status().Error = empty, want an empty-list error")
+	}
+}
+
 // TestLoadFromDisk checks reading persisted rules at startup, and that
 // a missing directory is not an error.
 func TestLoadFromDisk(t *testing.T) {

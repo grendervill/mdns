@@ -5,6 +5,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"mydns/internal/dnsname"
 )
 
 // topDomainsLimit bounds the distinct domains the top tracker keeps;
@@ -40,7 +42,7 @@ type index struct {
 
 // check answers one normalized name with the design's rule order.
 func (i *index) check(name string) (bool, string) {
-	lbl := labels(name)
+	lbl := dnsname.Labels(name)
 	if len(lbl) == 0 {
 		return false, ""
 	}
@@ -59,12 +61,6 @@ func (i *index) check(name string) (bool, string) {
 	return false, ""
 }
 
-// compiled is one installed list with its live hit counter.
-type compiled struct {
-	list CompiledList
-	hits atomic.Uint64
-}
-
 // Engine is safe for concurrent use.
 type Engine struct {
 	logger *slog.Logger
@@ -72,8 +68,9 @@ type Engine struct {
 	mu        sync.Mutex
 	userAllow []string
 	userBlock []string
-	lists     map[string]*compiled
-	order     []string // install order: source priority and Stats order
+	lists     map[string]CompiledList
+	hits      map[string]*atomic.Uint64 // outside the replaced list data: counters survive updates
+	order     []string                  // install order: source priority and Stats order
 	idx       atomic.Pointer[index]
 
 	totalBlocked atomic.Uint64
@@ -93,7 +90,8 @@ func NewEngine(opts EngineOptions) *Engine {
 		logger:    logger,
 		userAllow: opts.UserAllow,
 		userBlock: opts.UserBlock,
-		lists:     make(map[string]*compiled),
+		lists:     make(map[string]CompiledList),
+		hits:      make(map[string]*atomic.Uint64),
 		top:       make(map[string]uint64),
 	}
 	e.rebuildLocked()
@@ -101,15 +99,18 @@ func NewEngine(opts EngineOptions) *Engine {
 }
 
 // SetList installs or replaces a list and atomically republishes the
-// index; queries in flight keep using the previous snapshot.
+// index; queries in flight keep using the previous snapshot. Hit
+// counters belong to the list identity, not to one snapshot of its
+// rules, so they survive refreshes.
 func (e *Engine) SetList(l CompiledList) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	if _, exists := e.lists[l.ID]; !exists {
 		e.order = append(e.order, l.ID)
+		e.hits[l.ID] = &atomic.Uint64{}
 	}
-	e.lists[l.ID] = &compiled{list: l}
+	e.lists[l.ID] = l
 	e.rebuildLocked()
 
 	e.logger.Debug("filter list installed", "id", l.ID, "block", len(l.Block), "except", len(l.Except))
@@ -124,6 +125,7 @@ func (e *Engine) RemoveList(id string) {
 		return
 	}
 	delete(e.lists, id)
+	delete(e.hits, id)
 	for i, oid := range e.order {
 		if oid == id {
 			e.order = append(e.order[:i], e.order[i+1:]...)
@@ -141,19 +143,21 @@ func (e *Engine) Check(qname string) (bool, string) {
 		return false, ""
 	}
 
-	blocked, source := idx.check(normalizeName(qname))
+	name := dnsname.Normalize(qname)
+	blocked, source := idx.check(name)
 	if !blocked {
 		return false, ""
 	}
 
 	e.totalBlocked.Add(1)
-	e.countTop(normalizeName(qname))
+	e.countTop(name)
 	if source != "user" {
 		e.mu.Lock()
-		if c := e.lists[source]; c != nil {
-			c.hits.Add(1)
-		}
+		h := e.hits[source]
 		e.mu.Unlock()
+		if h != nil {
+			h.Add(1)
+		}
 	}
 	return true, source
 }
@@ -198,14 +202,20 @@ func (e *Engine) Stats() Stats {
 	e.mu.Lock()
 	lists := make([]ListStat, 0, len(e.order))
 	for _, id := range e.order {
-		if c := e.lists[id]; c != nil {
-			lists = append(lists, ListStat{
-				ID:     id,
-				Block:  len(c.list.Block),
-				Except: len(c.list.Except),
-				Hits:   c.hits.Load(),
-			})
+		l, ok := e.lists[id]
+		if !ok {
+			continue
 		}
+		var hits uint64
+		if h := e.hits[id]; h != nil {
+			hits = h.Load()
+		}
+		lists = append(lists, ListStat{
+			ID:     id,
+			Block:  len(l.Block),
+			Except: len(l.Except),
+			Hits:   hits,
+		})
 	}
 	e.mu.Unlock()
 
@@ -249,16 +259,16 @@ func (e *Engine) rebuildLocked() {
 		idx.userBlock.add(d, struct{}{})
 	}
 	for _, id := range e.order {
-		if c := e.lists[id]; c != nil {
-			for _, d := range c.list.Except {
+		if l, ok := e.lists[id]; ok {
+			for _, d := range l.Except {
 				idx.listExcept.add(d, struct{}{})
 			}
 		}
 	}
 	for _, id := range e.order {
-		if c := e.lists[id]; c != nil {
-			for _, d := range c.list.Block {
-				name := normalizeName(d)
+		if l, ok := e.lists[id]; ok {
+			for _, d := range l.Block {
+				name := dnsname.Normalize(d)
 				if name == "" {
 					continue
 				}

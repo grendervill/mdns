@@ -1,6 +1,7 @@
-// Package core is the per-request pipeline: validate, serve from the
-// cache or forward through the router, and record what happened in the
-// query log. The filtering stage joins this pipeline in a later plan.
+// Package core is the per-request pipeline: validate, filter, serve
+// from the cache or forward through the router, and record what
+// happened in the query log. Blocked names are answered before the
+// cache and the upstream are touched.
 package core
 
 import (

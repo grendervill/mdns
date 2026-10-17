@@ -250,6 +250,12 @@ func (u *Updater) updateOne(ctx context.Context, spec ListSpec) {
 		u.fail(spec.ID, fmt.Errorf("parse: %w", err))
 		return
 	}
+	if parsed.Applied == 0 {
+		// A 200 carrying no usable rules is almost always an error
+		// page or an emptied list; never let it wipe working rules.
+		u.fail(spec.ID, fmt.Errorf("list has no usable rules (%d lines skipped)", parsed.Skipped))
+		return
+	}
 
 	newMeta := listMeta{
 		ID:           spec.ID,
