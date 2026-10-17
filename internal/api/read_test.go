@@ -31,6 +31,7 @@ type fakeController struct {
 	catalog      []providers.Provider
 	lastRequests int
 	lastProbe    []providers.Endpoint
+	probeFn      func(context.Context, []providers.Endpoint) []probe.Result
 	lastFilterID string
 	lastConfig   *config.Config
 	updateErr    error
@@ -45,8 +46,11 @@ func (f *fakeController) UpdateConfig(_ context.Context, c *config.Config) error
 	return f.updateErr
 }
 func (f *fakeController) Providers() []providers.Provider { return f.catalog }
-func (f *fakeController) Probe(_ context.Context, eps []providers.Endpoint) []probe.Result {
+func (f *fakeController) Probe(ctx context.Context, eps []providers.Endpoint) []probe.Result {
 	f.lastProbe = eps
+	if f.probeFn != nil {
+		return f.probeFn(ctx, eps)
+	}
 	return nil
 }
 func (f *fakeController) Requests(n int) []qlog.Entry {
@@ -63,7 +67,7 @@ func (f *fakeController) FilterUpdate(_ context.Context, id string) error {
 // HTTP server around it.
 func newTestServer(t *testing.T, ctl *fakeController) *httptest.Server {
 	t.Helper()
-	srv := api.New(ctl, discardLogger(), api.ServerOptions{})
+	srv := api.New(ctl, api.NewBus(), discardLogger(), api.ServerOptions{})
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return ts

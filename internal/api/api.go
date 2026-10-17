@@ -71,6 +71,7 @@ type Controller interface {
 // Server is the HTTP API. It is safe for concurrent use after New.
 type Server struct {
 	ctl    Controller
+	bus    *Bus
 	logger *slog.Logger
 	mux    *http.ServeMux
 
@@ -83,8 +84,9 @@ type ServerOptions struct {
 	PingInterval time.Duration // 0 → 15s
 }
 
-// New builds the API server over ctl.
-func New(ctl Controller, logger *slog.Logger, opts ServerOptions) *Server {
+// New builds the API server over ctl. bus carries live events for the
+// /events stream; it may be nil (stream then carries pings only).
+func New(ctl Controller, bus *Bus, logger *slog.Logger, opts ServerOptions) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -93,14 +95,17 @@ func New(ctl Controller, logger *slog.Logger, opts ServerOptions) *Server {
 		ping = 15 * time.Second
 	}
 
-	s := &Server{ctl: ctl, logger: logger, pingInterval: ping}
+	s := &Server{ctl: ctl, bus: bus, logger: logger, pingInterval: ping}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/status", s.handleStatus)
 	mux.HandleFunc("GET /api/v1/config", s.handleConfigGet)
+	mux.HandleFunc("PUT /api/v1/config", s.handleConfigPut)
 	mux.HandleFunc("GET /api/v1/providers", s.handleProviders)
+	mux.HandleFunc("POST /api/v1/probe", s.handleProbe)
 	mux.HandleFunc("GET /api/v1/requests", s.handleRequests)
 	mux.HandleFunc("GET /api/v1/filter/status", s.handleFilterStatus)
-	// Writes, probes and the SSE stream join here in the next task.
+	mux.HandleFunc("POST /api/v1/filter/update", s.handleFilterUpdate)
+	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	s.mux = mux
 	return s
 }
