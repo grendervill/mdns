@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -59,7 +61,13 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	// DoT, DoH and DoQ listeners join here in the following tasks.
+	if s.cfg.Protocols.DoT.Enabled {
+		if err := s.startDoT(); err != nil {
+			s.stopLocked(context.Background())
+			return err
+		}
+	}
+	// DoH and DoQ listeners join here in the following tasks.
 
 	s.started = true
 	return nil
@@ -100,4 +108,36 @@ func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	if err := srv.ActivateAndServe(); err != nil {
 		s.logger.Warn("listener stopped", "proto", proto, "port", port, "error", err)
 	}
+}
+
+// coreHandler answers one decoded query through the core pipeline; the
+// plain and DoT listeners share it.
+type coreHandler struct {
+	core  *core.Core
+	proto string
+	ctx   context.Context
+}
+
+// ServeDNS implements dns.Handler.
+func (h *coreHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
+	resp := h.core.Resolve(h.ctx, req, core.Meta{Proto: h.proto, ClientIP: remoteIP(w.RemoteAddr())})
+	_ = w.WriteMsg(resp)
+}
+
+// remoteIP extracts the client address of a connection.
+func remoteIP(addr net.Addr) netip.Addr {
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if ip, ok := netip.AddrFromSlice(a.IP); ok {
+			return ip.Unmap()
+		}
+	case *net.TCPAddr:
+		if ip, ok := netip.AddrFromSlice(a.IP); ok {
+			return ip.Unmap()
+		}
+	}
+	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
+		return ap.Addr().Unmap()
+	}
+	return netip.Addr{}
 }

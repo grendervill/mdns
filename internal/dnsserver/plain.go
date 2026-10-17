@@ -1,14 +1,11 @@
 package dnsserver
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"net/netip"
 
 	"github.com/miekg/dns"
 
-	"mydns/internal/core"
 	"mydns/internal/ratelimit"
 )
 
@@ -23,7 +20,10 @@ func (s *Server) startPlain() error {
 	}
 	udpSrv := &dns.Server{
 		PacketConn: pc,
-		Handler:    &plainHandler{core: s.core, limiter: s.limiter, proto: "udp", ctx: s.baseCtx},
+		Handler: &plainHandler{
+			coreHandler: coreHandler{core: s.core, proto: "udp", ctx: s.baseCtx},
+			limiter:     s.limiter,
+		},
 	}
 	s.track(udpSrv)
 	go s.serve(udpSrv, "udp", port)
@@ -35,7 +35,10 @@ func (s *Server) startPlain() error {
 	}
 	tcpSrv := &dns.Server{
 		Listener: ln,
-		Handler:  &plainHandler{core: s.core, limiter: s.limiter, proto: "tcp", ctx: s.baseCtx},
+		Handler: &plainHandler{
+			coreHandler: coreHandler{core: s.core, proto: "tcp", ctx: s.baseCtx},
+			limiter:     s.limiter,
+		},
 	}
 	s.track(tcpSrv)
 	go s.serve(tcpSrv, "tcp", port)
@@ -48,16 +51,13 @@ func (s *Server) startPlain() error {
 // after the per-IP rate limiter. Over-limit UDP requests are dropped
 // silently (no amplification), over-limit TCP requests get REFUSED.
 type plainHandler struct {
-	core    *core.Core
+	coreHandler
 	limiter *ratelimit.Limiter
-	proto   string
-	ctx     context.Context
 }
 
 // ServeDNS implements dns.Handler.
 func (h *plainHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
-	ip := remoteIP(w.RemoteAddr())
-	if !h.limiter.Allow(ip) {
+	if !h.limiter.Allow(remoteIP(w.RemoteAddr())) {
 		if h.proto == "udp" {
 			return
 		}
@@ -66,25 +66,5 @@ func (h *plainHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		_ = w.WriteMsg(m)
 		return
 	}
-
-	resp := h.core.Resolve(h.ctx, req, core.Meta{Proto: h.proto, ClientIP: ip})
-	_ = w.WriteMsg(resp)
-}
-
-// remoteIP extracts the client address of a connection.
-func remoteIP(addr net.Addr) netip.Addr {
-	switch a := addr.(type) {
-	case *net.UDPAddr:
-		if ip, ok := netip.AddrFromSlice(a.IP); ok {
-			return ip.Unmap()
-		}
-	case *net.TCPAddr:
-		if ip, ok := netip.AddrFromSlice(a.IP); ok {
-			return ip.Unmap()
-		}
-	}
-	if ap, err := netip.ParseAddrPort(addr.String()); err == nil {
-		return ap.Addr().Unmap()
-	}
-	return netip.Addr{}
+	h.coreHandler.ServeDNS(w, req)
 }

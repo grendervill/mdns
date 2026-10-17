@@ -69,14 +69,23 @@ func newFakeUpstream(t *testing.T) (*dnsfake.Fake, *upstream.Upstream) {
 func newTestServer(t *testing.T, rps int) (*dnsserver.Server, *dnsfake.Fake, *qlog.Log, int) {
 	t.Helper()
 
-	fake, u := newFakeUpstream(t)
-
 	port := freePort(t)
 	cfg := config.Default()
 	cfg.Domain = "mdns.test"
 	cfg.Protocols = config.Protocols{
 		Plain: config.Protocol{Enabled: true, Port: port},
 	}
+
+	srv, fake, queryLog := testPipeline(t, cfg, rps)
+	return srv, fake, queryLog, port
+}
+
+// testPipeline builds the whole stack up to a started server for the
+// given config; everything is torn down when the test ends.
+func testPipeline(t *testing.T, cfg *config.Config, rps int) (*dnsserver.Server, *dnsfake.Fake, *qlog.Log) {
+	t.Helper()
+
+	fake, u := newFakeUpstream(t)
 
 	certs, err := tlscert.New(cfg.TLS, cfg.Domain)
 	if err != nil {
@@ -110,7 +119,7 @@ func newTestServer(t *testing.T, rps int) (*dnsserver.Server, *dnsfake.Fake, *ql
 		_ = srv.Shutdown(sctx)
 	})
 
-	return srv, fake, queryLog, port
+	return srv, fake, queryLog
 }
 
 // query builds a single-question A query.
