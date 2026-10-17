@@ -25,12 +25,14 @@ type Transport interface {
 	Close() error
 }
 
-// New returns the Transport named by cfg.Transport. Only "plain" is
-// implemented so far; the dot, doh and doq transports follow.
+// New returns the Transport named by cfg.Transport. Only "plain" and
+// "dot" are implemented so far; the doh and doq transports follow.
 func New(cfg config.UpstreamConfig) (Transport, error) {
 	switch cfg.Transport {
 	case "plain":
 		return &Plain{addr: cfg.Address}, nil
+	case "dot":
+		return newDoT(cfg), nil
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}

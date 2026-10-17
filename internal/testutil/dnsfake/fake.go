@@ -1,10 +1,12 @@
-// Package dnsfake provides a fake plain-DNS upstream for tests: UDP
-// and TCP listeners on one 127.0.0.1 port, a settable per-query handler
-// and an atomic query counter. It exists only for tests; production
-// code must not import it.
+// Package dnsfake provides a fake plain-DNS or DNS-over-TLS upstream for
+// tests: listeners on 127.0.0.1, a settable per-query handler, an
+// atomic query counter and, for the TLS variant, a record of the last
+// TLS ClientHello. It exists only for tests; production code must not
+// import it.
 package dnsfake
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sync"
@@ -17,8 +19,10 @@ import (
 // UDP port that was picked for the TCP listener.
 const maxPortAttempts = 10
 
-// Fake is a fake plain DNS upstream listening on 127.0.0.1, UDP and
-// TCP on the same port. The zero value is not usable; call New.
+// Fake is a fake DNS upstream listening on 127.0.0.1. New creates a
+// plain server with UDP and TCP on the same port; NewTLS creates a
+// DNS-over-TLS server with TLS on TCP only. The zero value is not
+// usable; call New or NewTLS.
 type Fake struct {
 	udpConn net.PacketConn
 	tcpLn   net.Listener
@@ -29,12 +33,25 @@ type Fake struct {
 	handler func(*dns.Msg) *dns.Msg
 
 	calls atomic.Int64
+
+	// hello records the last TLS ClientHello; nil until the first
+	// handshake. Only the TLS variant fills it.
+	hello atomic.Pointer[HelloInfo]
 }
 
-// New starts the fake on 127.0.0.1: a TCP listener picks a free port
-// and the UDP socket binds to the same port number, so both protocols
-// share one address. In the rare case the UDP port is taken in
-// between, a fresh port is tried, up to 10 times.
+// HelloInfo is a copy of the fields of the last TLS ClientHello the
+// fake saw during a handshake.
+type HelloInfo struct {
+	// ServerName is the SNI the client sent; empty when it sent none.
+	ServerName string
+	// ALPN is the list of protocols the client offered.
+	ALPN []string
+}
+
+// New starts the plain fake on 127.0.0.1: a TCP listener picks a free
+// port and the UDP socket binds to the same port number, so both
+// protocols share one address. In the rare case the UDP port is taken
+// in between, a fresh port is tried, up to 10 times.
 func New() (*Fake, error) {
 	var lastErr error
 	for i := 0; i < maxPortAttempts; i++ {
@@ -61,6 +78,40 @@ func New() (*Fake, error) {
 	return nil, fmt.Errorf("dnsfake: find a port for both UDP and TCP after %d attempts: %w", maxPortAttempts, lastErr)
 }
 
+// NewTLS starts the fake as a DNS-over-TLS server on 127.0.0.1,
+// presenting cert in the handshake and recording the ClientHello it
+// received. Only TCP is served; Calls counts handshaken queries as for
+// the plain variant.
+func NewTLS(cert tls.Certificate) (*Fake, error) {
+	rawLn, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, fmt.Errorf("dnsfake: listen tcp: %w", err)
+	}
+
+	f := &Fake{}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		GetConfigForClient: func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+			f.hello.Store(&HelloInfo{
+				ServerName: hi.ServerName,
+				ALPN:       append([]string(nil), hi.SupportedProtos...),
+			})
+			return nil, nil // keep the original config
+		},
+	}
+
+	f.tcpLn = tls.NewListener(rawLn, tlsCfg)
+	f.tcpSrv = &dns.Server{Listener: f.tcpLn, Handler: f}
+	go f.tcpSrv.ActivateAndServe()
+	return f, nil
+}
+
+// LastHello returns the ClientHello of the last completed TLS
+// handshake, or nil if none happened or the fake serves plain DNS.
+func (f *Fake) LastHello() *HelloInfo {
+	return f.hello.Load()
+}
+
 // Addr returns the fake's listen address, "127.0.0.1:<port>",
 // reachable over both UDP and TCP.
 func (f *Fake) Addr() string {
@@ -84,15 +135,23 @@ func (f *Fake) Calls() int {
 	return int(f.calls.Load())
 }
 
-// Close stops both listeners and waits until their serve loops have
+// Close stops the listeners and waits until their serve loops have
 // ended. The underlying sockets are closed first so the loops always
 // exit, even if they have not started serving yet. Close is safe to
-// call more than once.
+// call more than once and for both variants (plain and TLS).
 func (f *Fake) Close() {
-	f.udpConn.Close()
-	f.tcpLn.Close()
-	f.udpSrv.Shutdown()
-	f.tcpSrv.Shutdown()
+	if f.udpConn != nil {
+		f.udpConn.Close()
+	}
+	if f.tcpLn != nil {
+		f.tcpLn.Close()
+	}
+	if f.udpSrv != nil {
+		f.udpSrv.Shutdown()
+	}
+	if f.tcpSrv != nil {
+		f.tcpSrv.Shutdown()
+	}
 }
 
 // ServeDNS implements dns.Handler for both listeners: it counts the
