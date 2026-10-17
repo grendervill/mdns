@@ -11,18 +11,14 @@
 # against an unresolvable name would cost a multi-minute backoff).
 # scripts/e2e-pebble.sh picks a subnet that no existing network uses.
 #
-# pebble is pinned to 2.8.0: pebble 2.9.0+ stopped sending a Location
-# header on the finalize response, and golang.org/x/crypto's autocert
-# (which internal/acmecert wraps) polls the order at that header, so
-# issuance cannot complete against newer pebble (see the task report;
-# upstream fix: acme.CreateCertFromOrder, golang.org/x/crypto v0.58.0).
-# Drop the pins once the dependency is bumped.
+# Both images are deliberately unpinned: the e2e follows the current
+# pebble release, which is what catches client-side protocol drift.
 
 services:
   # Authoritative DNS for the test domain (and the management API the
   # script uses to aim mdns.test at the daemon container).
   challtestsrv:
-    image: ghcr.io/letsencrypt/pebble-challtestsrv:2.8.0
+    image: ghcr.io/letsencrypt/pebble-challtestsrv
     # No AAAA by default: pebble must not pick a broken IPv6 path.
     command: ["-defaultIPv6", ""]
     ports:
@@ -34,7 +30,7 @@ services:
   # 5001/5002, so the custom config mounted below moves tls-alpn-01 to
   # 443 and http-01 to 80.
   pebble:
-    image: ghcr.io/letsencrypt/pebble:2.8.0
+    image: ghcr.io/letsencrypt/pebble
     depends_on:
       - challtestsrv
     command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "challtestsrv:8053"]

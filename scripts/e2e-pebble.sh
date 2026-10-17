@@ -12,15 +12,11 @@
 #   - the control API reports the certificate state "ok".
 #
 # The compose project is fixed to mdns-e2e-pebble and torn down with
-# `down -v` on exit, so the test is repeatable.
+# `down -v` on exit, so the test is repeatable. Both CA images are
+# unpinned: the e2e deliberately runs against the current pebble release.
 #
-# Two limits of the local CA shape this test (see the task report for
+# One limit of the local CA shapes this test (see the task report for
 # the evidence):
-#   - pebble is pinned to 2.8.0 in the compose file: pebble 2.9.0+
-#     stopped sending a Location header on the finalize response, and
-#     the autocert stack internal/acmecert wraps polls the order there,
-#     so issuance never completes against newer pebble (upstream fix:
-#     acme.CreateCertFromOrder, golang.org/x/crypto v0.58.0).
 #   - pebble issues leaves with an empty subject DN, and kdig (GnuTLS)
 #     refuses to complete a handshake with them, so the DoT and DoQ
 #     phases fall back to the dnsprobe helper (Go crypto/tls) after
