@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "domain": "mdns.test",
+  "protocols": {
+    "plain": {"enabled": true, "port": 53},
+    "doh": {"enabled": true, "port": 443},
+    "dot": {"enabled": true, "port": 853},
+    "doq": {"enabled": true, "port": 853}
+  },
+  "tls": {
+    "mode": "acme",
+    "acme": {
+      "provider": "custom",
+      "directory_url": "https://pebble:14000/dir",
+      "email": "e2e@example.com",
+      "insecure_skip_verify": true
+    }
+  },
+  "upstreams": [
+    {"id": "cf", "name": "Cloudflare", "transport": "plain", "address": "1.1.1.1:53", "priority": 0, "enabled": true}
+  ],
+  "strategy": "fastest",
+  "cache": {"size": 10000, "min_ttl": 0, "max_ttl": 86400},
+  "limits": {"plain_rps_per_ip": 50, "trusted_cidrs": []},
+  "log": {"memory_entries": 10000, "file": "", "max_file_size_bytes": 0},
+  "data_dir": "/var/lib/mdns",
+  "filter": {
+    "enabled": false,
+    "mode": "zero",
+    "update_interval_hours": 0,
+    "lists": [],
+    "user_allow": [],
+    "user_block": []
+  }
+}
