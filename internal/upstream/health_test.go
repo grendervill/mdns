@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"mydns/internal/testutil/scripted"
 )
 
 // discardLogger returns a logger that drops everything.
@@ -44,12 +46,12 @@ func TestMonitorRunStopsWithContext(t *testing.T) {
 // TestMonitorRunProbes checks that Run keeps probing while the context
 // is alive.
 func TestMonitorRunProbes(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetReply(req)
 		return m, nil
-	}
+	})
 	u := newTestUpstream(t, tr)
 
 	opts := DefaultMonitorOptions()
@@ -62,7 +64,7 @@ func TestMonitorRunProbes(t *testing.T) {
 	defer cancel()
 	m.Run(ctx)
 
-	if got := tr.callCount(); got == 0 {
+	if got := tr.Calls(); got == 0 {
 		t.Errorf("probes during Run = 0, want > 0")
 	}
 }
@@ -71,12 +73,12 @@ func TestMonitorRunProbes(t *testing.T) {
 // upstream not used for a while is probed on the idle interval, while
 // a recently used one is probed on the active interval.
 func TestMonitorRunRespectsIdleInterval(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetReply(req)
 		return m, nil
-	}
+	})
 	u := newTestUpstream(t, tr)
 
 	opts := DefaultMonitorOptions()
@@ -91,7 +93,7 @@ func TestMonitorRunRespectsIdleInterval(t *testing.T) {
 
 	// The never-used upstream is idle, so it should have been probed
 	// once at most (the first pass), not on every active tick.
-	if got := tr.callCount(); got > 2 {
+	if got := tr.Calls(); got > 2 {
 		t.Errorf("probes for an idle upstream = %d, want <= 2 (idle interval 500ms)", got)
 	}
 }

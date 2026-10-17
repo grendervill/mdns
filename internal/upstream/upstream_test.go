@@ -3,62 +3,22 @@ package upstream
 import (
 	"context"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 
 	"mydns/internal/config"
+	"mydns/internal/testutil/scripted"
 	"mydns/internal/transport"
 )
-
-// scriptedTransport is a hand-scripted Transport for tests: replies
-// come from a settable function and every request is recorded.
-type scriptedTransport struct {
-	mu    sync.Mutex
-	reply func(*dns.Msg) (*dns.Msg, error)
-	calls []*dns.Msg
-}
-
-func (s *scriptedTransport) Name() string { return "scripted" }
-
-func (s *scriptedTransport) Exchange(_ context.Context, req *dns.Msg) (*dns.Msg, error) {
-	s.mu.Lock()
-	s.calls = append(s.calls, req.Copy())
-	f := s.reply
-	s.mu.Unlock()
-
-	if f == nil {
-		return nil, fmt.Errorf("scripted: no reply configured")
-	}
-	return f(req)
-}
-
-func (s *scriptedTransport) Close() error { return nil }
-
-func (s *scriptedTransport) callCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.calls)
-}
-
-func (s *scriptedTransport) lastCall(t *testing.T) *dns.Msg {
-	t.Helper()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.calls) == 0 {
-		t.Fatal("scriptedTransport saw no calls")
-	}
-	return s.calls[len(s.calls)-1]
-}
 
 // newTestUpstream builds an upstream around tr; a nil tr is replaced by
 // a scripted one.
 func newTestUpstream(t *testing.T, tr transport.Transport) *Upstream {
 	t.Helper()
 	if tr == nil {
-		tr = &scriptedTransport{}
+		tr = scripted.New()
 	}
 	return NewWithTransport(config.UpstreamConfig{
 		ID:        "test",
@@ -102,14 +62,14 @@ func TestNewBuildsTransport(t *testing.T) {
 // TestExchangeCountsStats checks that Exchange delegates to the
 // transport and tracks sent and failed queries.
 func TestExchangeCountsStats(t *testing.T) {
-	tr := &scriptedTransport{}
+	tr := scripted.New()
 	u := newTestUpstream(t, tr)
 
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetReply(req)
 		return m, nil
-	}
+	})
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
 
@@ -120,7 +80,7 @@ func TestExchangeCountsStats(t *testing.T) {
 		t.Errorf("Stats() = (%d, %d), want (1, 0)", sent, failed)
 	}
 
-	tr.reply = func(*dns.Msg) (*dns.Msg, error) { return nil, fmt.Errorf("dial refused") }
+	tr.SetReply(func(*dns.Msg) (*dns.Msg, error) { return nil, fmt.Errorf("dial refused") })
 	if _, err := u.Exchange(context.Background(), q); err == nil {
 		t.Fatalf("Exchange() = nil error, want the transport's error")
 	}
@@ -189,18 +149,21 @@ func TestRecovery(t *testing.T) {
 
 // TestProbeSendsNSRoot checks that Probe asks each upstream "NS .".
 func TestProbeSendsNSRoot(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetReply(req)
 		return m, nil
-	}
+	})
 	u := newTestUpstream(t, tr)
 
 	m := NewMonitor([]*Upstream{u}, DefaultMonitorOptions(), discardLogger())
 	m.Probe(context.Background())
 
-	last := tr.lastCall(t)
+	last := tr.LastCall()
+	if last == nil {
+		t.Fatal("probe transport saw no calls")
+	}
 	if len(last.Question) != 1 {
 		t.Fatalf("probe questions = %d, want 1", len(last.Question))
 	}
@@ -215,12 +178,12 @@ func TestProbeSendsNSRoot(t *testing.T) {
 // TestProbeSERVFAILIsFailure checks that a SERVFAIL probe counts as a
 // failure: three of them make the upstream unhealthy.
 func TestProbeSERVFAILIsFailure(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeServerFailure)
 		return m, nil
-	}
+	})
 	u := newTestUpstream(t, tr)
 	m := NewMonitor([]*Upstream{u}, DefaultMonitorOptions(), discardLogger())
 
@@ -235,12 +198,12 @@ func TestProbeSERVFAILIsFailure(t *testing.T) {
 // TestProbeNXDOMAINIsSuccess checks that NXDOMAIN counts as a healthy
 // answer: probe failures must reflect reachability, not answer content.
 func TestProbeNXDOMAINIsSuccess(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		m := new(dns.Msg)
 		m.SetRcode(req, dns.RcodeNameError)
 		return m, nil
-	}
+	})
 	u := newTestUpstream(t, tr)
 	m := NewMonitor([]*Upstream{u}, DefaultMonitorOptions(), discardLogger())
 
@@ -255,10 +218,10 @@ func TestProbeNXDOMAINIsSuccess(t *testing.T) {
 // TestProbeTimeoutIsFailure checks that an upstream that outlives the
 // monitor's timeout counts as a failure.
 func TestProbeTimeoutIsFailure(t *testing.T) {
-	tr := &scriptedTransport{}
-	tr.reply = func(req *dns.Msg) (*dns.Msg, error) {
+	tr := scripted.New()
+	tr.SetReply(func(req *dns.Msg) (*dns.Msg, error) {
 		return nil, context.DeadlineExceeded // the monitor's timeout fired
-	}
+	})
 	u := newTestUpstream(t, tr)
 
 	opts := DefaultMonitorOptions()
