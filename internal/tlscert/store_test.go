@@ -20,6 +20,10 @@ import (
 // testDomain is the server domain used across the tests.
 const testDomain = "dns.example.com"
 
+// Compile-time proof that the static store satisfies the source
+// contract that the ACME manager will implement as well.
+var _ tlscert.Source = (*tlscert.Store)(nil)
+
 // writeCertPair generates a fresh self-signed ECDSA P-256 certificate
 // for testDomain with a known serial number and writes the certificate
 // and key as PEM files. It returns the serial number so the caller can
@@ -131,6 +135,106 @@ func TestFiles(t *testing.T) {
 	if got := cert.Leaf.DNSNames; len(got) != 1 || got[0] != testDomain {
 		t.Errorf("DNSNames = %v, want [%s]", got, testDomain)
 	}
+}
+
+func TestStoreImplementsSource(t *testing.T) {
+	s, err := tlscert.New(config.TLS{Mode: "self-signed"}, testDomain)
+	if err != nil {
+		t.Fatalf("New(self-signed) = %v, want nil", err)
+	}
+
+	var src tlscert.Source = s
+	cert, err := src.GetCertificate(nil)
+	if err != nil {
+		t.Fatalf("GetCertificate(nil) = %v, want nil", err)
+	}
+	if cert == nil {
+		t.Fatal("GetCertificate(nil) returned a nil certificate")
+	}
+}
+
+func TestStoreStatus(t *testing.T) {
+	t.Run("self-signed", func(t *testing.T) {
+		s, err := tlscert.New(config.TLS{Mode: "self-signed"}, testDomain)
+		if err != nil {
+			t.Fatalf("New(self-signed) = %v, want nil", err)
+		}
+		if !s.Ready() {
+			t.Error("Ready() = false, want true")
+		}
+		if s.ACMEALPN() {
+			t.Error("ACMEALPN() = true, want false")
+		}
+
+		got := s.Status()
+		if got.Mode != "self-signed" {
+			t.Errorf("Status().Mode = %q, want self-signed", got.Mode)
+		}
+		if got.State != "ok" {
+			t.Errorf("Status().State = %q, want ok", got.State)
+		}
+		if got.Error != "" {
+			t.Errorf("Status().Error = %q, want empty", got.Error)
+		}
+		if got.Issuer != testDomain {
+			t.Errorf("Status().Issuer = %q, want %q", got.Issuer, testDomain)
+		}
+		want := time.Now().Add(90 * 24 * time.Hour)
+		if d := got.NotAfter.Sub(want); d < -5*time.Minute || d > 5*time.Minute {
+			t.Errorf("Status().NotAfter = %v, want ~%v (90 days from now)", got.NotAfter, want)
+		}
+	})
+
+	t.Run("files", func(t *testing.T) {
+		dir := t.TempDir()
+		certPath := filepath.Join(dir, "cert.pem")
+		keyPath := filepath.Join(dir, "key.pem")
+		writeCertPair(t, certPath, keyPath)
+
+		// The expected issuer and expiry come from the certificate on
+		// disk, not from the store.
+		pemBytes, err := os.ReadFile(certPath)
+		if err != nil {
+			t.Fatalf("read %s: %v", certPath, err)
+		}
+		block, _ := pem.Decode(pemBytes)
+		if block == nil {
+			t.Fatalf("%s holds no PEM block", certPath)
+		}
+		want, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("parse %s: %v", certPath, err)
+		}
+
+		s, err := tlscert.New(config.TLS{
+			Mode:     "files",
+			CertFile: certPath,
+			KeyFile:  keyPath,
+		}, testDomain)
+		if err != nil {
+			t.Fatalf("New(files) = %v, want nil", err)
+		}
+		if !s.Ready() {
+			t.Error("Ready() = false, want true")
+		}
+		if s.ACMEALPN() {
+			t.Error("ACMEALPN() = true, want false")
+		}
+
+		got := s.Status()
+		if got.Mode != "files" {
+			t.Errorf("Status().Mode = %q, want files", got.Mode)
+		}
+		if got.State != "ok" {
+			t.Errorf("Status().State = %q, want ok", got.State)
+		}
+		if got.Issuer != want.Issuer.CommonName {
+			t.Errorf("Status().Issuer = %q, want %q", got.Issuer, want.Issuer.CommonName)
+		}
+		if !got.NotAfter.Equal(want.NotAfter) {
+			t.Errorf("Status().NotAfter = %v, want %v", got.NotAfter, want.NotAfter)
+		}
+	})
 }
 
 func TestBadMode(t *testing.T) {
