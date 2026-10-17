@@ -24,6 +24,10 @@ type stubClient struct {
 	statusErr   error
 	statusCalls int
 	events      chan api.Event
+
+	filters   []string
+	updateErr error
+	updates   []*config.Config
 }
 
 func (s *stubClient) Status(context.Context) (api.Status, error) {
@@ -33,7 +37,13 @@ func (s *stubClient) Status(context.Context) (api.Status, error) {
 func (s *stubClient) Config(context.Context) (*config.Config, error) {
 	return config.Default(), nil
 }
-func (s *stubClient) UpdateConfig(context.Context, *config.Config) error { return nil }
+func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
+	if s.updateErr != nil {
+		return s.updateErr
+	}
+	s.updates = append(s.updates, c)
+	return nil
+}
 func (s *stubClient) Providers(context.Context) ([]providers.Provider, error) {
 	return nil, nil
 }
@@ -44,7 +54,10 @@ func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) { retu
 func (s *stubClient) FilterStatus(context.Context) ([]filter.ListStatus, error) {
 	return nil, nil
 }
-func (s *stubClient) FilterUpdate(context.Context, string) error { return nil }
+func (s *stubClient) FilterUpdate(_ context.Context, id string) error {
+	s.filters = append(s.filters, id)
+	return nil
+}
 func (s *stubClient) Events(context.Context) (<-chan api.Event, error) {
 	if s.events == nil {
 		s.events = make(chan api.Event)

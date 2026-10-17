@@ -7,6 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"mydns/internal/api"
+	"mydns/internal/config"
+	"mydns/internal/filter"
 	"mydns/internal/qlog"
 )
 
@@ -65,6 +67,19 @@ type Model struct {
 	requestsPaused bool
 	requestsScroll int
 
+	filterLists  []filter.ListStatus
+	filterCursor int
+	filterErr    error
+
+	settingsCfg    *config.Config
+	settingsCursor int
+	settingsErr    error
+
+	inputActive bool
+	inputMode   inputMode
+	inputField  int
+	input       string
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -109,6 +124,18 @@ type (
 	}
 	eventMsg        struct{ e api.Event }
 	eventsClosedMsg struct{}
+
+	filterLoadedMsg struct {
+		lists []filter.ListStatus
+		err   error
+	}
+	filterUpdatedMsg struct{ err error }
+
+	configLoadedMsg struct {
+		cfg *config.Config
+		err error
+	}
+	configAppliedMsg struct{ err error }
 )
 
 // fetchStatus loads the status snapshot.
@@ -177,37 +204,204 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.events = nil
 		return m, nil
 
+	case filterLoadedMsg:
+		m.filterLists = msg.lists
+		m.filterErr = msg.err
+		if m.filterCursor >= len(m.filterLists) {
+			m.filterCursor = 0
+		}
+		return m, nil
+
+	case filterUpdatedMsg:
+		return m.applyFilterUpdateResult(msg.err)
+
+	case configLoadedMsg:
+		m.settingsCfg = msg.cfg
+		m.settingsErr = msg.err
+		return m, nil
+
+	case configAppliedMsg:
+		if msg.err != nil {
+			m.settingsErr = msg.err
+			m.filterErr = msg.err
+			return m, nil
+		}
+		m.settingsErr = nil
+		m.filterErr = nil
+		return m, fetchStatus(m.client)
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
 	return m, nil
 }
 
+// refreshCmd reloads the data of the active screen.
+func (m Model) refreshCmd() tea.Cmd {
+	cmds := []tea.Cmd{fetchStatus(m.client)}
+	switch m.screen {
+	case screenFilters:
+		cmds = append(cmds, loadFilterStatus(m.client))
+	case screenSettings:
+		cmds = append(cmds, loadConfig(m.client))
+	}
+	return tea.Batch(cmds...)
+}
+
+// lazyLoadCmd loads the screen's data on first visit.
+func (m Model) lazyLoadCmd() tea.Cmd {
+	switch m.screen {
+	case screenFilters:
+		if m.filterLists == nil {
+			return loadFilterStatus(m.client)
+		}
+	case screenSettings:
+		if m.settingsCfg == nil {
+			return loadConfig(m.client)
+		}
+	}
+	return nil
+}
+
 // handleKey processes one key press.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.inputActive {
+		return m.handleInputKey(msg)
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.cancel()
 		return m, tea.Quit
 	case "r":
-		return m, fetchStatus(m.client)
-	case " ":
-		m.requestsPaused = !m.requestsPaused
-	case "x":
-		m.requests = nil
-		m.requestsScroll = 0
-	case "up", "k":
-		if m.requestsScroll < len(m.requests) {
-			m.requestsScroll++
-		}
-	case "down", "j":
-		if m.requestsScroll > 0 {
-			m.requestsScroll--
-		}
+		return m, m.refreshCmd()
 	case "1", "2", "3", "4", "5", "6", "7":
 		idx := int(msg.String()[0] - '1')
 		m.screen = screenTabs[idx].screen
+		return m, m.lazyLoadCmd()
 	}
+
+	switch m.screen {
+	case screenRequests:
+		switch msg.String() {
+		case " ":
+			m.requestsPaused = !m.requestsPaused
+		case "x":
+			m.requests = nil
+			m.requestsScroll = 0
+		case "up", "k":
+			if m.requestsScroll < len(m.requests) {
+				m.requestsScroll++
+			}
+		case "down", "j":
+			if m.requestsScroll > 0 {
+				m.requestsScroll--
+			}
+		}
+
+	case screenFilters:
+		fields := m.filterLists
+		switch msg.String() {
+		case "j", "down":
+			if m.filterCursor < len(fields)-1 {
+				m.filterCursor++
+			}
+		case "k", "up":
+			if m.filterCursor > 0 {
+				m.filterCursor--
+			}
+		case "enter":
+			if len(fields) > 0 {
+				return m, filterUpdateCmd(m.client, fields[m.filterCursor].ID)
+			}
+		case "u":
+			return m, filterUpdateCmd(m.client, "")
+		case "m":
+			next := nextBlockMode(m.status.Filter.Mode)
+			m.status.Filter.Mode = next // optimistic until the reload lands
+			return m, applyModeCmd(m.client, next)
+		case "a":
+			m.inputActive = true
+			m.inputMode = inputRule
+			m.input = ""
+		}
+
+	case screenSettings:
+		switch msg.String() {
+		case "j", "down":
+			if m.settingsCfg != nil && m.settingsCursor < len(m.settingsFields())-1 {
+				m.settingsCursor++
+			}
+		case "k", "up":
+			if m.settingsCursor > 0 {
+				m.settingsCursor--
+			}
+		case "enter":
+			if m.settingsCfg == nil {
+				return m, m.lazyLoadCmd()
+			}
+			f := m.settingsFields()[m.settingsCursor]
+			if f.toggle != nil {
+				f.toggle(m.settingsCfg)
+				return m, nil
+			}
+			m.inputActive = true
+			m.inputMode = inputSettingsField
+			m.inputField = m.settingsCursor
+			m.input = ""
+		case "ctrl+s":
+			if m.settingsCfg == nil {
+				return m, nil
+			}
+			return m, applySettingsCmd(m.client, cloneConfig(m.settingsCfg))
+		}
+	}
+	return m, nil
+}
+
+// handleInputKey processes keys while an input line is open.
+func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.inputActive = false
+		m.input = ""
+		return m, nil
+	case tea.KeyEnter:
+		return m.commitInput()
+	case tea.KeyBackspace:
+		runes := []rune(m.input)
+		if len(runes) > 0 {
+			m.input = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	case tea.KeySpace:
+		m.input += " "
+		return m, nil
+	case tea.KeyRunes:
+		m.input += string(msg.Runes)
+		return m, nil
+	}
+	return m, nil
+}
+
+// commitInput applies the open input line.
+func (m Model) commitInput() (tea.Model, tea.Cmd) {
+	switch m.inputMode {
+	case inputRule:
+		return m.commitRule()
+	case inputSettingsField:
+		m.inputActive = false
+		field := m.settingsFields()[m.inputField]
+		err := commitSettingsField(field, m.settingsCfg, m.input)
+		m.input = ""
+		if err != nil {
+			m.settingsErr = err
+		} else {
+			m.settingsErr = nil
+		}
+		return m, nil
+	}
+	m.inputActive = false
 	return m, nil
 }
 
@@ -243,6 +437,10 @@ func (m Model) View() string {
 		b.WriteString(m.requestsView())
 	case screenUpstreams:
 		b.WriteString(m.upstreamsView())
+	case screenFilters:
+		b.WriteString(m.filtersView())
+	case screenSettings:
+		b.WriteString(m.settingsView())
 	case screenHelp:
 		b.WriteString(m.helpView())
 	default:
