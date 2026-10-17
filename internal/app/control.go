@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"mydns/internal/api"
-	"mydns/internal/config"
 	"mydns/internal/links"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -43,31 +42,14 @@ func (a *App) statusLocked() api.Status {
 		Version:   version.String(),
 		Domain:    cfg.Domain,
 		Links:     links.Links(cfg),
-		Listeners: listenLabels(cfg),
+		Listeners: rt.server.Listeners(),
 		Strategy:  cfg.Strategy,
 		Upstreams: a.upstreamStatusesLocked(),
 		Cache:     rt.cache.Stats(),
 		Filter:    a.filterSnapshotLocked(),
+		Cert:      rt.certSource.Status(),
 	}
 	return st
-}
-
-// listenLabels lists the enabled listeners as "proto:port".
-func listenLabels(cfg *config.Config) []string {
-	var out []string
-	if cfg.Protocols.DoH.Enabled {
-		out = append(out, fmt.Sprintf("doh:%d", cfg.Protocols.DoH.Port))
-	}
-	if cfg.Protocols.DoT.Enabled {
-		out = append(out, fmt.Sprintf("dot:%d", cfg.Protocols.DoT.Port))
-	}
-	if cfg.Protocols.DoQ.Enabled {
-		out = append(out, fmt.Sprintf("doq:%d", cfg.Protocols.DoQ.Port))
-	}
-	if cfg.Protocols.Plain.Enabled {
-		out = append(out, fmt.Sprintf("plain:%d", cfg.Protocols.Plain.Port))
-	}
-	return out
 }
 
 // upstreamStatusesLocked snapshots every upstream. The caller must

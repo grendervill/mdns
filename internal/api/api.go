@@ -20,6 +20,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/tlscert"
 )
 
 // Status is the read-only snapshot the interfaces render.
@@ -32,6 +33,7 @@ type Status struct {
 	Upstreams []UpstreamStatus
 	Cache     cache.Stats
 	Filter    FilterSnapshot
+	Cert      tlscert.Status
 }
 
 // UpstreamStatus is one upstream's live state.
