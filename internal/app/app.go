@@ -91,6 +91,8 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		router,
 		cache.New(cfg.Cache.Size, cfg.Cache.MinTTL, cfg.Cache.MaxTTL),
 		queryLog,
+		nil, // the filter engine joins here in the next task
+		cfg.Filter.Mode,
 		logger,
 	)
 
