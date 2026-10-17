@@ -158,6 +158,15 @@ func TestAppServesPlain(t *testing.T) {
 	}
 }
 
+// tlsSkipClient returns an HTTP client trusting self-signed test
+// servers.
+func tlsSkipClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		Timeout:   3 * time.Second,
+	}
+}
+
 // TestAppFilterBlocks checks the whole filter wiring: the updater
 // fetches the list over TLS, the engine blocks a domain while letting
 // others through, and a dead list server keeps the rules working with
@@ -178,10 +187,7 @@ func TestAppFilterBlocks(t *testing.T) {
 		Lists:   []config.FilterList{{ID: "test-list", URL: srv.URL + "/list.txt"}},
 	}
 
-	cl := &http.Client{
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
-		Timeout:   3 * time.Second,
-	}
+	cl := tlsSkipClient()
 	a, err := app.New(cfg, app.Options{
 		Monitor:        fastMonitor(),
 		FilterClient:   cl,
