@@ -220,7 +220,7 @@
 - В сводке: при `acme` и DoH `port != 443` — предупреждение «ACME использует HTTP-01 на порту 80»; при acme — строка «сертификат будет выпущен после запуска демона».
 - Существующие тесты файлов/self-signed продолжают проходить (варианты 3–4 сохраняют прежние пути).
 
-- [ ] **Step 1: Падающие тесты**: `TestWizardTLSLet'sEncrypt` (cursor 0 → email → cfg.TLS.ACME); `TestWizardTLSZeroSSL` (EAB kid/hmac попадают в конфиг); `TestWizardTLSCustom` (URL + insecure y/n); обновить `TestWizardFlow` (курсор теперь 3 для self-signed — взять значение из константы, не магическое число); `TestWizardSummaryWarnsHTTP01`.
+- [ ] **Step 1: Падающие тесты**: `TestWizardTLSLetsEncrypt` (cursor 0 → email → cfg.TLS.ACME); `TestWizardTLSZeroSSL` (EAB kid/hmac попадают в конфиг); `TestWizardTLSCustom` (URL + insecure y/n); обновить `TestWizardFlow` (курсор теперь 3 для self-signed — взять значение из константы, не магическое число); `TestWizardSummaryWarnsHTTP01`.
 - [ ] **Step 2: целевые тесты — FAIL**.
 - [ ] **Step 3: реализовать** (очередь вводов на шаг TLS: список вариантов + последовательные input'ы).
 - [ ] **Step 4: `go test ./internal/tui/ -race -count=1` — PASS**; tmux-прогон ветки Let's Encrypt (до сохранения, без реального выпуска).
@@ -391,7 +391,7 @@
 - `install.sh` (bash, `set -euo pipefail`): флаги `--local <bin>`, `--version vX.Y.Z`, остальное передаётся `mdns install "$@"`. Режим по умолчанию: `BASE=${MDNS_BASE_URL:-https://github.com/grendervill/mdns/releases}`; latest → `$BASE/latest/download`, версия → `$BASE/download/$VERSION`; скачать `mdns-linux-$ARCH` и `SHA256SUMS`, сверить `sha256sum -c`, поставить в `/usr/local/bin/mdns` (0755); затем `exec /usr/local/bin/mdns install "$@"`. `MDNS_BASE_URL` — тестовый хук (Task 14).
 - ARCH: `x86_64→amd64`, `aarch64/arm64→arm64`.
 
-- [ ] **Step 1: тест**: `bash -n install.sh`; локальный смоук с `MDNS_BASE_URL=http://127.0.0.1:<port>` и `python3 -m http.server` из `dist/` (скачивание+шам-проверка+подстановка бинарника в temp-prefix через `--dest`? нет — смок на mac: бинарник linux не запустится, поэтому проверяем только скачивание/сверку — `--download-only` НЕ вводим, вместо этого локальный смоук ограничивается сверкой SHA256 вручную и `bash -n`; полная проверка — Task 14 в контейнере).
+- [ ] **Step 1: тест**: `bash -n install.sh` — синтаксис; `make dist-linux` — оба бинарника и `SHA256SUMS` на месте, сумма в файле совпадает с `shasum -a 256 dist/mdns-linux-<arch>`; проверить парсинг флагов (`--local`, `--version`) ревью-чтением скрипта. Полная проверка download-режима — Task 14 (в контейнере, где linux-бинарник исполним).
 - [ ] **Step 2: полная проверка в Task 14** (download-режим через `MDNS_BASE_URL` на host-файл-сервер).
 - [ ] **Step 3: реализовать**.
 - [ ] **Step 4: `make dist-linux && ls dist/` — файлы и суммы на месте**.
