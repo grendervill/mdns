@@ -67,11 +67,13 @@ type runtime struct {
 	filterInterval time.Duration
 
 	// certSource provides the TLS certificate; acmeMgr is the same
-	// object when the source is the ACME manager. certCfg and dataDir
-	// scope the manager's reuse across generations. challengeHTTP asks
-	// start to bind the ACME HTTP-01 responder on :80.
+	// object when the source is the ACME manager. certDomain, certCfg
+	// and dataDir scope the manager's reuse across generations: the
+	// manager is bound to one domain, TLS section and cache directory.
+	// challengeHTTP asks start to bind the ACME HTTP-01 responder on :80.
 	certSource    tlscert.Source
 	acmeMgr       *acmecert.Manager
+	certDomain    string
 	certCfg       config.TLS
 	challengeHTTP bool
 
@@ -612,6 +614,7 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 		filterInterval: interval,
 		certSource:     certSource,
 		acmeMgr:        acmeMgr,
+		certDomain:     cfg.Domain,
 		certCfg:        cfg.TLS,
 		challengeHTTP:  acmeMgr != nil && !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443),
 		logCfg:         cfg.Log,
@@ -623,9 +626,10 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 
 // buildCertSource assembles the certificate source for a generation: a
 // static store for files/self-signed, an ACME manager for acme mode.
-// The manager carries over from prev when the TLS config and the data
-// dir are unchanged, so a rebuild for another section does not restart
-// issuance; a structural TLS change builds a new one.
+// The manager carries over from prev when it still matches the
+// configuration (see reuseACMEManager), so a rebuild for another
+// section does not restart issuance; a structural certificate change
+// builds a new one.
 func buildCertSource(cfg *config.Config, prev *runtime, logger *slog.Logger) (tlscert.Source, *acmecert.Manager, error) {
 	if cfg.TLS.Mode != "acme" {
 		store, err := tlscert.New(cfg.TLS, cfg.Domain)
@@ -635,7 +639,7 @@ func buildCertSource(cfg *config.Config, prev *runtime, logger *slog.Logger) (tl
 		return store, nil, nil
 	}
 
-	if prev != nil && prev.acmeMgr != nil && prev.certCfg == cfg.TLS && prev.dataDir == cfg.DataDir {
+	if reuseACMEManager(prev, cfg) {
 		return prev.acmeMgr, prev.acmeMgr, nil
 	}
 
@@ -666,6 +670,19 @@ func buildCertSource(cfg *config.Config, prev *runtime, logger *slog.Logger) (tl
 		return nil, nil, fmt.Errorf("app: acme: %w", err)
 	}
 	return m, m, nil
+}
+
+// reuseACMEManager reports whether the previous generation's ACME
+// manager can serve this configuration. The manager is bound to one
+// domain (the ACME HostPolicy and the name it fetches), one TLS section
+// and one cache directory, so any of those changing needs a fresh
+// manager; the caller has already established that cfg selects acme
+// mode.
+func reuseACMEManager(prev *runtime, cfg *config.Config) bool {
+	if prev == nil || prev.acmeMgr == nil {
+		return false
+	}
+	return prev.certDomain == cfg.Domain && prev.certCfg == cfg.TLS && prev.dataDir == cfg.DataDir
 }
 
 // acmeBackoffFromEnv reads the test-only backoff overrides
