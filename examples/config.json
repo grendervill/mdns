@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "domain": "mdns.test",
+  "protocols": {
+    "plain": { "enabled": true, "port": 5533 },
+    "doh": { "enabled": true, "port": 8443 },
+    "dot": { "enabled": true, "port": 8853 },
+    "doq": { "enabled": true, "port": 8853 }
+  },
+  "tls": {
+    "mode": "self-signed"
+  },
+  "upstreams": [
+    {
+      "id": "cloudflare-plain",
+      "name": "Cloudflare",
+      "transport": "plain",
+      "address": "1.1.1.1:53",
+      "priority": 0,
+      "enabled": true
+    },
+    {
+      "id": "google-dot",
+      "name": "Google",
+      "transport": "dot",
+      "address": "8.8.8.8:853",
+      "server_name": "dns.google",
+      "priority": 1,
+      "enabled": true
+    },
+    {
+      "id": "quad9-doh",
+      "name": "Quad9",
+      "transport": "doh",
+      "address": "https://dns.quad9.net/dns-query",
+      "priority": 2,
+      "enabled": true
+    }
+  ],
+  "strategy": "fastest",
+  "cache": {
+    "size": 10000,
+    "min_ttl": 0,
+    "max_ttl": 86400
+  },
+  "limits": {
+    "plain_rps_per_ip": 50,
+    "trusted_cidrs": []
+  },
+  "log": {
+    "memory_entries": 10000,
+    "file": "",
+    "max_file_size_bytes": 0
+  }
+}
