@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,6 +73,9 @@ type Updater struct {
 	maxBytes int64
 	logger   *slog.Logger
 
+	interval atomic.Int64 // nanoseconds; the sleeping Run picks changes up immediately
+	wake     chan struct{}
+
 	mu     sync.Mutex
 	status map[string]*ListStatus
 	order  []string
@@ -100,6 +104,7 @@ func NewUpdater(opts UpdaterOptions) *Updater {
 		client:   client,
 		maxBytes: maxBytes,
 		logger:   logger,
+		wake:     make(chan struct{}, 1),
 		status:   make(map[string]*ListStatus, len(opts.Specs)),
 	}
 	for _, s := range opts.Specs {
@@ -109,11 +114,25 @@ func NewUpdater(opts UpdaterOptions) *Updater {
 	return u
 }
 
+// SetInterval changes the update period; a Run currently sleeping
+// re-arms immediately. A zero interval means "single update": a running
+// Run stops after its current pass.
+func (u *Updater) SetInterval(d time.Duration) {
+	u.interval.Store(int64(d))
+	select {
+	case u.wake <- struct{}{}:
+	default:
+	}
+}
+
 // LoadFromDisk installs every list that has persisted rules under
 // DataDir/filters. Missing or unreadable files are skipped: the engine
 // simply starts without those lists.
 func (u *Updater) LoadFromDisk() error {
 	for _, spec := range u.specs {
+		if err := validateListID(spec.ID); err != nil {
+			continue // never touch paths outside the filters dir
+		}
 		meta, err := u.readMeta(spec.ID)
 		if err != nil {
 			continue // nothing cached for this list yet
@@ -156,23 +175,53 @@ func (u *Updater) Update(ctx context.Context) {
 }
 
 // Run performs an immediate Update and then repeats it every interval
-// until ctx is cancelled; a zero interval means a single update.
+// until ctx is cancelled; a non-positive interval means no periodic
+// refreshes until SetInterval arms one. While idle or sleeping,
+// SetInterval changes take effect immediately.
 func (u *Updater) Run(ctx context.Context, interval time.Duration) {
-	u.Update(ctx)
-	if interval <= 0 {
-		return
-	}
+	u.SetInterval(interval)
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	u.Update(ctx)
 	for {
+		d := time.Duration(u.interval.Load())
+		if d <= 0 {
+			// Manual mode: stay alive so a later SetInterval can arm
+			// periodic refreshes without a daemon restart.
+			select {
+			case <-ctx.Done():
+				return
+			case <-u.wake:
+			}
+			continue
+		}
+
+		timer := time.NewTimer(d)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-u.wake:
+			timer.Stop() // new interval: re-arm
+		case <-timer.C:
 			u.Update(ctx)
 		}
 	}
+}
+
+// UpdateOne refreshes one list by ID; an empty id refreshes every
+// list. Unknown IDs are an error.
+func (u *Updater) UpdateOne(ctx context.Context, id string) error {
+	if id == "" {
+		u.Update(ctx)
+		return nil
+	}
+	for _, spec := range u.specs {
+		if spec.ID == id {
+			u.updateOne(ctx, spec)
+			return nil
+		}
+	}
+	return fmt.Errorf("filter: unknown list %q", id)
 }
 
 // Status returns the current state of every configured list, in

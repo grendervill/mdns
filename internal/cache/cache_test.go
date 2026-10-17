@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -166,6 +167,52 @@ func TestGetStripsCookies(t *testing.T) {
 	}
 	if sz := gotOpt.UDPSize(); sz != 1232 {
 		t.Errorf("advertised UDP size = %d, want 1232 (only cookies are stripped)", sz)
+	}
+}
+
+// TestSetSizeEvicts checks that shrinking the cache drops the least
+// recently used entries.
+func TestSetSizeEvicts(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 86400)
+
+	for i := 0; i < 10; i++ {
+		q := query(fmt.Sprintf("d%d.example.com", i))
+		c.Put(q, reply(q, 300))
+	}
+	c.Get(query("d8.example.com"))
+	c.Get(query("d9.example.com"))
+
+	c.SetSize(2)
+	if got := c.Stats().Size; got != 2 {
+		t.Fatalf("Size after SetSize(2) = %d, want 2", got)
+	}
+	for _, keep := range []string{"d8.example.com", "d9.example.com"} {
+		if _, ok := c.Get(query(keep)); !ok {
+			t.Errorf("Get(%s) = miss, want hit (most recently used survive)", keep)
+		}
+	}
+	if _, ok := c.Get(query("d0.example.com")); ok {
+		t.Errorf("Get(d0) = hit, want miss (evicted)")
+	}
+}
+
+// TestSetLimits checks that a new clamp applies to later stores.
+func TestSetLimits(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 60)
+
+	q := query("long.example.com")
+	c.Put(q, reply(q, 999999))
+	got, ok := c.Get(query("long.example.com"))
+	if !ok || got.Answer[0].Header().Ttl != 60 {
+		t.Fatalf("served TTL = %v (ok=%v), want the 60s clamp", got, ok)
+	}
+
+	c.SetLimits(0, 10)
+	q2 := query("long.example.com")
+	c.Put(q2, reply(q2, 999999))
+	got, ok = c.Get(query("long.example.com"))
+	if !ok || got.Answer[0].Header().Ttl != 10 {
+		t.Fatalf("served TTL after SetLimits = %v, want 10", got.Answer[0].Header().Ttl)
 	}
 }
 
@@ -387,4 +434,35 @@ func TestStatsAndFlush(t *testing.T) {
 	if st := c.Stats(); st.Misses != 2 {
 		t.Errorf("Misses after Flush = %d, want 2; stats: %s", st.Misses, fmt.Sprint(st))
 	}
+}
+
+// TestConcurrentSetLimitsAndPut checks that live TTL-clamp changes do
+// not race with cache stores (meaningful under -race).
+func TestConcurrentSetLimitsAndPut(t *testing.T) {
+	c, _ := newTestCache(t, 64, 0, 3600)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; ; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				req := query(fmt.Sprintf("c%d-%d.example.com", n, j))
+				c.Put(req, reply(req, 60))
+				c.Get(req)
+			}
+		}(i)
+	}
+
+	for i := 0; i < 200; i++ {
+		c.SetLimits(0, uint32(60+i))
+	}
+	close(stop)
+	wg.Wait()
 }

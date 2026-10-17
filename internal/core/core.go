@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -42,8 +43,9 @@ type Core struct {
 	cache    *cache.Cache
 	log      *qlog.Log
 	filter   Filter
-	mode     string
 	logger   *slog.Logger
+
+	blockMode atomic.Value // string: zero | nxdomain | refused
 }
 
 // New wires the pipeline. mode selects how blocked names are answered:
@@ -53,7 +55,14 @@ func New(r Resolver, c *cache.Cache, l *qlog.Log, f Filter, mode string, logger 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Core{resolver: r, cache: c, log: l, filter: f, mode: mode, logger: logger}
+	core := &Core{resolver: r, cache: c, log: l, filter: f, logger: logger}
+	core.blockMode.Store(mode)
+	return core
+}
+
+// SetBlockMode replaces the answer mode for blocked names live.
+func (c *Core) SetBlockMode(mode string) {
+	c.blockMode.Store(mode)
 }
 
 // Resolve answers one request and always returns a message: internal
@@ -72,7 +81,8 @@ func (c *Core) Resolve(ctx context.Context, req *dns.Msg, meta Meta) *dns.Msg {
 
 	if c.filter != nil {
 		if blocked, source := c.filter.Check(req.Question[0].Name); blocked {
-			resp := blockedReply(req, c.mode)
+			mode, _ := c.blockMode.Load().(string)
+			resp := blockedReply(req, mode)
 			c.record(req, meta, resp, nil, start, false, true, source)
 			return resp
 		}

@@ -8,6 +8,8 @@
 #   - plain DNS (dig) for a normal and a list-blocked domain,
 #   - DoT (kdig +tls) and DoQ (kdig +quic),
 #   - DoH (curl, RFC 8484 GET),
+#   - the control API on the unix socket (status, config round-trip,
+#     persistence, SSE),
 #   - the persisted filter rules on disk.
 #
 # Usage:
@@ -123,6 +125,27 @@ od -An -tx1 -N16 /tmp/doh.bin
 
 echo "--- filter list on disk ---"
 wc -l /tmp/mdns-data/filters/adguard-dns-filter.rules
+
+echo "--- control API: socket ---"
+ls -l /run/mdns/mdns.sock
+
+echo "--- control API: status ---"
+curl -s --max-time 5 --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/status | head -c 260; echo
+
+echo "--- control API: SSE ping ---"
+curl -sN --max-time 2 --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/events | head -c 80 || true
+echo
+
+echo "--- control API: config round-trip (user_allow) ---"
+curl -s --max-time 5 --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/config > /tmp/api-config.json
+sed -i 's/"user_allow": *\[\]/"user_allow": ["api-allowed.example.com"]/' /tmp/api-config.json
+curl -s --max-time 5 -X PUT -H 'Content-Type: application/json' \
+  --data @/tmp/api-config.json --unix-socket /run/mdns/mdns.sock \
+  http://localhost/api/v1/config
+echo
+echo "persisted allow entries: $(grep -c 'api-allowed' /tmp/config.json)"
+echo "still serving after the update:"
+dig @127.0.0.1 -p 5533 example.com A +short +timeout=4 | head -1
 
 echo "--- serve log ---"
 tail -6 /tmp/serve.log

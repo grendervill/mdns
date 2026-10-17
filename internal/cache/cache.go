@@ -113,6 +113,12 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 	if !ok {
 		return
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// SetLimits may replace the clamps at any moment; read them under
+	// the same lock that guards the entries.
 	if ttl < c.minTTL {
 		ttl = c.minTTL
 	}
@@ -122,9 +128,6 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 	if ttl == 0 {
 		return
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	now := c.now()
 	k := keyFor(req)
@@ -150,6 +153,34 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 		expires:  now.Add(time.Duration(ttl) * time.Second),
 	}
 	c.entries[k] = c.lru.PushFront(e)
+}
+
+// SetSize changes the entry bound and immediately evicts the least
+// recently used entries beyond it.
+func (c *Cache) SetSize(size int) {
+	if size < 1 {
+		size = 1
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.size = size
+	for len(c.entries) > size {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		c.removeElement(back)
+	}
+}
+
+// SetLimits replaces the TTL clamp for future stores and serves.
+func (c *Cache) SetLimits(minTTL, maxTTL uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.minTTL = minTTL
+	c.maxTTL = maxTTL
 }
 
 // Flush drops every entry. Cumulative hit and miss counters survive.

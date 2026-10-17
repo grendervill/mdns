@@ -142,7 +142,7 @@ func TestEndToEndAllProtocols(t *testing.T) {
 		t.Fatalf("cfg.Validate() = %v, want nil", err)
 	}
 
-	a, err := app.New(cfg, app.Options{Monitor: fastMonitor()}, discardLogger())
+	a, err := app.New(cfg, testOptions(t), discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}

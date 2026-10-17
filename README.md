@@ -5,17 +5,21 @@ DNS-over-TLS, DNS-over-QUIC and plain DNS queries for your devices and
 forwards them to a pool of public upstream resolvers, picking the
 fastest healthy one, caching answers and keeping a query log.
 
-The current repository state implements the core engine (plan 1 of 4):
-config, certificate store, upstream transports (plain/DoT/DoH/DoQ),
-answer cache, health monitor, routing strategies, query log, rate
-limiting and the server listeners for all four protocols. Filtering,
-the control API, the TUI, the web panel, ACME certificates and the
-one-command installer arrive in the following plans.
+The current repository state implements the core engine, the filter
+engine and the control surfaces (plans 1–3 of 4): config, certificate
+store, upstream transports (plain/DoT/DoH/DoQ), answer cache, health
+monitor, routing strategies, query log, rate limiting, the server
+listeners for all four protocols, the own block-list engine, and the
+management layer — a control API on a unix socket, a terminal UI
+(`mdns`) and the first-run wizard (`mdns setup`). The web panel, ACME
+certificates and the one-command installer arrive in the last plan.
 
 Design and plans live in `docs/superpowers/`:
 
 - `docs/superpowers/specs/2026-10-17-mdns-design.md` — the design.
 - `docs/superpowers/plans/2026-10-17-mdns-core.md` — the core plan.
+- `docs/superpowers/plans/2026-10-17-mdns-filters.md` — filtering.
+- `docs/superpowers/plans/2026-10-17-mdns-control.md` — the control layer.
 
 ## Requirements
 
@@ -105,8 +109,9 @@ The own block-list engine is off by default; turn it on in the config:
   keep working when a list server is down.
 - Catalog: `adguard-dns-filter`, `adguard-base`, `ublock-filters`,
   `easylist`, `peter-lowe`, `oisd-small`, `oisd-full`, `hagezi-pro`,
-  `hagezi-proplus`, `stevenblack-unified`, `1hosts-lite`. The setup
-  wizard's `basic` and `strict` presets arrive with the control plan.
+  `hagezi-proplus`, `stevenblack-unified`, `1hosts-lite`. The wizard's
+  `basic` (adguard-dns-filter + oisd-small) and `strict` presets are
+  shortcuts over this catalog.
 - `user_allow` / `user_block` — your own rules; each covers the domain
   and its subdomains. A user allow beats everything, then user blocks,
   then list exceptions (`@@`), then list rules.
@@ -115,6 +120,82 @@ The own block-list engine is off by default; turn it on in the config:
   and junk lines are skipped and counted.
 - Filtering happens in the core before cache and upstream, so blocked
   names are answered the same way over plain DNS, DoT, DoH and DoQ.
+
+## Control: TUI, wizard and the daemon API
+
+The daemon exposes a control API on a unix socket (`/run/mdns/mdns.sock`
+by default; `serve --socket <path>` overrides it). The TUI and the
+wizard are thin clients of that API, so the terminal interface, the
+upcoming web panel and the daemon itself always agree — the daemon is
+the single source of truth.
+
+### TUI
+
+Run `mdns` with no arguments (opens the TUI when the daemon socket
+answers, prints a hint otherwise) or `mdns tui --socket <path>`:
+
+- **1 Статус** — domain, listeners, ready-to-use links, upstream health,
+  cache counters.
+- **2 Визард** — the setup wizard running against the live daemon
+  (same steps as `mdns setup`; `ctrl+c` closes it without saving).
+- **3 Запросы** — the live query journal: protocol, name, type, result,
+  cache/upstream, latency; blocked entries show their list
+  (`space` pauses the feed, `x` clears it, `↑↓` scrolls).
+- **4 Upstream'ы** — per-upstream state, EWMA latency, sent/failed.
+- **5 Фильтры** — per-list state; `enter` refreshes the list under the
+  cursor, `u` — all lists, `m` cycles the block mode, `a` adds a user
+  rule (`block domain` / `allow domain`).
+- **6 Настройки** — the key config fields in place; `enter` edits or
+  toggles, `ctrl+s` applies (`w` opens the wizard).
+- **7 Помощь** — the key reference.
+
+`q` quits, `r` reloads the active screen's data, digits switch screens.
+
+### First-run wizard
+
+```sh
+mdns setup --config /etc/mdns/config.json
+```
+
+The steps: domain, certificate (self-signed or your own PEM files),
+protocols and ports, DNS providers with live latency probes (pick
+several, choose the per-provider transport with `t`), routing
+strategy, filter preset. On save it writes the config and prints the
+ready-to-use device links.
+
+### Control API
+
+```sh
+curl -s --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/status
+```
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/v1/status` | GET | listeners, upstream health, cache, filter counters |
+| `/api/v1/config` | GET | the full current configuration |
+| `/api/v1/config` | PUT | validate, apply and persist a full configuration |
+| `/api/v1/providers` | GET | the resolver catalog (with all endpoints) |
+| `/api/v1/probe` | POST | measure endpoints: `{"endpoints": [...]}` |
+| `/api/v1/requests` | GET | the query journal: `?n=100` |
+| `/api/v1/filter/status` | GET | per-list state (rules, errors, timestamps) |
+| `/api/v1/filter/update` | POST | refresh one list (`{"id": "oisd-small"}`) or all (`{"id": ""}`) |
+| `/api/v1/events` | GET | SSE stream: `requests`, `upstreams`, `filter`, `ping` |
+
+Updating the configuration from a script:
+
+```sh
+curl -s --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/config > cfg.json
+# edit cfg.json ...
+curl -s -X PUT -H 'Content-Type: application/json' --data @cfg.json \
+  http://localhost/api/v1/config     # -> {"status":"applied"}
+```
+
+`PUT /config` applies what it can without a restart (routing strategy,
+cache sizes, rate limits, filter mode and user rules, update interval)
+and restarts listeners only for structural changes (domain, TLS,
+protocols, upstreams, log, data dir, filter lists). If the new runtime
+fails to come up, the previous one keeps serving and the API returns
+the error.
 
 ## Tests
 

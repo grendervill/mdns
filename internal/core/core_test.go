@@ -99,6 +99,26 @@ type fakeFilter struct {
 
 func (f *fakeFilter) Check(qname string) (bool, string) { return f.fn(qname) }
 
+// TestSetBlockMode checks live switching of the block mode.
+func TestSetBlockMode(t *testing.T) {
+	res := &fakeResolver{fn: func(*dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return nil, nil, fmt.Errorf("unreachable")
+	}}
+	blockAll := &fakeFilter{fn: func(string) (bool, string) { return true, "l" }}
+	c, _, _ := newTestCoreFilter(t, res, blockAll, "zero")
+
+	resp := c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+	if len(resp.Answer) != 1 {
+		t.Fatalf("zero-mode answer = %v, want one A record", resp.Answer)
+	}
+
+	c.SetBlockMode("nxdomain")
+	resp = c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+	if resp.Rcode != dns.RcodeNameError {
+		t.Errorf("after SetBlockMode(nxdomain) rcode = %d, want NXDOMAIN", resp.Rcode)
+	}
+}
+
 // TestCacheHitRewritesID checks that an answer served from the cache
 // carries the querying client's message ID, not the ID of whoever
 // populated the cache first.

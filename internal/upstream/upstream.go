@@ -41,6 +41,7 @@ type Upstream struct {
 	ID       string
 	Name     string
 	Priority int
+	Address  string
 
 	tr      transport.Transport
 	enabled bool
@@ -72,6 +73,7 @@ func NewWithTransport(cfg config.UpstreamConfig, tr transport.Transport) *Upstre
 		ID:       cfg.ID,
 		Name:     cfg.Name,
 		Priority: cfg.Priority,
+		Address:  cfg.Address,
 		tr:       tr,
 		enabled:  cfg.Enabled,
 		status:   Healthy,
