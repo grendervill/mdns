@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go/http3"
 
 	"mydns/internal/config"
 	"mydns/internal/core"
@@ -31,6 +33,8 @@ type Server struct {
 	mu      sync.Mutex
 	started bool
 	servers []*dns.Server
+	httpSrv *http.Server
+	h3Srv   *http3.Server
 	baseCtx context.Context
 	cancel  context.CancelFunc
 }
@@ -67,7 +71,13 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	// DoH and DoQ listeners join here in the following tasks.
+	if s.cfg.Protocols.DoH.Enabled {
+		if err := s.startDoH(); err != nil {
+			s.stopLocked(context.Background())
+			return err
+		}
+	}
+	// The DoQ listener joins here in the following task.
 
 	s.started = true
 	return nil
@@ -95,6 +105,15 @@ func (s *Server) stopLocked(ctx context.Context) {
 		_ = srv.ShutdownContext(ctx)
 	}
 	s.servers = nil
+
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Shutdown(ctx)
+		s.httpSrv = nil
+	}
+	if s.h3Srv != nil {
+		_ = s.h3Srv.Close()
+		s.h3Srv = nil
+	}
 }
 
 // track registers a listener for shutdown.

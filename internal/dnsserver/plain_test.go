@@ -21,17 +21,25 @@ import (
 	"mydns/internal/upstream"
 )
 
-// freePort returns a port currently free for UDP on the loopback
-// interface. A rare race with another process is acceptable for tests.
+// freePort returns a port currently free for both TCP and UDP on the
+// loopback interface. A rare race with another process is acceptable
+// for tests.
 func freePort(t *testing.T) int {
 	t.Helper()
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("ListenPacket() = %v, want nil", err)
+		t.Fatalf("Listen(tcp) = %v, want nil", err)
 	}
-	port := pc.LocalAddr().(*net.UDPAddr).Port
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	pc, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		_ = ln.Close()
+		t.Fatalf("ListenPacket(udp :%d) = %v, want nil", port, err)
+	}
 	_ = pc.Close()
+	_ = ln.Close()
 	return port
 }
 
