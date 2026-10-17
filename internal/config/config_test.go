@@ -245,6 +245,19 @@ func TestValidateTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "cache size zero",
+			mutate:  func(c *config.Config) { c.Cache.Size = 0 },
+			wantErr: true,
+		},
+		{
+			name: "cache min above max",
+			mutate: func(c *config.Config) {
+				c.Cache.MinTTL = 100
+				c.Cache.MaxTTL = 50
+			},
+			wantErr: true,
+		},
+		{
 			name: "disabled upstream with empty address",
 			mutate: func(c *config.Config) {
 				c.Upstreams = append(c.Upstreams, config.UpstreamConfig{

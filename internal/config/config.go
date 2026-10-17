@@ -224,6 +224,13 @@ func (c *Config) Validate() error {
 		return errors.New("data_dir must not be empty")
 	}
 
+	if c.Cache.Size < 1 {
+		return fmt.Errorf("cache: size %d must be at least 1", c.Cache.Size)
+	}
+	if c.Cache.MinTTL > c.Cache.MaxTTL {
+		return fmt.Errorf("cache: min_ttl %d above max_ttl %d", c.Cache.MinTTL, c.Cache.MaxTTL)
+	}
+
 	switch c.Filter.Mode {
 	case "zero", "nxdomain", "refused":
 	default:

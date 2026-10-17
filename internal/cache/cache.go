@@ -239,8 +239,11 @@ func copyWithElapsed(resp *dns.Msg, elapsed time.Duration, minTTL, maxTTL uint32
 	out := resp.Copy()
 	for _, sec := range [][]dns.RR{out.Answer, out.Ns, out.Extra} {
 		for _, rr := range sec {
-			switch rr.(type) {
-			case *dns.OPT, *dns.TSIG, *dns.TKEY:
+			switch typed := rr.(type) {
+			case *dns.OPT:
+				stripCookies(typed)
+				continue
+			case *dns.TSIG, *dns.TKEY:
 				continue
 			}
 			ttl := rr.Header().Ttl
@@ -258,4 +261,18 @@ func copyWithElapsed(resp *dns.Msg, elapsed time.Duration, minTTL, maxTTL uint32
 		}
 	}
 	return out
+}
+
+// stripCookies removes EDNS0 COOKIE options from an OPT record: a DNS
+// cookie belongs to the client that sent it (RFC 7873), so a cached
+// reply must not carry the first client's cookie to the next one.
+func stripCookies(opt *dns.OPT) {
+	kept := opt.Option[:0]
+	for _, o := range opt.Option {
+		if o.Option() == dns.EDNS0COOKIE {
+			continue
+		}
+		kept = append(kept, o)
+	}
+	opt.Option = kept
 }
