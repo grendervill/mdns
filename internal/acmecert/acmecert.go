@@ -37,8 +37,6 @@ const (
 	defaultBackoffMin = 5 * time.Minute
 	defaultBackoffMax = 6 * time.Hour
 
-	// renewBefore asks the CA for a renewal 30 days before expiry.
-	renewBefore = 30 * 24 * time.Hour
 	// checkInterval is how often Run checks a ready certificate.
 	checkInterval = 24 * time.Hour
 )
@@ -94,15 +92,9 @@ type Manager struct {
 	reported tlscert.Status
 }
 
-// New builds the ACME manager: it issues and caches certificates for
-// Domain through DirectoryURL, keeping the account key and the issued
-// certificates in CacheDir. InsecureSkipVerify disables the directory
-// TLS verification and is meant for test ACME servers only.
-func New(opts Options) (*Manager, error) {
-	if err := opts.validate(); err != nil {
-		return nil, err
-	}
-
+// newAutocertManager assembles the autocert manager New wraps: the ACME
+// stack itself, kept in one place so a test can inspect it.
+func newAutocertManager(opts Options) *autocert.Manager {
 	client := &acme.Client{DirectoryURL: opts.DirectoryURL}
 	if opts.InsecureSkipVerify {
 		client.HTTPClient = &http.Client{
@@ -114,15 +106,32 @@ func New(opts Options) (*Manager, error) {
 		}
 	}
 
-	acmeMgr := &autocert.Manager{
-		Prompt:                 autocert.AcceptTOS,
-		Cache:                  autocert.DirCache(opts.CacheDir),
-		HostPolicy:             autocert.HostWhitelist(opts.Domain),
-		RenewBefore:            renewBefore,
+	return &autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		Cache:      autocert.DirCache(opts.CacheDir),
+		HostPolicy: autocert.HostWhitelist(opts.Domain),
+		// RenewBefore stays at its zero value on purpose: autocert then
+		// renews at the lesser of 30 days or a third of the certificate
+		// lifetime — the 30 days the spec asks for on a 90-day
+		// certificate, and a safe window on a short-lived one. Setting
+		// 30 days explicitly would put every short-lived certificate
+		// inside the renewal window on every handshake.
 		Client:                 client,
 		Email:                  opts.Email,
 		ExternalAccountBinding: opts.EAB,
 	}
+}
+
+// New builds the ACME manager: it issues and caches certificates for
+// Domain through DirectoryURL, keeping the account key and the issued
+// certificates in CacheDir. InsecureSkipVerify disables the directory
+// TLS verification and is meant for test ACME servers only.
+func New(opts Options) (*Manager, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
+
+	acmeMgr := newAutocertManager(opts)
 
 	m, err := newWithGetter(acmeMgr, opts, time.Now)
 	if err != nil {

@@ -504,3 +504,34 @@ func TestChallengeHandshakeDoesNotFlipReady(t *testing.T) {
 		t.Error("ReadyChan() is open after a regular handshake, want closed")
 	}
 }
+
+func TestRenewBeforeUsesAutocertDefault(t *testing.T) {
+	opts := Options{Domain: "example.com", Email: "admin@example.com", CacheDir: t.TempDir()}
+	mgr := newAutocertManager(opts)
+
+	// A zero RenewBefore makes autocert renew at the lesser of 30 days
+	// or a third of the certificate lifetime: the 30 days the spec asks
+	// for on a 90-day certificate, and a safe window on a short-lived
+	// one. An explicit 30 days would renew every short-lived
+	// certificate on every handshake.
+	if mgr.RenewBefore != 0 {
+		t.Errorf("RenewBefore = %v, want the autocert default 0", mgr.RenewBefore)
+	}
+
+	// The rest of the wiring must survive the refactor.
+	if mgr.Prompt == nil {
+		t.Error("Prompt = nil, want autocert.AcceptTOS")
+	}
+	if mgr.Cache == nil {
+		t.Error("Cache = nil, want the DirCache of Options.CacheDir")
+	}
+	if mgr.HostPolicy == nil {
+		t.Error("HostPolicy = nil, want the HostWhitelist of Options.Domain")
+	}
+	if mgr.Client == nil || mgr.Client.DirectoryURL != "" {
+		t.Errorf("Client = %+v, want a client with the empty default directory", mgr.Client)
+	}
+	if mgr.Email != opts.Email {
+		t.Errorf("Email = %q, want %q", mgr.Email, opts.Email)
+	}
+}
