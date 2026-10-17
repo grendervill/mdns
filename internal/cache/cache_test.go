@@ -66,6 +66,28 @@ func TestGetMissEmpty(t *testing.T) {
 	}
 }
 
+// TestGetRewritesID checks that a cached answer is returned with the
+// querying request's ID, not the ID the entry was stored with.
+func TestGetRewritesID(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 86400)
+
+	stored := query("example.com")
+	stored.Id = 1111
+	resp := reply(stored, 300)
+	resp.Id = 1111
+	c.Put(stored, resp)
+
+	q := query("example.com")
+	q.Id = 2222
+	got, ok := c.Get(q)
+	if !ok {
+		t.Fatalf("Get() = miss, want hit")
+	}
+	if got.Id != 2222 {
+		t.Errorf("Get() reply ID = %d, want 2222", got.Id)
+	}
+}
+
 // TestPutGet checks the happy path and TTL countdown: the stored answer
 // comes back with its TTL reduced by the elapsed seconds, never raised.
 func TestPutGet(t *testing.T) {

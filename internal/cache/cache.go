@@ -94,7 +94,9 @@ func (c *Cache) Get(req *dns.Msg) (*dns.Msg, bool) {
 
 	c.lru.MoveToFront(el)
 	c.hits++
-	return copyWithElapsed(e.resp, now.Sub(e.storedAt)), true
+	out := copyWithElapsed(e.resp, now.Sub(e.storedAt))
+	out.Id = req.Id // the stored reply carries the ID of whoever filled the cache
+	return out, true
 }
 
 // Put stores resp for req's question. Replies that must not be cached
