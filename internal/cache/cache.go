@@ -53,9 +53,11 @@ type Cache struct {
 }
 
 // New returns a cache holding at most size entries. minTTL and maxTTL
-// clamp how long an answer stays cached; the answer handed to clients
-// keeps the upstream's real TTL. The zero MinTTL keeps zero-TTL replies
-// uncacheable; a non-zero MinTTL raises them.
+// clamp how long an answer is stored and the TTL served back to
+// clients: the stored entry expires after the clamped lifetime, and
+// the answer handed out carries clamped TTLs counting down with time.
+// The zero MinTTL keeps zero-TTL replies uncacheable; a non-zero
+// MinTTL raises them.
 func New(size int, minTTL, maxTTL uint32) *Cache {
 	return &Cache{
 		size:    size,
@@ -94,7 +96,7 @@ func (c *Cache) Get(req *dns.Msg) (*dns.Msg, bool) {
 
 	c.lru.MoveToFront(el)
 	c.hits++
-	out := copyWithElapsed(e.resp, now.Sub(e.storedAt))
+	out := copyWithElapsed(e.resp, now.Sub(e.storedAt), c.minTTL, c.maxTTL)
 	out.Id = req.Id // the stored reply carries the ID of whoever filled the cache
 	return out, true
 }
@@ -227,14 +229,27 @@ func soaTTL(resp *dns.Msg) (uint32, bool) {
 }
 
 // copyWithElapsed returns a private copy of resp with every record's
-// TTL reduced by the elapsed whole seconds, floored at zero.
-func copyWithElapsed(resp *dns.Msg, elapsed time.Duration) *dns.Msg {
+// TTL clamped into [minTTL, maxTTL] and then reduced by the elapsed
+// whole seconds, floored at zero. Records whose TTL field is not a
+// lifetime — the OPT pseudo-record (DO bit, extended rcode, version)
+// and TSIG/TKEY auth records — pass through untouched.
+func copyWithElapsed(resp *dns.Msg, elapsed time.Duration, minTTL, maxTTL uint32) *dns.Msg {
 	secs := uint32(elapsed / time.Second)
 
 	out := resp.Copy()
 	for _, sec := range [][]dns.RR{out.Answer, out.Ns, out.Extra} {
 		for _, rr := range sec {
+			switch rr.(type) {
+			case *dns.OPT, *dns.TSIG, *dns.TKEY:
+				continue
+			}
 			ttl := rr.Header().Ttl
+			if ttl < minTTL {
+				ttl = minTTL
+			}
+			if ttl > maxTTL {
+				ttl = maxTTL
+			}
 			if ttl > secs {
 				rr.Header().Ttl = ttl - secs
 			} else {

@@ -9,16 +9,60 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 
 	"mydns/internal/core"
+	"mydns/internal/tlscert"
 )
 
 // maxDoHRequest caps the request body size: the wire format's own
 // limit is 65535 bytes, so 64 KiB covers it with room to spare.
 const maxDoHRequest = 64 << 10
+
+// DoH server hardening: this endpoint is internet-facing, so headers
+// and idle connections are bounded (Slowloris, connection exhaustion).
+const (
+	dohReadHeaderTimeout = 5 * time.Second
+	dohReadTimeout       = 10 * time.Second
+	dohWriteTimeout      = 10 * time.Second
+	dohIdleTimeout       = 60 * time.Second
+	dohMaxHeaderBytes    = 16 << 10
+)
+
+// buildDoHServers builds the HTTPS (HTTP/1.1 + HTTP/2) and HTTP/3
+// servers sharing one handler. certs may be nil in tests; when set,
+// its GetCertificate signs every handshake.
+func buildDoHServers(mux http.Handler, certs *tlscert.Store, addr string) (*http.Server, *http3.Server) {
+	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	if certs != nil {
+		getCert = certs.GetCertificate
+	}
+
+	httpSrv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			GetCertificate: getCert,
+			NextProtos:     []string{"h2", "http/1.1"},
+		},
+		ReadHeaderTimeout: dohReadHeaderTimeout,
+		ReadTimeout:       dohReadTimeout,
+		WriteTimeout:      dohWriteTimeout,
+		IdleTimeout:       dohIdleTimeout,
+		MaxHeaderBytes:    dohMaxHeaderBytes,
+	}
+	h3Srv := &http3.Server{
+		Addr:           addr,
+		Handler:        mux,
+		TLSConfig:      &tls.Config{GetCertificate: getCert},
+		IdleTimeout:    dohIdleTimeout,
+		MaxHeaderBytes: dohMaxHeaderBytes,
+	}
+	return httpSrv, h3Srv
+}
 
 // startDoH binds the DoH endpoint: HTTPS over TCP (HTTP/1.1 and
 // HTTP/2) and HTTP/3 over UDP, both on the same port, sharing one
@@ -29,23 +73,11 @@ func (s *Server) startDoH() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.handleDoH)
 
-	httpSrv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			GetCertificate: s.certs.GetCertificate,
-			NextProtos:     []string{"h2", "http/1.1"},
-		},
-	}
+	httpSrv, h3Srv := buildDoHServers(mux, s.certs, fmt.Sprintf(":%d", port))
+
 	ln, err := net.Listen("tcp", httpSrv.Addr)
 	if err != nil {
 		return fmt.Errorf("doh tcp :%d: %w", port, err)
-	}
-
-	h3Srv := &http3.Server{
-		Addr:      fmt.Sprintf(":%d", port),
-		Handler:   mux,
-		TLSConfig: &tls.Config{GetCertificate: s.certs.GetCertificate},
 	}
 
 	s.httpSrv = httpSrv

@@ -69,7 +69,7 @@ func New() (*Fake, error) {
 		}
 
 		f := &Fake{udpConn: udpConn, tcpLn: tcpLn}
-		f.udpSrv = &dns.Server{PacketConn: udpConn, Handler: f}
+		f.udpSrv = &dns.Server{PacketConn: udpConn, UDPSize: 1232, Handler: f}
 		f.tcpSrv = &dns.Server{Listener: tcpLn, Handler: f}
 		go f.udpSrv.ActivateAndServe()
 		go f.tcpSrv.ActivateAndServe()
@@ -156,7 +156,9 @@ func (f *Fake) Close() {
 
 // ServeDNS implements dns.Handler for both listeners: it counts the
 // query, applies the current handler and writes the reply with the
-// request's ID.
+// request's ID. UDP replies are truncated to the classic 512-byte
+// limit like a real server's would be, so TCP-fallback behavior is
+// exercised faithfully.
 func (f *Fake) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	f.calls.Add(1)
 
@@ -172,6 +174,9 @@ func (f *Fake) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return // no reply: the client times out
 	}
 	resp.Id = req.Id
+	if _, isUDP := w.RemoteAddr().(*net.UDPAddr); isUDP {
+		resp.Truncate(dns.MinMsgSize)
+	}
 	_ = w.WriteMsg(resp)
 }
 

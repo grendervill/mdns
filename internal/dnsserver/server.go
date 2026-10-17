@@ -140,6 +140,11 @@ func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	}
 }
 
+// udpMaxResponse is the largest UDP response this server sends, which
+// keeps datagrams under the fragmentation threshold (the project's
+// 1232-byte policy) while leaving classic 512-byte clients working.
+const udpMaxResponse = 1232
+
 // coreHandler answers one decoded query through the core pipeline; the
 // plain and DoT listeners share it.
 type coreHandler struct {
@@ -152,9 +157,25 @@ type coreHandler struct {
 // ServeDNS implements dns.Handler.
 func (h *coreHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	resp := h.core.Resolve(h.ctx, req, core.Meta{Proto: h.proto, ClientIP: remoteIP(w.RemoteAddr())})
+	if h.proto == "udp" {
+		resp.Truncate(udpResponseLimit(req))
+	}
 	if err := w.WriteMsg(resp); err != nil {
 		h.logger.Warn("write reply failed", "proto", h.proto, "error", err)
 	}
+}
+
+// udpResponseLimit returns the largest response sent over UDP to this
+// client: udpMaxResponse, lowered to a smaller EDNS0 receive buffer
+// the client advertised (never below the classic 512 bytes).
+func udpResponseLimit(req *dns.Msg) int {
+	limit := udpMaxResponse
+	if opt := req.IsEdns0(); opt != nil {
+		if size := int(opt.UDPSize()); size >= dns.MinMsgSize && size < limit {
+			limit = size
+		}
+	}
+	return limit
 }
 
 // remoteIP extracts the client address of a connection.

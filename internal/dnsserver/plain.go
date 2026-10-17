@@ -20,6 +20,7 @@ func (s *Server) startPlain() error {
 	}
 	udpSrv := &dns.Server{
 		PacketConn: pc,
+		UDPSize:    udpMaxResponse, // receive buffer: large EDNS0 queries must parse
 		Handler: &plainHandler{
 			coreHandler: coreHandler{core: s.core, proto: "udp", ctx: s.baseCtx, logger: s.logger},
 			limiter:     s.limiter,

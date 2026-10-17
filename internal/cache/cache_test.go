@@ -88,6 +88,48 @@ func TestGetRewritesID(t *testing.T) {
 	}
 }
 
+// TestOPTNotDecayed checks that the OPT pseudo-record survives cache
+// serving untouched: its TTL field carries the DO bit and the extended
+// rcode, not a lifetime, so decrementing it corrupts the reply.
+func TestOPTNotDecayed(t *testing.T) {
+	c, clk := newTestCache(t, 10, 0, 86400)
+
+	q := query("example.com")
+	resp := reply(q, 300)
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(1232)
+	opt.SetDo(true)
+	resp.Extra = append(resp.Extra, opt)
+	c.Put(q, resp)
+
+	clk.advance(1 * time.Second)
+	got, ok := c.Get(query("example.com"))
+	if !ok {
+		t.Fatalf("Get() = miss, want hit")
+	}
+
+	var gotOpt *dns.OPT
+	for _, rr := range got.Extra {
+		if o, isOpt := rr.(*dns.OPT); isOpt {
+			gotOpt = o
+		}
+	}
+	if gotOpt == nil {
+		t.Fatalf("cached reply lost its OPT record")
+	}
+	if !gotOpt.Do() {
+		t.Errorf("DO bit = false, want true (OPT TTL must not be decremented)")
+	}
+	if v := gotOpt.Version(); v != 0 {
+		t.Errorf("EDNS version = %d, want 0 (OPT TTL must not be decremented)", v)
+	}
+	if sz := gotOpt.UDPSize(); sz != 1232 {
+		t.Errorf("advertised UDP size = %d, want 1232", sz)
+	}
+}
+
 // TestPutGet checks the happy path and TTL countdown: the stored answer
 // comes back with its TTL reduced by the elapsed seconds, never raised.
 func TestPutGet(t *testing.T) {
@@ -178,16 +220,29 @@ func TestNoCacheSERVFAILAndTruncated(t *testing.T) {
 	}
 }
 
-// TestTTLClamp checks that stored TTLs respect the min and max clamp
-// while the returned answer keeps its real TTL.
+// TestTTLClamp checks that the stored lifetime and the TTL served to
+// clients both respect the min and max clamp.
 func TestTTLClamp(t *testing.T) {
 	c, clk := newTestCache(t, 10, 5, 86400)
 
 	q := query("short.example.com")
 	c.Put(q, reply(q, 1)) // clamped up to 5s
+
+	resp, ok := c.Get(query("short.example.com"))
+	if !ok {
+		t.Fatalf("Get() = miss, want hit (min TTL 5s)")
+	}
+	if got := resp.Answer[0].Header().Ttl; got != 5 {
+		t.Errorf("served TTL = %d, want 5 (clamped up)", got)
+	}
+
 	clk.advance(4 * time.Second)
-	if _, ok := c.Get(query("short.example.com")); !ok {
+	resp, ok = c.Get(query("short.example.com"))
+	if !ok {
 		t.Fatalf("Get() at 4s = miss, want hit (min TTL 5s)")
+	}
+	if got := resp.Answer[0].Header().Ttl; got != 1 {
+		t.Errorf("served TTL at 4s = %d, want 1", got)
 	}
 	clk.advance(2 * time.Second)
 	if _, ok := c.Get(query("short.example.com")); ok {
@@ -196,18 +251,23 @@ func TestTTLClamp(t *testing.T) {
 
 	c2, clk2 := newTestCache(t, 10, 0, 60)
 	q2 := query("long.example.com")
-	resp := reply(q2, 999999)
-	c2.Put(q2, resp)
-	clk2.advance(59 * time.Second)
+	c2.Put(q2, reply(q2, 999999)) // clamped down to 60s
+
 	got, ok := c2.Get(query("long.example.com"))
+	if !ok {
+		t.Fatalf("Get() = miss, want hit (max TTL 60s)")
+	}
+	if ttl := got.Answer[0].Header().Ttl; ttl != 60 {
+		t.Errorf("served TTL = %d, want 60 (clamped down)", ttl)
+	}
+
+	clk2.advance(59 * time.Second)
+	got, ok = c2.Get(query("long.example.com"))
 	if !ok {
 		t.Fatalf("Get() at 59s = miss, want hit (max TTL 60s)")
 	}
-	if ttl := got.Answer[0].Header().Ttl; ttl != 999940 {
-		// The returned TTL counts down from the upstream's 999999 by
-		// the 59 elapsed seconds; the 60s max clamp bounds only how
-		// long the entry is stored, not the TTL served to clients.
-		t.Errorf("returned TTL = %d, want 999940 (original 999999 minus 59s)", ttl)
+	if ttl := got.Answer[0].Header().Ttl; ttl != 1 {
+		t.Errorf("served TTL at 59s = %d, want 1", ttl)
 	}
 	clk2.advance(2 * time.Second)
 	if _, ok := c2.Get(query("long.example.com")); ok {
