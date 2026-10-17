@@ -19,9 +19,8 @@ func filterListsMsg() filterLoadedMsg {
 	}}
 }
 
-// enterKey and escKey are the shared key messages.
+// enterKey is the shared enter key message.
 func enterKey() tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyEnter} }
-func escKey() tea.KeyMsg   { return tea.KeyMsg{Type: tea.KeyEsc} }
 
 // typeText feeds r as individual rune keys.
 func typeText(m Model, s string) Model {

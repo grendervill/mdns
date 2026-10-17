@@ -1,10 +1,12 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/miekg/dns"
 
 	"mydns/internal/qlog"
@@ -12,6 +14,14 @@ import (
 
 // requestsCap is the requests screen buffer size.
 const requestsCap = 500
+
+// loadRequests fetches the recent query journal.
+func loadRequests(c Client) tea.Cmd {
+	return func() tea.Msg {
+		entries, err := c.Requests(context.Background(), requestsCap)
+		return requestsLoadedMsg{entries: entries, err: err}
+	}
+}
 
 // requestsView renders the live query journal.
 func (m *Model) requestsView() string {

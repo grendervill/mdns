@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,11 +64,16 @@ type wizardRow struct {
 	provider *providers.Provider
 }
 
-// wizardProbeMsg carries fresh probe results by provider ID.
-type wizardProbeMsg struct{ byID map[string]probe.Result }
+// wizardProbeMsg carries fresh probe results by provider ID. seq
+// identifies the probe chain, so results of a superseded chain are
+// ignored.
+type wizardProbeMsg struct {
+	byID map[string]probe.Result
+	seq  int
+}
 
-// wizardProbeTickMsg re-runs the probes.
-type wizardProbeTickMsg struct{}
+// wizardProbeTickMsg re-runs the probes of one chain.
+type wizardProbeTickMsg struct{ seq int }
 
 // wizardDoneMsg ends an embedded wizard; saved is false on cancel.
 type wizardDoneMsg struct{ saved bool }
@@ -88,6 +94,9 @@ type WizardModel struct {
 	selected  map[string]bool
 	transport map[string]string
 	probes    map[string]probe.Result
+	// probeSeq counts probe chains; a newer chain invalidates the old
+	// one so re-entering the providers step cannot stack tickers.
+	probeSeq int
 
 	inputActive bool
 	inputTarget string
@@ -129,6 +138,12 @@ func NewWizard(b WizardBackend) (WizardModel, error) {
 	w.inputActive = true
 	w.inputTarget = "domain"
 	w.input = ""
+	if cfg.Domain != config.Default().Domain {
+		// Re-running the wizard: start from the current domain. On a
+		// first run the placeholder stays out of the input, so keeping
+		// it takes a deliberate Enter on an empty field (an error).
+		w.input = cfg.Domain
+	}
 	return w, nil
 }
 
@@ -190,19 +205,23 @@ func (w WizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return w, nil
 
 	case wizardProbeMsg:
+		if msg.seq != w.probeSeq {
+			return w, nil // a superseded probe chain
+		}
 		for id, r := range msg.byID {
 			w.probes[id] = r
 		}
 		if w.stage == stageProviders {
-			return w, tea.Tick(time.Second, func(time.Time) tea.Msg { return wizardProbeTickMsg{} })
+			seq := w.probeSeq
+			return w, tea.Tick(time.Second, func(time.Time) tea.Msg { return wizardProbeTickMsg{seq: seq} })
 		}
 		return w, nil
 
 	case wizardProbeTickMsg:
-		if w.stage != stageProviders {
+		if msg.seq != w.probeSeq || w.stage != stageProviders {
 			return w, nil
 		}
-		return w, wizardProbeCmd(w.backend, w.probeTargets())
+		return w, wizardProbeCmd(w.backend, w.probeTargets(), msg.seq)
 
 	case tea.KeyMsg:
 		return w.handleKey(msg)
@@ -336,6 +355,13 @@ func (w WizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // handleInputKey processes keys while an input is open.
 func (w WizardModel) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyCtrlC {
+		if w.embedded {
+			return w, func() tea.Msg { return wizardDoneMsg{} }
+		}
+		return w, tea.Quit
+	}
+
 	switch msg.Type {
 	case tea.KeyEsc:
 		w.inputActive = false
@@ -373,11 +399,24 @@ func (w *WizardModel) enterStage(s stage) tea.Cmd {
 	w.inputActive = false
 	w.err = nil
 
-	if s == stageProviders {
+	switch s {
+	case stageProviders:
 		w.moveProviderCursor(1) // skip the first section header
-		return wizardProbeCmd(w.backend, w.probeTargets())
+		return w.restartProbes()
+	case stageFilters:
+		w.cursor = filterPresetCursor(w.cfg)
 	}
 	return nil
+}
+
+// restartProbes starts a fresh probe chain for the providers step; a
+// newer chain invalidates any previous one.
+func (w *WizardModel) restartProbes() tea.Cmd {
+	if w.stage != stageProviders {
+		return nil
+	}
+	w.probeSeq++
+	return wizardProbeCmd(w.backend, w.probeTargets(), w.probeSeq)
 }
 
 // commitInput applies the open input line.
@@ -503,9 +542,29 @@ func (w *WizardModel) applyFilterPreset() {
 		w.cfg.Filter.Enabled = true
 		w.cfg.Filter.Lists = presetLists("strict")
 	case 3:
+		// "Custom": just enable filtering; the configured lists stay
+		// untouched so re-running the wizard cannot wipe them.
 		w.cfg.Filter.Enabled = true
-		w.cfg.Filter.Lists = nil
 	}
+}
+
+// filterPresetCursor points the filter step at the current config: the
+// matching preset when the lists line up, "custom" otherwise.
+func filterPresetCursor(cfg *config.Config) int {
+	if !cfg.Filter.Enabled {
+		return 0
+	}
+	ids := make([]string, 0, len(cfg.Filter.Lists))
+	for _, l := range cfg.Filter.Lists {
+		ids = append(ids, l.ID)
+	}
+	if basic, ok := filter.Preset("basic"); ok && slices.Equal(ids, basic) {
+		return 1
+	}
+	if strict, ok := filter.Preset("strict"); ok && slices.Equal(ids, strict) {
+		return 2
+	}
+	return 3
 }
 
 // presetLists converts a catalog preset into config lists.
@@ -633,7 +692,7 @@ func (w *WizardModel) probeTargets() []probeTarget {
 }
 
 // wizardProbeCmd measures the targets and reports them by provider ID.
-func wizardProbeCmd(b WizardBackend, targets []probeTarget) tea.Cmd {
+func wizardProbeCmd(b WizardBackend, targets []probeTarget, seq int) tea.Cmd {
 	return func() tea.Msg {
 		eps := make([]providers.Endpoint, len(targets))
 		for i, t := range targets {
@@ -647,7 +706,7 @@ func wizardProbeCmd(b WizardBackend, targets []probeTarget) tea.Cmd {
 				byID[t.id] = results[i]
 			}
 		}
-		return wizardProbeMsg{byID: byID}
+		return wizardProbeMsg{byID: byID, seq: seq}
 	}
 }
 
@@ -822,6 +881,8 @@ func (w WizardModel) View() string {
 			}
 			b.WriteString(marker + name + "\n")
 		}
+		b.WriteString("\n" + dimStyle.Render("Сейчас: "+filterPresetNames[filterPresetCursor(w.cfg)]))
+		b.WriteString("\n")
 	case stageSummary:
 		b.WriteString("Проверьте настройки:\n\n")
 		b.WriteString(fmt.Sprintf("  Домен: %s\n", w.cfg.Domain))
@@ -881,8 +942,18 @@ func onOff(v bool) string {
 	return "выкл"
 }
 
-// Run starts the wizard in the alternate screen.
-func (w WizardModel) Run() error {
-	_, err := tea.NewProgram(w, tea.WithAltScreen()).Run()
+// runWizardProgram runs the wizard's bubbletea program; tests replace
+// it to observe the final model.
+var runWizardProgram = func(w WizardModel) (tea.Model, error) {
+	return tea.NewProgram(w, tea.WithAltScreen()).Run()
+}
+
+// Run starts the wizard in the alternate screen and keeps the final
+// model, so callers can check Saved() and read the outcome.
+func (w *WizardModel) Run() error {
+	final, err := runWizardProgram(*w)
+	if m, ok := final.(WizardModel); ok {
+		*w = m
+	}
 	return err
 }

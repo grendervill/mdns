@@ -195,7 +195,7 @@ func TestWizardProbeUpdates(t *testing.T) {
 	}
 	w.enterStage(stageProviders) // proper transition: resets the domain input
 
-	w = wizardStep(t, w, wizardProbeMsg{byID: map[string]probe.Result{
+	w = wizardStep(t, w, wizardProbeMsg{seq: w.probeSeq, byID: map[string]probe.Result{
 		"cloudflare": {Latency: 12 * time.Millisecond},
 	}})
 
@@ -310,5 +310,131 @@ func TestWizardKeepsCustomUpstreams(t *testing.T) {
 	}
 	if ups[1].ID != "my-custom" {
 		t.Errorf("custom upstream = %q, want my-custom kept", ups[1].ID)
+	}
+}
+
+// TestRunKeepsFinalModel checks that Run() stores the final model back:
+// mdns setup used to report a cancellation after a successful save.
+func TestRunKeepsFinalModel(t *testing.T) {
+	old := runWizardProgram
+	defer func() { runWizardProgram = old }()
+
+	runWizardProgram = func(w WizardModel) (tea.Model, error) {
+		w.saved = true
+		return w, nil
+	}
+
+	b := newFakeWizardBackend(t)
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	if err := w.Run(); err != nil {
+		t.Fatalf("Run() = %v, want nil", err)
+	}
+	if !w.Saved() {
+		t.Fatalf("Run() dropped the final model: Saved() = false after a save")
+	}
+}
+
+// TestWizardCtrlCWhileTyping checks that ctrl+c cancels the wizard
+// even while an input line is open.
+func TestWizardCtrlCWhileTyping(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	if !w.inputActive {
+		t.Fatalf("the domain input is not open on entry")
+	}
+
+	updated, cmd := w.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	w = updated.(WizardModel)
+	if cmd == nil {
+		t.Fatalf("ctrl+c while typing did not quit the standalone wizard")
+	}
+
+	w.embedded = true
+	updated, cmd = w.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	w = updated.(WizardModel)
+	if cmd == nil {
+		t.Fatalf("ctrl+c while typing did not cancel the embedded wizard")
+	}
+	if _, ok := cmd().(wizardDoneMsg); !ok {
+		t.Errorf("embedded ctrl+c produced %T, want wizardDoneMsg", cmd())
+	}
+}
+
+// TestWizardFiltersPresetSeeded checks that the filter step starts from
+// the current config and "custom" does not wipe the configured lists.
+func TestWizardFiltersPresetSeeded(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	b.cfg.Filter = config.FilterConfig{
+		Enabled: true,
+		Mode:    "zero",
+		Lists:   []config.FilterList{{ID: "my-list", URL: "https://x/list.txt"}},
+	}
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+
+	w.enterStage(stageFilters)
+	if got := filterPresetCursor(w.cfg); got != 3 {
+		t.Fatalf("preset cursor for custom lists = %d, want 3", got)
+	}
+	if w.cursor != 3 {
+		t.Fatalf("cursor = %d, want it seeded to the custom preset", w.cursor)
+	}
+
+	w = wizardStep(t, w, enterKey()) // "Свой набор"
+	if !w.cfg.Filter.Enabled {
+		t.Errorf("filtering got disabled by the custom preset")
+	}
+	if len(w.cfg.Filter.Lists) != 1 || w.cfg.Filter.Lists[0].ID != "my-list" {
+		t.Errorf("custom preset wiped the lists: %+v", w.cfg.Filter.Lists)
+	}
+
+	// The basic preset is detected too.
+	b2 := newFakeWizardBackend(t)
+	b2.cfg.Filter = config.FilterConfig{
+		Enabled: true,
+		Mode:    "zero",
+		Lists:   []config.FilterList{{ID: "adguard-dns-filter"}, {ID: "oisd-small"}},
+	}
+	w2, err := NewWizard(b2)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w2.enterStage(stageFilters)
+	if w2.cursor != 1 {
+		t.Errorf("cursor = %d for the basic preset, want 1", w2.cursor)
+	}
+}
+
+// TestWizardProbeChainInvalidated checks that results of a superseded
+// probe chain are ignored.
+func TestWizardProbeChainInvalidated(t *testing.T) {
+	b := newFakeWizardBackend(t)
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w.enterStage(stageProviders) // chain 1
+	stale := w.probeSeq - 1      // a chain from before the restart
+	w.enterStage(stageProviders) // chain 2
+
+	w = wizardStep(t, w, wizardProbeMsg{seq: stale, byID: map[string]probe.Result{
+		"cloudflare": {Latency: time.Second},
+	}})
+	if _, ok := w.probes["cloudflare"]; ok {
+		t.Errorf("stale probe results were applied")
+	}
+
+	updated, cmd := w.Update(wizardProbeTickMsg{seq: stale})
+	w = updated.(WizardModel)
+	if cmd != nil {
+		t.Errorf("a stale tick re-armed a probe chain")
 	}
 }

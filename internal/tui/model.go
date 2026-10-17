@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -41,9 +42,6 @@ var screenTabs = []struct {
 
 // Options configure the model.
 type Options struct {
-	// SocketPath is only used for display; the client carries the real
-	// connection.
-	SocketPath string
 	// Initial names the starting screen ("status", "requests", ...);
 	// empty means status.
 	Initial string
@@ -140,6 +138,14 @@ type (
 		err error
 	}
 	configAppliedMsg struct{ err error }
+
+	requestsLoadedMsg struct {
+		entries []qlog.Entry
+		err     error
+	}
+
+	// eventsRetryMsg re-opens the event stream after eventsRetryDelay.
+	eventsRetryMsg struct{}
 )
 
 // fetchStatus loads the status snapshot.
@@ -169,6 +175,15 @@ func waitEvents(ch <-chan api.Event) tea.Cmd {
 	}
 }
 
+// eventsRetryDelay is the pause before re-opening the event stream.
+var eventsRetryDelay = 2 * time.Second
+
+// resubscribe schedules a new subscribe attempt after a pause, so a
+// daemon restart or a dropped socket heals without a TUI restart.
+func resubscribe() tea.Cmd {
+	return tea.Tick(eventsRetryDelay, func(time.Time) tea.Msg { return eventsRetryMsg{} })
+}
+
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(fetchStatus(m.client), subscribe(m.client, m.ctx))
@@ -185,7 +200,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.forwardToWizard(msg)
 
 		case wizardProbeMsg, wizardProbeTickMsg:
-			return m.forwardToWizard(msg)
+			if m.screen == screenWizard {
+				return m.forwardToWizard(msg)
+			}
+			// Parked on another screen: the chain dies here and
+			// re-entering the wizard restarts it.
 
 		case tea.KeyMsg:
 			if m.screen == screenWizard {
@@ -234,7 +253,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case eventsReadyMsg:
 		if msg.err != nil {
-			return m, nil // the status screen already reports daemon errors
+			return m, resubscribe() // the daemon may come back
 		}
 		m.events = msg.ch
 		return m, waitEvents(msg.ch)
@@ -248,7 +267,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case eventsClosedMsg:
 		m.events = nil
-		return m, nil
+		return m, resubscribe()
+
+	case eventsRetryMsg:
+		return m, subscribe(m.client, m.ctx)
 
 	case filterLoadedMsg:
 		m.filterLists = msg.lists
@@ -276,6 +298,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filterErr = nil
 		return m, fetchStatus(m.client)
 
+	case requestsLoadedMsg:
+		if msg.err == nil {
+			m.requests = msg.entries
+			if len(m.requests) > requestsCap {
+				m.requests = m.requests[len(m.requests)-requestsCap:]
+			}
+			m.requestsScroll = 0 // follow the newest entry
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -290,6 +322,8 @@ func (m Model) refreshCmd() tea.Cmd {
 		cmds = append(cmds, loadFilterStatus(m.client))
 	case screenSettings:
 		cmds = append(cmds, loadConfig(m.client))
+	case screenRequests:
+		cmds = append(cmds, loadRequests(m.client))
 	}
 	return tea.Batch(cmds...)
 }
@@ -304,6 +338,10 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 	case screenSettings:
 		if m.settingsCfg == nil {
 			return loadConfig(m.client)
+		}
+	case screenRequests:
+		if m.requests == nil {
+			return loadRequests(m.client)
 		}
 	}
 	return nil
@@ -339,7 +377,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.requests = nil
 			m.requestsScroll = 0
 		case "up", "k":
-			if m.requestsScroll < len(m.requests) {
+			if m.requestsScroll < len(m.requests)-1 {
 				m.requestsScroll++
 			}
 		case "down", "j":
@@ -414,7 +452,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // API.
 func (m Model) openWizard() (tea.Model, tea.Cmd) {
 	m.screen = screenWizard
-	if m.wizard != nil || m.wizardLoading {
+	if m.wizard != nil {
+		return m, m.wizard.restartProbes() // resume the pings if parked
+	}
+	if m.wizardLoading {
 		return m, nil
 	}
 	m.wizardNote = ""
@@ -437,6 +478,11 @@ func isScreenDigit(s string) bool {
 
 // handleInputKey processes keys while an input line is open.
 func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyCtrlC {
+		m.cancel()
+		return m, tea.Quit
+	}
+
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.inputActive = false

@@ -130,7 +130,7 @@ func tuiCmd(args []string) int {
 // tuiRun opens the TUI and returns its exit code.
 func tuiRun(socketPath string) int {
 	client := tui.NewUnixClient(socketPath)
-	m := tui.New(client, tui.Options{SocketPath: socketPath})
+	m := tui.New(client, tui.Options{})
 	if err := m.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "mdns tui:", err)
 		return 1

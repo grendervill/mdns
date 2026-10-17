@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"mydns/internal/config"
+	"mydns/internal/providers"
 	"mydns/internal/setup"
 	"mydns/internal/tui"
 )
@@ -78,14 +79,18 @@ func TestSaveRejectsInvalid(t *testing.T) {
 	}
 }
 
-// TestProbeMeasures checks the backend's probe wiring with a local
-// silent address (an immediate connection error is a Result, not a
-// panic).
+// TestProbeMeasures checks the backend's probe wiring: a silent
+// address comes back as a failed Result, not a panic or a hang.
 func TestProbeMeasures(t *testing.T) {
 	b := setup.NewLocalBackend(filepath.Join(t.TempDir(), "config.json"))
 
-	results := b.Probe(context.Background(), nil)
-	if len(results) != 0 {
-		t.Errorf("Probe(nil) = %d results, want 0", len(results))
+	results := b.Probe(context.Background(), []providers.Endpoint{
+		{Transport: "plain", Address: "127.0.0.1:1"},
+	})
+	if len(results) != 1 {
+		t.Fatalf("Probe() = %d results, want 1", len(results))
+	}
+	if results[0].Err == "" {
+		t.Errorf("Probe() on a silent address = no error, want a failure result")
 	}
 }

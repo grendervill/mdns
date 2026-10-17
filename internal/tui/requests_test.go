@@ -111,3 +111,43 @@ func TestUpstreamsView(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestsBackfill checks that entering the requests screen loads
+// the recent journal from the daemon instead of starting empty.
+func TestRequestsBackfill(t *testing.T) {
+	sc := &stubClient{requestEntries: []qlog.Entry{
+		{QName: "one.example.com.", Proto: "udp"},
+		{QName: "two.example.com.", Proto: "dot"},
+	}}
+	m := New(sc, Options{})
+
+	updated, cmd := m.Update(key('3')) // switch to the requests screen
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("entering the requests screen returned no load command")
+	}
+	m = step(m, cmd())
+
+	if view := m.View(); !strings.Contains(view, "two.example.com.") {
+		t.Errorf("View() misses the backfilled journal:\n%s", view)
+	}
+}
+
+// TestRequestsScrollStops checks that scrolling up cannot run past the
+// oldest entry into a blank view.
+func TestRequestsScrollStops(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	for i := 0; i < 3; i++ {
+		m = step(m, requestEvent(qlog.Entry{QName: fmt.Sprintf("d%d.example.com.", i), Proto: "udp"}))
+	}
+
+	for i := 0; i < 6; i++ {
+		m = step(m, key('k'))
+	}
+	if got, want := m.requestsScroll, len(m.requests)-1; got != want {
+		t.Fatalf("requestsScroll = %d, want it capped at %d", got, want)
+	}
+	if view := m.View(); !strings.Contains(view, "d0.example.com.") {
+		t.Errorf("View() is blank at full scroll:\n%s", view)
+	}
+}

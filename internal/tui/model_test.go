@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -29,6 +30,8 @@ type stubClient struct {
 	filters   []string
 	updateErr error
 	updates   []*config.Config
+
+	requestEntries []qlog.Entry
 }
 
 func (s *stubClient) Status(context.Context) (api.Status, error) {
@@ -54,7 +57,9 @@ func (s *stubClient) Providers(context.Context) ([]providers.Provider, error) {
 func (s *stubClient) Probe(context.Context, []providers.Endpoint) ([]probe.Result, error) {
 	return nil, nil
 }
-func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) { return nil, nil }
+func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) {
+	return s.requestEntries, nil
+}
 func (s *stubClient) FilterStatus(context.Context) ([]filter.ListStatus, error) {
 	return nil, nil
 }
@@ -229,4 +234,89 @@ func cmdsCommands(c tea.Cmd) []tea.Cmd {
 		return batch
 	}
 	return nil
+}
+
+// TestEventsReconnect checks that a failed subscription and a closed
+// stream both schedule a retry that heals the stream (a daemon restart
+// used to leave the live screens frozen forever).
+func TestEventsReconnect(t *testing.T) {
+	old := eventsRetryDelay
+	eventsRetryDelay = time.Millisecond
+	defer func() { eventsRetryDelay = old }()
+
+	sc := &stubClient{}
+	m := New(sc, Options{})
+
+	updated, cmd := m.Update(eventsReadyMsg{err: errors.New("daemon down")})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("a failed subscription scheduled no retry")
+	}
+	updated, cmd = m.Update(cmd()) // the retry tick
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("the retry tick returned no subscribe command")
+	}
+	updated, _ = m.Update(cmd()) // the subscribe result
+	m = updated.(Model)
+	if m.events == nil {
+		t.Fatalf("the event stream did not reconnect")
+	}
+
+	updated, cmd = m.Update(eventsClosedMsg{})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("a closed stream scheduled no retry")
+	}
+}
+
+// TestInputCtrlCQuits checks that ctrl+c is not swallowed while an
+// input line is open.
+func TestInputCtrlCQuits(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "filters"})
+	m = step(m, key('a'))
+	if !m.inputActive {
+		t.Fatalf("the rule input is not open")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("ctrl+c in an input line was swallowed")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Errorf("ctrl+c produced %T, want tea.QuitMsg", cmd())
+	}
+}
+
+// TestTUIWizardParkedProbes checks that probes stop while the embedded
+// wizard is parked on another screen and resume when it is reopened.
+func TestTUIWizardParkedProbes(t *testing.T) {
+	sc := &stubClient{}
+	m := New(sc, Options{})
+
+	updated, cmd := m.Update(key('2'))
+	m = updated.(Model)
+	m = step(m, cmd().(wizardOpenedMsg))
+	if m.wizard == nil {
+		t.Fatalf("wizard not opened")
+	}
+
+	// Move the wizard to the providers step, then park it elsewhere.
+	m.wizard.enterStage(stageProviders)
+	seq := m.wizard.probeSeq
+	m.screen = screenStatus
+
+	// Probe messages are dropped while parked.
+	m = step(m, wizardProbeMsg{seq: seq, byID: map[string]probe.Result{"cloudflare": {}}})
+	if _, ok := m.wizard.probes["cloudflare"]; ok {
+		t.Errorf("probes kept running while the wizard was parked")
+	}
+
+	// Reopening the wizard restarts the probe chain.
+	updated, cmd = m.Update(key('2'))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Errorf("reopening the wizard did not restart the probes")
+	}
 }
