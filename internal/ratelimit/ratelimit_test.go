@@ -2,6 +2,7 @@ package ratelimit_test
 
 import (
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -164,4 +165,39 @@ func TestRejectsInvalidCIDR(t *testing.T) {
 	if _, err := ratelimit.New(10, []string{"10.0.0.0/33"}, time.Now); err == nil {
 		t.Fatalf("New(bad CIDR) = nil error, want an error")
 	}
+}
+
+// TestConcurrentReloadAndAllow checks that live reloads do not race
+// with the plain-DNS request path (meaningful under -race).
+func TestConcurrentReloadAndAllow(t *testing.T) {
+	l, err := ratelimit.New(100, []string{"10.0.0.0/8"}, time.Now)
+	if err != nil {
+		t.Fatalf("New() = %v, want nil", err)
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				l.Allow(netip.MustParseAddr("192.0.2.1"))
+				l.Exempt(netip.MustParseAddr("10.1.2.3"))
+			}
+		}()
+	}
+
+	for i := 0; i < 200; i++ {
+		if err := l.Reload(5+i%7, []string{"10.0.0.0/8", "192.0.2.0/24"}); err != nil {
+			t.Fatalf("Reload() = %v, want nil", err)
+		}
+	}
+	close(stop)
+	wg.Wait()
 }

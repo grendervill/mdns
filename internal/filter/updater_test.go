@@ -284,3 +284,79 @@ func TestRunFirstUpdateImmediateAndStops(t *testing.T) {
 		t.Errorf("requests = %d, want at least 2 (immediate + interval)", got)
 	}
 }
+
+// TestRunResumesFromManualMode checks that a manual (zero-interval)
+// updater stays alive and starts periodic refreshes once SetInterval
+// arms an interval - previously it returned for good.
+func TestRunResumesFromManualMode(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		fmt.Fprint(w, "||a.example.com^\n")
+	}))
+	defer srv.Close()
+
+	e := filter.NewEngine(filter.EngineOptions{})
+	u, _ := newTestUpdater(t, e, []filter.ListSpec{{ID: "t1", URL: srv.URL + "/list.txt"}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		u.Run(ctx, 0)
+		close(done)
+	}()
+
+	waitFor := func(want int64) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for requests.Load() < want && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		return requests.Load() >= want
+	}
+
+	if !waitFor(1) {
+		t.Fatalf("no immediate update in manual mode")
+	}
+	select {
+	case <-done:
+		t.Fatalf("Run returned in manual mode; SetInterval can never resume it")
+	default:
+	}
+
+	u.SetInterval(20 * time.Millisecond)
+	if !waitFor(2) {
+		t.Errorf("periodic refreshes did not resume after SetInterval: requests = %d", requests.Load())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Run did not stop with the context")
+	}
+}
+
+// TestLoadFromDiskRejectsUnsafeID checks that a traversal-style list ID
+// cannot read files outside the filters directory.
+func TestLoadFromDiskRejectsUnsafeID(t *testing.T) {
+	dir := t.TempDir()
+
+	// A crafted id resolves to <dir>/secret.* - plant files there.
+	if err := os.WriteFile(filepath.Join(dir, "secret.meta.json"),
+		[]byte(`{"URL":"https://x/","UpdatedAt":"2026-01-01T00:00:00Z","Applied":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "secret.rules"), []byte("+evil.example.com\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e := filter.NewEngine(filter.EngineOptions{})
+	u, _ := newTestUpdater(t, e, []filter.ListSpec{{ID: "../secret", URL: "https://x/list.txt"}})
+
+	if err := u.LoadFromDisk(); err != nil {
+		t.Fatalf("LoadFromDisk() = %v, want nil", err)
+	}
+	if blocked, _ := e.Check("evil.example.com."); blocked {
+		t.Errorf("a traversal list id loaded rules from outside the filters dir")
+	}
+}

@@ -130,6 +130,9 @@ func (u *Updater) SetInterval(d time.Duration) {
 // simply starts without those lists.
 func (u *Updater) LoadFromDisk() error {
 	for _, spec := range u.specs {
+		if err := validateListID(spec.ID); err != nil {
+			continue // never touch paths outside the filters dir
+		}
 		meta, err := u.readMeta(spec.ID)
 		if err != nil {
 			continue // nothing cached for this list yet
@@ -172,8 +175,9 @@ func (u *Updater) Update(ctx context.Context) {
 }
 
 // Run performs an immediate Update and then repeats it every interval
-// until ctx is cancelled; a zero interval means a single update. While
-// sleeping, SetInterval changes take effect immediately.
+// until ctx is cancelled; a non-positive interval means no periodic
+// refreshes until SetInterval arms one. While idle or sleeping,
+// SetInterval changes take effect immediately.
 func (u *Updater) Run(ctx context.Context, interval time.Duration) {
 	u.SetInterval(interval)
 
@@ -181,7 +185,14 @@ func (u *Updater) Run(ctx context.Context, interval time.Duration) {
 	for {
 		d := time.Duration(u.interval.Load())
 		if d <= 0 {
-			return
+			// Manual mode: stay alive so a later SetInterval can arm
+			// periodic refreshes without a daemon restart.
+			select {
+			case <-ctx.Done():
+				return
+			case <-u.wake:
+			}
+			continue
 		}
 
 		timer := time.NewTimer(d)

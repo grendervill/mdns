@@ -63,6 +63,11 @@ type runtime struct {
 	specs          []filter.ListSpec
 	filterInterval time.Duration
 
+	// logCfg and dataDir scope resource reuse across generations: a
+	// changed query-log config or data dir must rebuild its component.
+	logCfg  config.LogConfig
+	dataDir string
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -166,6 +171,7 @@ func (a *App) Start(ctx context.Context) error {
 
 	if err := a.startAPI(appCtx); err != nil {
 		_ = a.rt.stop(context.Background())
+		a.rt.closeResources(nil)
 		cancel()
 		a.cancel = nil
 		return err
@@ -271,7 +277,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 
 	if a.appCtx != nil {
 		if err := newRT.start(a.appCtx); err != nil {
-			// Roll back to the previous runtime.
+			// Roll back to the previous runtime; the half-started one
+			// must not leak its transports or a freshly opened log.
+			newRT.closeResources(oldRT)
 			if rerr := oldRT.start(a.appCtx); rerr != nil {
 				a.logger.Error("app: rollback failed", "error", rerr)
 				return fmt.Errorf("app: applying config: %w (rollback failed: %v)", err, rerr)
@@ -287,6 +295,7 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 				a.logger.Error("app: rollback after save failure failed", "error", rerr)
 			}
 		}
+		newRT.closeResources(oldRT) // discarded without ever going live
 		return fmt.Errorf("app: saving config: %w", err)
 	}
 
@@ -416,7 +425,7 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 	}
 
 	queryLog := (*qlog.Log)(nil)
-	if prev != nil && prev.queryLog != nil {
+	if prev != nil && prev.queryLog != nil && prev.logCfg == cfg.Log {
 		queryLog = prev.queryLog // carry the journal across generations
 	} else {
 		queryLog, err = qlog.New(cfg.Log.MemoryEntries, cfg.Log.File, cfg.Log.MaxFileSizeBytes)
@@ -442,6 +451,18 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 		if prev != nil && prev.filterEngine != nil {
 			filterEngine = prev.filterEngine // loaded lists carry over
 			filterEngine.SetUserRules(cfg.Filter.UserAllow, cfg.Filter.UserBlock)
+
+			// Lists dropped from the config must stop blocking right
+			// away instead of lingering until a restart.
+			want := make(map[string]struct{}, len(specs))
+			for _, s := range specs {
+				want[s.ID] = struct{}{}
+			}
+			for _, st := range filterEngine.Stats().Lists {
+				if _, ok := want[st.ID]; !ok {
+					filterEngine.RemoveList(st.ID)
+				}
+			}
 		} else {
 			filterEngine = filter.NewEngine(filter.EngineOptions{
 				UserAllow: cfg.Filter.UserAllow,
@@ -450,7 +471,7 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 			})
 		}
 
-		if prev != nil && prev.updater != nil && slices.Equal(prev.specs, specs) {
+		if prev != nil && prev.updater != nil && prev.dataDir == cfg.DataDir && slices.Equal(prev.specs, specs) {
 			updater = prev.updater
 		} else {
 			updater = filter.NewUpdater(filter.UpdaterOptions{
@@ -500,6 +521,8 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 		updater:        updater,
 		specs:          specs,
 		filterInterval: interval,
+		logCfg:         cfg.Log,
+		dataDir:        cfg.DataDir,
 	}, nil
 }
 

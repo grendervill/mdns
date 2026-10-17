@@ -91,8 +91,15 @@ func parsePrefixes(cidrs []string) ([]netip.Prefix, error) {
 // Exempt reports whether addr falls inside a trusted CIDR. IPv4
 // addresses in IPv6 form are matched against IPv4 prefixes too.
 func (l *Limiter) Exempt(addr netip.Addr) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return exempt(l.trusted, addr)
+}
+
+// exempt is the lock-free core of Exempt; the caller holds l.mu.
+func exempt(trusted []netip.Prefix, addr netip.Addr) bool {
 	addr = addr.Unmap()
-	for _, p := range l.trusted {
+	for _, p := range trusted {
 		if p.Contains(addr) {
 			return true
 		}
@@ -103,15 +110,17 @@ func (l *Limiter) Exempt(addr netip.Addr) bool {
 // Allow consumes one token for addr and reports whether the request
 // may proceed. A disabled limiter and exempt addresses always pass.
 func (l *Limiter) Allow(addr netip.Addr) bool {
-	if l.rps <= 0 || l.Exempt(addr) {
-		return true
-	}
 	addr = addr.Unmap()
-
 	now := l.now()
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	// Reload may replace the limits at any moment; read them under the
+	// same lock that guards the buckets.
+	if l.rps <= 0 || exempt(l.trusted, addr) {
+		return true
+	}
 
 	l.collect(now)
 

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -433,4 +434,35 @@ func TestStatsAndFlush(t *testing.T) {
 	if st := c.Stats(); st.Misses != 2 {
 		t.Errorf("Misses after Flush = %d, want 2; stats: %s", st.Misses, fmt.Sprint(st))
 	}
+}
+
+// TestConcurrentSetLimitsAndPut checks that live TTL-clamp changes do
+// not race with cache stores (meaningful under -race).
+func TestConcurrentSetLimitsAndPut(t *testing.T) {
+	c, _ := newTestCache(t, 64, 0, 3600)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; ; j++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				req := query(fmt.Sprintf("c%d-%d.example.com", n, j))
+				c.Put(req, reply(req, 60))
+				c.Get(req)
+			}
+		}(i)
+	}
+
+	for i := 0; i < 200; i++ {
+		c.SetLimits(0, uint32(60+i))
+	}
+	close(stop)
+	wg.Wait()
 }

@@ -113,6 +113,12 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 	if !ok {
 		return
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// SetLimits may replace the clamps at any moment; read them under
+	// the same lock that guards the entries.
 	if ttl < c.minTTL {
 		ttl = c.minTTL
 	}
@@ -122,9 +128,6 @@ func (c *Cache) Put(req, resp *dns.Msg) {
 	if ttl == 0 {
 		return
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	now := c.now()
 	k := keyFor(req)
