@@ -186,6 +186,29 @@ func TestRouterAllFailReturnsError(t *testing.T) {
 	}
 }
 
+// TestRouterNilResponseIsFailure checks that a transport answering
+// (nil, nil) counts as a failure instead of crashing the router.
+func TestRouterNilResponseIsFailure(t *testing.T) {
+	broken, _ := newScriptedUpstream(t, "broken", 0, func(*dns.Msg) (*dns.Msg, error) {
+		return nil, nil
+	})
+	good, _ := newScriptedUpstream(t, "good", 1, func(req *dns.Msg) (*dns.Msg, error) {
+		return answer(req), nil
+	})
+
+	r, _ := routing.New([]*upstream.Upstream{broken, good}, "failover")
+	resp, used, err := r.Exchange(context.Background(), query("example.com"))
+	if err != nil {
+		t.Fatalf("Exchange() = %v, want nil (the second upstream answers)", err)
+	}
+	if used != good {
+		t.Errorf("Exchange() used %q, want %q", used.ID, good.ID)
+	}
+	if resp == nil {
+		t.Fatalf("Exchange() reply = nil, want the second upstream's answer")
+	}
+}
+
 // TestRouterNoUpstreams checks the empty router.
 func TestRouterNoUpstreams(t *testing.T) {
 	r, err := routing.New(nil, "fastest")

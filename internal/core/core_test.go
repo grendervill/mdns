@@ -75,6 +75,12 @@ func query(name string) *dns.Msg {
 // and log.
 func newTestCore(t *testing.T, res core.Resolver) (*core.Core, *cache.Cache, *qlog.Log) {
 	t.Helper()
+	return newTestCoreFilter(t, res, nil, "zero")
+}
+
+// newTestCoreFilter is newTestCore with a filter and a block mode.
+func newTestCoreFilter(t *testing.T, res core.Resolver, f core.Filter, mode string) (*core.Core, *cache.Cache, *qlog.Log) {
+	t.Helper()
 
 	c := cache.New(100, 0, 86400)
 	l, err := qlog.New(100, "", 0)
@@ -83,8 +89,15 @@ func newTestCore(t *testing.T, res core.Resolver) (*core.Core, *cache.Cache, *ql
 	}
 	t.Cleanup(func() { _ = l.Close() })
 
-	return core.New(res, c, l, discardLogger()), c, l
+	return core.New(res, c, l, f, mode, discardLogger()), c, l
 }
+
+// fakeFilter scripts the core's filter stage.
+type fakeFilter struct {
+	fn func(qname string) (bool, string)
+}
+
+func (f *fakeFilter) Check(qname string) (bool, string) { return f.fn(qname) }
 
 // TestCacheHitRewritesID checks that an answer served from the cache
 // carries the querying client's message ID, not the ID of whoever
@@ -105,6 +118,130 @@ func TestCacheHitRewritesID(t *testing.T) {
 	resp := c.Resolve(context.Background(), q, core.Meta{Proto: "udp"})
 	if resp.Id != 2222 {
 		t.Errorf("cached reply ID = %d, want 2222 (the client's ID)", resp.Id)
+	}
+}
+
+// TestFilterBlocksBeforeCache checks that a blocked domain is answered
+// with the block reply even when a previous answer sits in the cache,
+// and the resolver is never called.
+func TestFilterBlocksBeforeCache(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		t.Errorf("resolver was called for a blocked query")
+		return nil, nil, fmt.Errorf("unreachable")
+	}}
+	blockAll := &fakeFilter{fn: func(string) (bool, string) { return true, "list-1" }}
+	c, cacheStore, _ := newTestCoreFilter(t, res, blockAll, "zero")
+
+	q := query("example.com")
+	cacheStore.Put(q, answer(q)) // a stale cached answer must not win
+
+	resp := c.Resolve(context.Background(), q, core.Meta{Proto: "udp"})
+	if len(resp.Answer) != 1 {
+		t.Fatalf("len(Answer) = %d, want the block answer", len(resp.Answer))
+	}
+	a, ok := resp.Answer[0].(*dns.A)
+	if !ok || a.A.String() != "0.0.0.0" {
+		t.Errorf("Answer = %v, want A 0.0.0.0", resp.Answer[0])
+	}
+	if got := res.callCount(); got != 0 {
+		t.Errorf("resolver calls = %d, want 0", got)
+	}
+}
+
+// TestFilterBlockModes checks every block mode: zero, nxdomain and
+// refused.
+func TestFilterBlockModes(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return answer(req), testUpstream(t), nil
+	}}
+	blockAll := &fakeFilter{fn: func(string) (bool, string) { return true, "l" }}
+
+	t.Run("zero A", func(t *testing.T) {
+		c, _, _ := newTestCoreFilter(t, res, blockAll, "zero")
+		resp := c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+		a, ok := resp.Answer[0].(*dns.A)
+		if !ok || a.A.String() != "0.0.0.0" {
+			t.Fatalf("Answer = %v, want A 0.0.0.0", resp.Answer[0])
+		}
+		if a.Hdr.Ttl != 10 {
+			t.Errorf("TTL = %d, want 10", a.Hdr.Ttl)
+		}
+	})
+	t.Run("zero AAAA", func(t *testing.T) {
+		c, _, _ := newTestCoreFilter(t, res, blockAll, "zero")
+		q := new(dns.Msg)
+		q.SetQuestion("example.com.", dns.TypeAAAA)
+		resp := c.Resolve(context.Background(), q, core.Meta{Proto: "udp"})
+		aaaa, ok := resp.Answer[0].(*dns.AAAA)
+		if !ok || aaaa.AAAA.String() != "::" {
+			t.Fatalf("Answer = %v, want AAAA ::", resp.Answer[0])
+		}
+	})
+	t.Run("zero other type is NODATA", func(t *testing.T) {
+		c, _, _ := newTestCoreFilter(t, res, blockAll, "zero")
+		q := new(dns.Msg)
+		q.SetQuestion("example.com.", dns.TypeTXT)
+		resp := c.Resolve(context.Background(), q, core.Meta{Proto: "udp"})
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 0 {
+			t.Errorf("reply = (%d, %d answers), want NOERROR with none", resp.Rcode, len(resp.Answer))
+		}
+	})
+	t.Run("nxdomain", func(t *testing.T) {
+		c, _, _ := newTestCoreFilter(t, res, blockAll, "nxdomain")
+		resp := c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+		if resp.Rcode != dns.RcodeNameError {
+			t.Errorf("Rcode = %d, want NXDOMAIN", resp.Rcode)
+		}
+	})
+	t.Run("refused", func(t *testing.T) {
+		c, _, _ := newTestCoreFilter(t, res, blockAll, "refused")
+		resp := c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+		if resp.Rcode != dns.RcodeRefused {
+			t.Errorf("Rcode = %d, want REFUSED", resp.Rcode)
+		}
+	})
+}
+
+// TestFilterAllowPasses checks that a non-blocked name follows the
+// normal path.
+func TestFilterAllowPasses(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return answer(req), testUpstream(t), nil
+	}}
+	f := &fakeFilter{fn: func(string) (bool, string) { return false, "" }}
+	c, _, _ := newTestCoreFilter(t, res, f, "zero")
+
+	resp := c.Resolve(context.Background(), query("example.com"), core.Meta{Proto: "udp"})
+	if len(resp.Answer) != 1 {
+		t.Fatalf("Answer = %v, want the resolver's answer", resp.Answer)
+	}
+	if _, ok := resp.Answer[0].(*dns.A); !ok {
+		t.Errorf("Answer = %v, want an A record from the resolver", resp.Answer[0])
+	}
+	if got := res.callCount(); got != 1 {
+		t.Errorf("resolver calls = %d, want 1", got)
+	}
+}
+
+// TestFilterLogsBlocked checks the journal entry of a blocked query.
+func TestFilterLogsBlocked(t *testing.T) {
+	res := &fakeResolver{fn: func(*dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return nil, nil, fmt.Errorf("unreachable")
+	}}
+	blockAll := &fakeFilter{fn: func(string) (bool, string) { return true, "list-9" }}
+	c, _, l := newTestCoreFilter(t, res, blockAll, "zero")
+
+	c.Resolve(context.Background(), query("ads.example.com"), core.Meta{Proto: "udp"})
+
+	recent := l.Recent(1)
+	if len(recent) != 1 {
+		t.Fatalf("Recent(1) length = %d, want 1", len(recent))
+	}
+	if !recent[0].Blocked || recent[0].BlockSource != "list-9" {
+		t.Errorf("entry = %+v, want Blocked with source list-9", recent[0])
+	}
+	if recent[0].Upstream != "" {
+		t.Errorf("Upstream = %q, want empty for a blocked query", recent[0].Upstream)
 	}
 }
 

@@ -25,7 +25,6 @@ func main() {
 	switch cmd {
 	case "version":
 		fmt.Printf("mdns %s\n", version.String())
-		os.Exit(0)
 	case "serve":
 		os.Exit(serveCmd(os.Args[2:]))
 	case "check":

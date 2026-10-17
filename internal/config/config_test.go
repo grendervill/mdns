@@ -71,6 +71,27 @@ func TestDefaultValid(t *testing.T) {
 	}
 }
 
+func TestFilterDefaults(t *testing.T) {
+	c := config.Default()
+
+	if got := c.DataDir; got != "/var/lib/mdns" {
+		t.Errorf("data_dir = %q, want %q", got, "/var/lib/mdns")
+	}
+	f := c.Filter
+	if f.Enabled {
+		t.Errorf("filter enabled = true, want false by default")
+	}
+	if f.Mode != "zero" {
+		t.Errorf("filter mode = %q, want %q", f.Mode, "zero")
+	}
+	if f.UpdateIntervalHours != 24 {
+		t.Errorf("filter update interval = %d, want 24", f.UpdateIntervalHours)
+	}
+	if len(f.Lists) != 0 || len(f.UserAllow) != 0 || len(f.UserBlock) != 0 {
+		t.Errorf("filter lists/rules = %+v, want empty by default", f)
+	}
+}
+
 func TestSaveLoadRoundtrip(t *testing.T) {
 	// Non-default values everywhere, including the omitempty fields.
 	c := config.Default()
@@ -89,6 +110,18 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	}
 	c.Limits.TrustedCIDRs = []string{"10.0.0.0/8", "192.168.0.0/16"}
 	c.Log.File = filepath.Join(t.TempDir(), "requests.jsonl")
+	c.DataDir = "/var/lib/mdns-test"
+	c.Filter = config.FilterConfig{
+		Enabled:             true,
+		Mode:                "nxdomain",
+		UpdateIntervalHours: 6,
+		Lists: []config.FilterList{
+			{ID: "oisd-small"},
+			{ID: "custom", URL: "https://lists.example.com/custom.txt"},
+		},
+		UserAllow: []string{"allowed.example.com"},
+		UserBlock: []string{"blocked.example.com"},
+	}
 
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := c.Save(path); err != nil {
@@ -212,6 +245,19 @@ func TestValidateTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "cache size zero",
+			mutate:  func(c *config.Config) { c.Cache.Size = 0 },
+			wantErr: true,
+		},
+		{
+			name: "cache min above max",
+			mutate: func(c *config.Config) {
+				c.Cache.MinTTL = 100
+				c.Cache.MaxTTL = 50
+			},
+			wantErr: true,
+		},
+		{
 			name: "disabled upstream with empty address",
 			mutate: func(c *config.Config) {
 				c.Upstreams = append(c.Upstreams, config.UpstreamConfig{
@@ -238,6 +284,145 @@ func TestValidateTable(t *testing.T) {
 				t.Errorf("Validate() = %v, want nil", err)
 			}
 		})
+	}
+}
+
+func TestValidateFilterTable(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*config.Config)
+		wantErr bool
+	}{
+		{
+			name:    "filter defaults",
+			mutate:  func(c *config.Config) {},
+			wantErr: false,
+		},
+		{
+			name: "filter enabled with catalog list",
+			mutate: func(c *config.Config) {
+				c.Filter.Enabled = true
+				c.Filter.Lists = []config.FilterList{{ID: "oisd-small"}}
+			},
+			wantErr: false,
+		},
+		{
+			name: "manual updates only",
+			mutate: func(c *config.Config) {
+				c.Filter.UpdateIntervalHours = 0
+			},
+			wantErr: false,
+		},
+		{
+			name:    "unknown mode",
+			mutate:  func(c *config.Config) { c.Filter.Mode = "bogus" },
+			wantErr: true,
+		},
+		{
+			name:    "negative interval",
+			mutate:  func(c *config.Config) { c.Filter.UpdateIntervalHours = -1 },
+			wantErr: true,
+		},
+		{
+			name: "duplicate list ids",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{ID: "a"}, {ID: "a"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty list id",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{URL: "https://x/y.txt"}}
+			},
+			wantErr: true,
+		},
+		{
+			name: "list url not https",
+			mutate: func(c *config.Config) {
+				c.Filter.Lists = []config.FilterList{{ID: "custom", URL: "http://x/y.txt"}}
+			},
+			wantErr: true,
+		},
+		{
+			name:    "user rule with space",
+			mutate:  func(c *config.Config) { c.Filter.UserBlock = []string{"two words"} },
+			wantErr: true,
+		},
+		{
+			name:    "user rule with scheme",
+			mutate:  func(c *config.Config) { c.Filter.UserAllow = []string{"https://x.com"} },
+			wantErr: true,
+		},
+		{
+			name:    "user rule single label",
+			mutate:  func(c *config.Config) { c.Filter.UserBlock = []string{"com"} },
+			wantErr: true,
+		},
+		{
+			name:    "user rule with path",
+			mutate:  func(c *config.Config) { c.Filter.UserAllow = []string{"x.com/path"} },
+			wantErr: true,
+		},
+		{
+			name:    "empty data dir",
+			mutate:  func(c *config.Config) { c.DataDir = "" },
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			tt.mutate(c)
+			err := c.Validate()
+			switch {
+			case tt.wantErr && err == nil:
+				t.Errorf("Validate() = nil, want error")
+			case !tt.wantErr && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestLoadBackwardCompatDefaults(t *testing.T) {
+	// A config written before the filter fields existed: version 1,
+	// no data_dir, no filter section. Loading it must fill the new
+	// fields with defaults instead of failing validation.
+	path := filepath.Join(t.TempDir(), "old.json")
+	old := `{
+  "version": 1,
+  "domain": "dns.example.com",
+  "protocols": {
+    "plain": {"enabled": false, "port": 0},
+    "doh": {"enabled": false, "port": 0},
+    "dot": {"enabled": false, "port": 0},
+    "doq": {"enabled": false, "port": 0}
+  },
+  "tls": {"mode": "self-signed"},
+  "upstreams": [],
+  "strategy": "fastest",
+  "cache": {"size": 100, "min_ttl": 0, "max_ttl": 3600},
+  "limits": {"plain_rps_per_ip": 10, "trusted_cidrs": []},
+  "log": {"memory_entries": 100, "file": "", "max_file_size_bytes": 0}
+}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load() = %v, want nil", err)
+	}
+	if c.DataDir != "/var/lib/mdns" {
+		t.Errorf("DataDir = %q, want the default for old configs", c.DataDir)
+	}
+	if c.Filter.Mode != "zero" {
+		t.Errorf("Filter.Mode = %q, want %q for old configs", c.Filter.Mode, "zero")
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil (old configs must keep loading)", err)
 	}
 }
 

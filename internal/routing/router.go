@@ -51,6 +51,13 @@ func (r *Router) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, *upstrea
 			}
 			continue
 		}
+		if resp == nil {
+			lastErr = fmt.Errorf("%s: upstream returned no reply", u.ID)
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
 		if resp.Rcode == dns.RcodeServerFailure {
 			lastErr = fmt.Errorf("%s: upstream answered SERVFAIL", u.ID)
 			if ctx.Err() != nil {

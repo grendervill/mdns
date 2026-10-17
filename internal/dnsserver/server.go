@@ -1,6 +1,6 @@
 // Package dnsserver exposes the core pipeline on the wire: plain DNS
-// (UDP/TCP) today, with DoT, DoH (h1/h2/h3) and DoQ listeners joining
-// in later tasks. Every listener is optional and configured by port.
+// (UDP/TCP), DoT, DoH (HTTP/1.1, HTTP/2 and HTTP/3) and DoQ listeners.
+// Every listener is optional and configured by port.
 package dnsserver
 
 import (
@@ -63,25 +63,25 @@ func (s *Server) Start(ctx context.Context) error {
 
 	if s.cfg.Protocols.Plain.Enabled {
 		if err := s.startPlain(); err != nil {
-			s.stopLocked(context.Background())
+			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
 	if s.cfg.Protocols.DoT.Enabled {
 		if err := s.startDoT(); err != nil {
-			s.stopLocked(context.Background())
+			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
 	if s.cfg.Protocols.DoH.Enabled {
 		if err := s.startDoH(); err != nil {
-			s.stopLocked(context.Background())
+			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
 	if s.cfg.Protocols.DoQ.Enabled {
 		if err := s.startDoQ(); err != nil {
-			s.stopLocked(context.Background())
+			_ = s.stopLocked(context.Background())
 			return err
 		}
 	}
@@ -91,40 +91,52 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 // Shutdown stops every listener and cancels the base context given to
-// Start, releasing handler work.
+// Start, releasing handler work. It returns the first error any
+// listener reported while stopping.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.stopLocked(ctx)
+	err := s.stopLocked(ctx)
 	s.started = false
-	return nil
+	return err
 }
 
-// stopLocked cancels the base context and stops all listeners. The
-// caller must hold s.mu.
-func (s *Server) stopLocked(ctx context.Context) {
+// stopLocked cancels the base context and stops all listeners,
+// collecting the first error. The caller must hold s.mu.
+func (s *Server) stopLocked(ctx context.Context) error {
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
 	}
+
+	var firstErr error
 	for _, srv := range s.servers {
-		_ = srv.ShutdownContext(ctx)
+		if err := srv.ShutdownContext(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	s.servers = nil
 
 	if s.httpSrv != nil {
-		_ = s.httpSrv.Shutdown(ctx)
+		if err := s.httpSrv.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		s.httpSrv = nil
 	}
 	if s.h3Srv != nil {
-		_ = s.h3Srv.Close()
+		if err := s.h3Srv.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		s.h3Srv = nil
 	}
 	if s.quicLn != nil {
-		_ = s.quicLn.Close()
+		if err := s.quicLn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 		s.quicLn = nil
 	}
+	return firstErr
 }
 
 // track registers a listener for shutdown.

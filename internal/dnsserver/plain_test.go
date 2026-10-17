@@ -147,7 +147,7 @@ func testPipelineHandler(t *testing.T, cfg *config.Config, rps int, h func(*dns.
 	}
 	t.Cleanup(func() { _ = queryLog.Close() })
 
-	c := core.New(router, cache.New(100, 0, 86400), queryLog, nil)
+	c := core.New(router, cache.New(100, 0, 86400), queryLog, nil, "zero", nil)
 	srv := dnsserver.New(cfg, c, certs, limiter, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())

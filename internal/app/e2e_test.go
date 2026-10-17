@@ -46,10 +46,10 @@ func fakeUpstreamIP(t *testing.T, ipv4 [4]byte, delay time.Duration) (*dnsfake.F
 	return fake, &aCalls
 }
 
-// askAllProtocols queries example.com over plain, DoT, DoH and DoQ and
+// askAllProtocols queries name over plain, DoT, DoH and DoQ and
 // returns the A answer from each. Every protocol gets a fresh message
 // with its own ID, as independent clients do.
-func askAllProtocols(t *testing.T, cfg *config.Config) []string {
+func askAllProtocols(t *testing.T, cfg *config.Config, name string) []string {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -57,7 +57,7 @@ func askAllProtocols(t *testing.T, cfg *config.Config) []string {
 
 	newQ := func() *dns.Msg {
 		m := new(dns.Msg)
-		m.SetQuestion("example.com.", dns.TypeA)
+		m.SetQuestion(dns.Fqdn(name), dns.TypeA)
 		return m
 	}
 
@@ -162,7 +162,7 @@ func TestEndToEndAllProtocols(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Every protocol answers, fastest upstream A wins.
-	for i, got := range askAllProtocols(t, cfg) {
+	for i, got := range askAllProtocols(t, cfg, "example.com") {
 		if got != "192.0.2.1" {
 			t.Errorf("protocol #%d answered from %s, want 192.0.2.1 (fastest)", i, got)
 		}
@@ -171,7 +171,7 @@ func TestEndToEndAllProtocols(t *testing.T) {
 	// Repeat: answers come from the cache, the upstream sees no new
 	// A queries.
 	before := aCalls.Load()
-	for i, got := range askAllProtocols(t, cfg) {
+	for i, got := range askAllProtocols(t, cfg, "example.com") {
 		if got != "192.0.2.1" {
 			t.Errorf("cached protocol #%d answered from %s, want 192.0.2.1", i, got)
 		}
@@ -186,7 +186,7 @@ func TestEndToEndAllProtocols(t *testing.T) {
 	time.Sleep(1200 * time.Millisecond)
 
 	beforeB := bCalls.Load()
-	for i, got := range askAllProtocols(t, cfg) {
+	for i, got := range askAllProtocols(t, cfg, "example.com") {
 		if got != "192.0.2.2" {
 			t.Errorf("failover protocol #%d answered from %s, want 192.0.2.2 (upstream B)", i, got)
 		}

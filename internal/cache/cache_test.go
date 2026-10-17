@@ -130,6 +130,45 @@ func TestOPTNotDecayed(t *testing.T) {
 	}
 }
 
+// TestGetStripsCookies checks that a cached reply does not carry the
+// first client's EDNS0 COOKIE to the next client (RFC 7873).
+func TestGetStripsCookies(t *testing.T) {
+	c, _ := newTestCache(t, 10, 0, 86400)
+
+	q := query("example.com")
+	resp := reply(q, 300)
+	opt := new(dns.OPT)
+	opt.Hdr.Name = "."
+	opt.Hdr.Rrtype = dns.TypeOPT
+	opt.SetUDPSize(1232)
+	opt.Option = append(opt.Option, &dns.EDNS0_COOKIE{Code: dns.EDNS0COOKIE, Cookie: "0011223344556677"})
+	resp.Extra = append(resp.Extra, opt)
+	c.Put(q, resp)
+
+	got, ok := c.Get(query("example.com"))
+	if !ok {
+		t.Fatalf("Get() = miss, want hit")
+	}
+
+	var gotOpt *dns.OPT
+	for _, rr := range got.Extra {
+		if o, isOpt := rr.(*dns.OPT); isOpt {
+			gotOpt = o
+		}
+	}
+	if gotOpt == nil {
+		t.Fatalf("cached reply lost its OPT record")
+	}
+	for _, op := range gotOpt.Option {
+		if op.Option() == dns.EDNS0COOKIE {
+			t.Errorf("cached reply still carries a COOKIE option")
+		}
+	}
+	if sz := gotOpt.UDPSize(); sz != 1232 {
+		t.Errorf("advertised UDP size = %d, want 1232 (only cookies are stripped)", sz)
+	}
+}
+
 // TestPutGet checks the happy path and TTL countdown: the stored answer
 // comes back with its TTL reduced by the elapsed seconds, never raised.
 func TestPutGet(t *testing.T) {
