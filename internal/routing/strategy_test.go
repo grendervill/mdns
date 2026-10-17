@@ -43,9 +43,7 @@ func ids(ups []*upstream.Upstream) []string {
 	return out
 }
 
-// noopStrategy keeps TestUnknownStrategyError honest about types.
-var _ routing.Strategy = mustStrategy("fastest")
-
+// mustStrategy builds a strategy or fails the test.
 func mustStrategy(name string) routing.Strategy {
 	s, err := routing.NewStrategy(name)
 	if err != nil {
