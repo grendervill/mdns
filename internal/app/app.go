@@ -9,11 +9,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"sync"
 	"time"
 
+	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
 	"mydns/internal/core"
@@ -40,6 +42,9 @@ type Options struct {
 	// ConfigPath is where UpdateConfig persists the configuration;
 	// updates fail before changing anything when it is empty.
 	ConfigPath string
+	// SocketPath is where the control API listens; empty means
+	// /run/mdns/mdns.sock.
+	SocketPath string
 }
 
 // runtime is one assembled generation of the server components.
@@ -109,6 +114,10 @@ type App struct {
 	cfg *config.Config
 	rt  *runtime
 
+	bus     *api.Bus
+	apiLn   net.Listener
+	apiDone chan struct{}
+
 	appCtx context.Context
 	cancel context.CancelFunc
 }
@@ -129,11 +138,20 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 	}
 
 	cfgCopy := *cfg
-	return &App{logger: logger, opts: opts, cfg: &cfgCopy, rt: rt}, nil
+	a := &App{
+		logger: logger,
+		opts:   opts,
+		cfg:    &cfgCopy,
+		rt:     rt,
+		bus:    api.NewBus(),
+	}
+	a.wireEvents(rt)
+	return a, nil
 }
 
-// Start launches the background loops and binds the listeners; on a
-// bind failure everything stops and the error returns.
+// Start launches the background loops, binds the listeners and serves
+// the control API; on any bind failure everything stops and the error
+// returns.
 func (a *App) Start(ctx context.Context) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -145,6 +163,15 @@ func (a *App) Start(ctx context.Context) error {
 		a.cancel = nil
 		return err
 	}
+
+	if err := a.startAPI(appCtx); err != nil {
+		_ = a.rt.stop(context.Background())
+		cancel()
+		a.cancel = nil
+		return err
+	}
+
+	go a.publishUpstreams(appCtx)
 	return nil
 }
 
@@ -158,7 +185,20 @@ func (a *App) Stop(ctx context.Context) error {
 		a.cancel()
 		a.cancel = nil
 	}
+
 	err := a.rt.stop(ctx)
+
+	// Wait for the control API goroutine so its socket is gone by the
+	// time Stop returns.
+	if a.apiDone != nil {
+		select {
+		case <-a.apiDone:
+		case <-ctx.Done():
+		}
+		a.apiDone = nil
+		a.apiLn = nil
+	}
+
 	a.rt.closeResources(nil)
 	return err
 }
@@ -252,7 +292,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 
 	a.rt = newRT
 	a.cfg = next
+	a.wireEvents(newRT)
 	oldRT.closeResources(newRT)
+	a.bus.Publish(api.Event{Type: "filter", Data: a.filterSnapshotLocked()})
 	return nil
 }
 
@@ -307,6 +349,7 @@ func (a *App) applySoft(old, next *config.Config) error {
 	}
 
 	a.cfg = next
+	a.bus.Publish(api.Event{Type: "filter", Data: a.filterSnapshotLocked()})
 	return nil
 }
 

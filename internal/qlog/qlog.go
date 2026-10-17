@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,10 @@ type Log struct {
 	path    string
 	maxSize int64
 	size    int64
+
+	// observer is invoked after every Add, outside the log's lock; it
+	// feeds the live event stream.
+	observer atomic.Pointer[func(Entry)]
 }
 
 // New returns a log keeping the newest memoryEntries entries and,
@@ -79,16 +84,30 @@ func (l *Log) Add(e Entry) {
 	}
 
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	l.buf[l.next] = e
 	l.next++
 	if l.next == len(l.buf) {
 		l.next = 0
 		l.filled = true
 	}
-
 	l.writeFile(e)
+	l.mu.Unlock()
+
+	// The observer runs outside the lock: it may publish to a bus but
+	// must not call back into the log.
+	if f := l.observer.Load(); f != nil {
+		(*f)(e)
+	}
+}
+
+// SetObserver installs a callback invoked after every Add; nil removes
+// it.
+func (l *Log) SetObserver(f func(Entry)) {
+	if f == nil {
+		l.observer.Store(nil)
+		return
+	}
+	l.observer.Store(&f)
 }
 
 // Recent returns up to n newest entries, oldest first.

@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -50,6 +52,26 @@ func freePort(t *testing.T) int {
 // loopback builds the loopback address for port.
 func loopback(port int) string {
 	return net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+}
+
+// testOptions returns Options wired for tests: a short temp socket
+// path (macOS caps unix socket paths at ~104 bytes, so t.TempDir's
+// long test-name paths are unsafe) and a temp config path plus the
+// fast monitor.
+func testOptions(t *testing.T) app.Options {
+	t.Helper()
+
+	sockDir, err := os.MkdirTemp("", "mdns-")
+	if err != nil {
+		t.Fatalf("MkdirTemp() = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+
+	return app.Options{
+		Monitor:    fastMonitor(),
+		SocketPath: filepath.Join(sockDir, "mdns.sock"),
+		ConfigPath: filepath.Join(t.TempDir(), "config.json"),
+	}
 }
 
 // query builds a single-question A query for name.
@@ -120,7 +142,7 @@ func TestAppServesPlain(t *testing.T) {
 	port := freePort(t)
 	cfg := testConfig(t, fake, port)
 
-	a, err := app.New(cfg, app.Options{Monitor: fastMonitor()}, discardLogger())
+	a, err := app.New(cfg, testOptions(t), discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}
@@ -188,11 +210,10 @@ func TestAppFilterBlocks(t *testing.T) {
 	}
 
 	cl := tlsSkipClient()
-	a, err := app.New(cfg, app.Options{
-		Monitor:        fastMonitor(),
-		FilterClient:   cl,
-		FilterInterval: 50 * time.Millisecond,
-	}, discardLogger())
+	opts := testOptions(t)
+	opts.FilterClient = cl
+	opts.FilterInterval = 50 * time.Millisecond
+	a, err := app.New(cfg, opts, discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}
@@ -271,7 +292,7 @@ func TestAppFilterDisabled(t *testing.T) {
 	port := freePort(t)
 	cfg := testConfig(t, fake, port) // Filter disabled by default
 
-	a, err := app.New(cfg, app.Options{Monitor: fastMonitor()}, discardLogger())
+	a, err := app.New(cfg, testOptions(t), discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}

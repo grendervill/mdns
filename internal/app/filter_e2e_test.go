@@ -52,11 +52,10 @@ func TestFilterEndToEndAllProtocols(t *testing.T) {
 		t.Fatalf("cfg.Validate() = %v, want nil", err)
 	}
 
-	a, err := app.New(cfg, app.Options{
-		Monitor:        fastMonitor(),
-		FilterClient:   tlsSkipClient(),
-		FilterInterval: 50 * time.Millisecond,
-	}, discardLogger())
+	opts := testOptions(t)
+	opts.FilterClient = tlsSkipClient()
+	opts.FilterInterval = 50 * time.Millisecond
+	a, err := app.New(cfg, opts, discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}

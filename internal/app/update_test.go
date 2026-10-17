@@ -23,7 +23,9 @@ func startApp(t *testing.T, cfg *config.Config) (*app.App, string) {
 		t.Fatalf("cfg.Save() = %v, want nil", err)
 	}
 
-	a, err := app.New(cfg, app.Options{Monitor: fastMonitor(), ConfigPath: cfgPath}, discardLogger())
+	opts := testOptions(t)
+	opts.ConfigPath = cfgPath
+	a, err := app.New(cfg, opts, discardLogger())
 	if err != nil {
 		t.Fatalf("app.New() = %v, want nil", err)
 	}

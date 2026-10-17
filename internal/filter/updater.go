@@ -197,6 +197,22 @@ func (u *Updater) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// UpdateOne refreshes one list by ID; an empty id refreshes every
+// list. Unknown IDs are an error.
+func (u *Updater) UpdateOne(ctx context.Context, id string) error {
+	if id == "" {
+		u.Update(ctx)
+		return nil
+	}
+	for _, spec := range u.specs {
+		if spec.ID == id {
+			u.updateOne(ctx, spec)
+			return nil
+		}
+	}
+	return fmt.Errorf("filter: unknown list %q", id)
+}
+
 // Status returns the current state of every configured list, in
 // configuration order.
 func (u *Updater) Status() []ListStatus {
