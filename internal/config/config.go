@@ -86,10 +86,16 @@ func (t TLS) ACMEDirectoryURL() (string, error) {
 	return t.ACME.DirectoryURL, nil
 }
 
-// validateACME checks the ACME settings: a known provider, the contact
-// email required by the public CAs, the ZeroSSL external account
-// binding and a usable custom directory URL.
+// validateACME checks the ACME settings: a known provider with a
+// usable directory URL (delegated to ACMEDirectoryURL, the single
+// source of truth for both) plus the credentials each CA requires —
+// a contact email for the public CAs, and the ZeroSSL external
+// account binding.
 func (t TLS) validateACME() error {
+	if _, err := t.ACMEDirectoryURL(); err != nil {
+		return err
+	}
+
 	switch t.ACME.Provider {
 	case "letsencrypt":
 		if t.ACME.Email == "" {
@@ -102,12 +108,6 @@ func (t TLS) validateACME() error {
 		if t.ACME.EABKeyID == "" || t.ACME.EABHMAC == "" {
 			return errors.New("tls.acme: zerossl requires eab_kid and eab_hmac")
 		}
-	case "custom":
-		if _, err := t.ACMEDirectoryURL(); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("tls.acme: unknown provider %q (want letsencrypt, zerossl or custom)", t.ACME.Provider)
 	}
 	return nil
 }

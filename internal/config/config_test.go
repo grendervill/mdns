@@ -240,7 +240,9 @@ func TestValidateTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "tls mode acme",
+			// Mode acme is a valid mode, but the empty ACME section
+			// names no provider.
+			name:    "tls mode acme without provider",
 			mutate:  func(c *config.Config) { c.TLS.Mode = "acme" },
 			wantErr: true,
 		},
