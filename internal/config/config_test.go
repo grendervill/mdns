@@ -386,6 +386,161 @@ func TestValidateFilterTable(t *testing.T) {
 	}
 }
 
+func TestTLSACMEModeValid(t *testing.T) {
+	tests := []struct {
+		name string
+		acme config.ACME
+	}{
+		{
+			name: "letsencrypt with email",
+			acme: config.ACME{Provider: "letsencrypt", Email: "admin@example.com"},
+		},
+		{
+			name: "zerossl with email and eab",
+			acme: config.ACME{
+				Provider: "zerossl",
+				Email:    "admin@example.com",
+				EABKeyID: "kid-1",
+				EABHMAC:  "c2VjcmV0",
+			},
+		},
+		{
+			name: "custom with https url and insecure skip verify",
+			acme: config.ACME{
+				Provider:           "custom",
+				DirectoryURL:       "https://acme.internal.example.com/directory",
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			c.TLS.Mode = "acme"
+			c.TLS.ACME = tt.acme
+
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestTLSACMEModeInvalid(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{
+			name: "unknown provider",
+			mutate: func(c *config.Config) {
+				c.TLS.ACME = config.ACME{Provider: "bogus", Email: "admin@example.com"}
+			},
+		},
+		{
+			name: "letsencrypt without email",
+			mutate: func(c *config.Config) {
+				c.TLS.ACME = config.ACME{Provider: "letsencrypt"}
+			},
+		},
+		{
+			name: "zerossl without eab",
+			mutate: func(c *config.Config) {
+				c.TLS.ACME = config.ACME{Provider: "zerossl", Email: "admin@example.com"}
+			},
+		},
+		{
+			name: "custom without directory url",
+			mutate: func(c *config.Config) {
+				c.TLS.ACME = config.ACME{Provider: "custom", Email: "admin@example.com"}
+			},
+		},
+		{
+			name: "custom with http directory url",
+			mutate: func(c *config.Config) {
+				c.TLS.ACME = config.ACME{
+					Provider:     "custom",
+					Email:        "admin@example.com",
+					DirectoryURL: "http://acme.internal.example.com/directory",
+				}
+			},
+		},
+		{
+			name:   "empty domain",
+			mutate: func(c *config.Config) { c.Domain = "" },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			c.TLS.Mode = "acme"
+			tt.mutate(c)
+
+			if err := c.Validate(); err == nil {
+				t.Errorf("Validate() = nil, want error")
+			}
+		})
+	}
+}
+
+func TestACMEDirectoryURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		tls     config.TLS
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "letsencrypt",
+			tls:  config.TLS{ACME: config.ACME{Provider: "letsencrypt"}},
+			want: "https://acme-v02.api.letsencrypt.org/directory",
+		},
+		{
+			name: "zerossl",
+			tls:  config.TLS{ACME: config.ACME{Provider: "zerossl"}},
+			want: "https://acme.zerossl.com/v2/DV90",
+		},
+		{
+			name: "custom",
+			tls: config.TLS{ACME: config.ACME{
+				Provider:     "custom",
+				DirectoryURL: "https://acme.internal.example.com/directory",
+			}},
+			want: "https://acme.internal.example.com/directory",
+		},
+		{
+			name:    "unknown provider",
+			tls:     config.TLS{ACME: config.ACME{Provider: "bogus"}},
+			wantErr: true,
+		},
+		{
+			name:    "custom without directory url",
+			tls:     config.TLS{ACME: config.ACME{Provider: "custom"}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.tls.ACMEDirectoryURL()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ACMEDirectoryURL() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ACMEDirectoryURL() = %v, want nil", err)
+			}
+			if got != tt.want {
+				t.Errorf("ACMEDirectoryURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadBackwardCompatDefaults(t *testing.T) {
 	// A config written before the filter fields existed: version 1,
 	// no data_dir, no filter section. Loading it must fill the new
