@@ -352,10 +352,29 @@ echo "=== phase B: idempotence and the live reconfigure ==="
 config_hash() { docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1; }
 main_pid() { docker exec "$NAME" systemctl show -p MainPID --value mdns 2>/dev/null | tr -d ' \n'; }
 active_since() { docker exec "$NAME" systemctl show -p ActiveEnterTimestamp --value mdns 2>/dev/null; }
+# valid_pid reports whether a MainPID reading identifies a live process.
+# A comparison of two PIDs is only meaningful when both sides are live, so
+# every restart assertion guards both: a dead daemon must fail loudly here
+# rather than make B1/B5/B9 pass without exercising anything.
+valid_pid() { [ -n "$1" ] && [ "$1" != "0" ]; }
 
 config_before=$(config_hash)
 pid_before=$(main_pid)
 note "before the re-run: config $config_before, daemon MainPID $pid_before, $(active_since)"
+
+# B0 is the precondition of the whole phase: the daemon has to be up and
+# has to be the process holding 53/443/853. Without it B1 would not take
+# the held-port path (the D1 case) and the PID comparisons would compare
+# nothing.
+ccontains "B0  the daemon is active before the re-run (it holds the ports)" \
+  'systemctl is-active mdns' 'active'
+if valid_pid "$pid_before"; then
+  pass "B0b the daemon reported a live MainPID ($pid_before)"
+else
+  fail "B0b the daemon reported a live MainPID" "MainPID before the re-run: '${pid_before}'"
+fi
+cassert "B0c the daemon holds a listening port (ss names the mdns process)" \
+  'ss -H -ltnup | grep -q "mdns"'
 
 iassert "B1  a second run over the running service exits 0" "$INSTALL_FLAGS" ok
 note "$(printf '%s\n' "$LAST_OUT" | grep -E 'скачиваем|сумма|оставлен без изменений' | head -3 || true)"
@@ -372,10 +391,11 @@ else
 fi
 ccontains "B4  the service is active after the re-run" 'systemctl is-active mdns' 'active'
 pid_after=$(main_pid)
-if [ -n "$pid_after" ] && [ "$pid_after" != "0" ] && [ "$pid_after" != "$pid_before" ]; then
+if valid_pid "$pid_before" && valid_pid "$pid_after" && [ "$pid_after" != "$pid_before" ]; then
   pass "B5  the re-run restarted the daemon (MainPID $pid_before -> $pid_after)"
 else
-  fail "B5  the re-run restarted the daemon" "MainPID before $pid_before, after ${pid_after:-none}"
+  fail "B5  the re-run restarted the daemon" \
+    "MainPID before '${pid_before}', after '${pid_after}'; both must be live and must differ"
 fi
 
 iassert "B6  a --reconfigure run exits 0 (same ports, new domain $RE_DOMAIN)" "$RECONFIG_FLAGS" ok
@@ -388,10 +408,11 @@ else
 fi
 ccontains "B8  the service is active after the reconfigure" 'systemctl is-active mdns' 'active'
 reconfig_pid=$(main_pid)
-if [ -n "$reconfig_pid" ] && [ "$reconfig_pid" != "0" ] && [ "$reconfig_pid" != "$pid_after" ]; then
+if valid_pid "$pid_after" && valid_pid "$reconfig_pid" && [ "$reconfig_pid" != "$pid_after" ]; then
   pass "B9  the reconfigure restarted the daemon (MainPID $pid_after -> $reconfig_pid)"
 else
-  fail "B9  the reconfigure restarted the daemon" "MainPID before $pid_after, after ${reconfig_pid:-none}"
+  fail "B9  the reconfigure restarted the daemon" \
+    "MainPID before '${pid_after}', after '${reconfig_pid}'; both must be live and must differ"
 fi
 
 # The strongest proof of D2's fix: the daemon that is running right now —
