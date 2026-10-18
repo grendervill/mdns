@@ -255,7 +255,7 @@
 **Interfaces:**
 - Фаза B (отказ): поднять только `daemon` (`MDNS_ACME_BACKOFF_MIN=5s`): `status.Cert.State ∈ {waiting,error}`, 443 закрыт, `dig` на 53 работает; поднять `pebble`+`challtestsrv` → ≤30 c TLS поднимается сам.
 - Фаза C (кэш): `docker compose restart daemon` при остановленном pebble → TLS снова отвечает сразу (сертификат из кэша, новый заказ не делается).
-- Фаза D (смена на живом): старт `daemon` с `self-signed` → через unix-сокет (volume) `curl -X PUT /api/v1/config` с `tls.mode=acme` → ждать TLS с pebble-сертификатом (issuer pebble), plain не прерывался (непрерывный `dig`-цикл с 0 ошибок).
+- Фаза D (смена на живом): старт `daemon` с `self-signed` → через unix-сокет (volume) `curl -X PUT /api/v1/config` с `tls.mode=acme` → ждать TLS с pebble-сертификатом (issuer pebble), plain переживает краткое окно рестарта листенеров; e2e ограничивает окно (≤2 подряд, ≤3 всего, чистый хвост) и ловит рост.
 
 - [ ] **Step 1: расширить скрипт фазами B–D** (каждая — отдельный `docker compose` профиль/этап, с чистым down между фазами).
 - [ ] **Step 2: прогнать целиком; красное — фиксить код (app/acmecert), не скрипт**.

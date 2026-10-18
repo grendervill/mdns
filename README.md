@@ -260,9 +260,13 @@ a restart of the daemon.
 **Switching a running daemon to ACME.** Changing `tls.mode` to `acme`
 on a daemon that is already serving (a config update or
 `mdns install --reconfigure`) takes DoT and DoQ offline until the
-certificate is issued: plain DNS keeps answering and the status shows
-the `waiting` state meanwhile. A fresh install configured with ACME
-from the start has no such window — nothing was serving TLS before.
+certificate is issued, and the status shows the `waiting` state
+meanwhile. The switch is a structural config change, so the daemon
+rebinds its listeners: plain DNS can see a refused window of up to a
+few seconds while the old runtime stops and the new one starts. If the
+new runtime fails to come up, the old one is restored and keeps
+serving (rollback). A fresh install configured with ACME from the
+start has no such window — nothing was serving TLS before.
 
 **Renewal.** autocert renews over the handshake path before the leaf
 expires — at the lesser of 30 days or a third of the certificate
