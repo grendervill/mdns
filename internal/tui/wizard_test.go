@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"mydns/internal/auth"
 	"mydns/internal/config"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -92,6 +93,36 @@ func tlsCursor(t *testing.T, w WizardModel, option int) WizardModel {
 	return w
 }
 
+// newWizardAtPanel returns a wizard sitting on the web-panel step with
+// the enable question open.
+func newWizardAtPanel(t *testing.T, b *fakeWizardBackend) WizardModel {
+	t.Helper()
+	w, err := NewWizard(b)
+	if err != nil {
+		t.Fatalf("NewWizard() = %v, want nil", err)
+	}
+	w.enterStage(stagePanel)
+	if !w.inputActive || w.inputTarget != inputPanelEnabled {
+		t.Fatalf("input = (%v, %q), want the panel question", w.inputActive, w.inputTarget)
+	}
+	return w
+}
+
+// answerPanelDisabled answers the panel question with «н» and moves on
+// to the summary step.
+func answerPanelDisabled(t *testing.T, w WizardModel) WizardModel {
+	t.Helper()
+	if !w.inputActive || w.inputTarget != inputPanelEnabled {
+		t.Fatalf("input = (%v, %q), want the panel question", w.inputActive, w.inputTarget)
+	}
+	w = typeWizard(t, w, "н")
+	w = wizardStep(t, w, enterKey())
+	if w.cfg.Panel.Enabled {
+		t.Fatalf("the panel is enabled after an «н» answer")
+	}
+	return wizardStep(t, w, key('n'))
+}
+
 // TestWizardFlow walks the wizard through every step, including a
 // back-and-forth that must not lose earlier answers, and checks the
 // saved configuration.
@@ -160,7 +191,8 @@ func TestWizardFlow(t *testing.T) {
 	w = wizardStep(t, w, key('n'))   // -> strategy
 	w = wizardStep(t, w, enterKey()) // select the first strategy (fastest)
 	w = wizardStep(t, w, key('n'))   // -> filters
-	w = wizardStep(t, w, key('n'))   // -> summary
+	w = wizardStep(t, w, key('n'))   // -> panel (opens the question)
+	w = answerPanelDisabled(t, w)    // answer «н» and move on to the summary
 	if w.stage != stageSummary {
 		t.Fatalf("stage = %v, want summary", w.stage)
 	}
@@ -446,7 +478,8 @@ func TestWizardRequiresProvider(t *testing.T) {
 	w = wizardStep(t, w, key('n'))   // -> strategy
 	w = wizardStep(t, w, enterKey())
 	w = wizardStep(t, w, key('n')) // -> filters
-	w = wizardStep(t, w, key('n')) // -> summary
+	w = wizardStep(t, w, key('n')) // -> panel (opens the question)
+	w = answerPanelDisabled(t, w)  // answer «н» and move on to the summary
 
 	w = wizardStep(t, w, enterKey())
 	if w.saved {
@@ -500,8 +533,9 @@ func TestSetupSummary(t *testing.T) {
 	w = wizardStep(t, w, enterKey()) // select cloudflare
 	w = wizardStep(t, w, key('n'))
 	w = wizardStep(t, w, enterKey()) // fastest
-	w = wizardStep(t, w, key('n'))
-	w = wizardStep(t, w, key('n'))   // summary
+	w = wizardStep(t, w, key('n'))   // -> filters
+	w = wizardStep(t, w, key('n'))   // -> panel (opens the question)
+	w = answerPanelDisabled(t, w)    // answer «н» and move on to the summary
 	w = wizardStep(t, w, enterKey()) // save
 
 	if !w.saved {
@@ -686,6 +720,118 @@ func TestWizardFiltersPresetSeeded(t *testing.T) {
 	w2.enterStage(stageFilters)
 	if w2.cursor != 1 {
 		t.Errorf("cursor = %d for the basic preset, want 1", w2.cursor)
+	}
+}
+
+// TestWizardPanelEnabled answers «д» and sets a password pair: the hash
+// lands in the config, verifies against the plaintext and leaves no
+// trace of it.
+func TestWizardPanelEnabled(t *testing.T) {
+	w := newWizardAtPanel(t, newFakeWizardBackend(t))
+
+	w = typeWizard(t, w, "д")
+	w = wizardStep(t, w, enterKey())
+	if w.inputTarget != inputPanelPassword {
+		t.Fatalf("input target = %q, want the password input", w.inputTarget)
+	}
+
+	const pw = "supersecret"
+	w = typeWizard(t, w, pw)
+	w = wizardStep(t, w, enterKey())
+	if w.inputTarget != inputPanelConfirm {
+		t.Fatalf("input target = %q, want the confirmation input", w.inputTarget)
+	}
+	w = typeWizard(t, w, pw)
+	w = wizardStep(t, w, enterKey())
+
+	if w.inputActive {
+		t.Fatalf("the panel input stayed open after the password pair: err=%v", w.err)
+	}
+	if !w.cfg.Panel.Enabled {
+		t.Fatalf("Panel.Enabled = false, want true")
+	}
+	if !strings.HasPrefix(w.cfg.Panel.PasswordHash, "$argon2id$") {
+		t.Errorf("PasswordHash = %q, want an argon2id PHC hash", w.cfg.Panel.PasswordHash)
+	}
+	if !auth.Verify(w.cfg.Panel.PasswordHash, pw) {
+		t.Errorf("the stored hash does not verify %q", pw)
+	}
+	if strings.Contains(w.cfg.Panel.PasswordHash, pw) {
+		t.Errorf("the stored hash contains the plaintext password")
+	}
+	if err := w.cfg.Validate(); err != nil {
+		t.Errorf("the resulting config does not validate: %v", err)
+	}
+	if sum := w.Summary(); !strings.Contains(sum, "https://mdns.test/ · логин admin") {
+		t.Errorf("Summary() misses the panel URL:\n%s", sum)
+	}
+}
+
+// TestWizardPanelPasswordMismatch checks that a mismatch re-asks the
+// pair from the password, keeping the error visible.
+func TestWizardPanelPasswordMismatch(t *testing.T) {
+	w := newWizardAtPanel(t, newFakeWizardBackend(t))
+
+	w = typeWizard(t, w, "да")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "password-one")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "password-two")
+	w = wizardStep(t, w, enterKey())
+
+	if !w.inputActive || w.inputTarget != inputPanelPassword {
+		t.Fatalf("input = (%v, %q), want a restart of the password pair", w.inputActive, w.inputTarget)
+	}
+	if w.err == nil || !strings.Contains(w.err.Error(), "не совпадают") {
+		t.Fatalf("err = %v, want a mismatch error", w.err)
+	}
+	if w.cfg.Panel.Enabled {
+		t.Errorf("Panel.Enabled = true after a password mismatch")
+	}
+
+	// The retry starts from the first password and succeeds.
+	w = typeWizard(t, w, "password-one")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "password-one")
+	w = wizardStep(t, w, enterKey())
+	if !w.cfg.Panel.Enabled || !auth.Verify(w.cfg.Panel.PasswordHash, "password-one") {
+		t.Errorf("the retry did not store a working hash: %+v (err=%v)", w.cfg.Panel, w.err)
+	}
+}
+
+// TestWizardPanelShortPassword checks the minimum length on the first
+// password: the input stays open with an error.
+func TestWizardPanelShortPassword(t *testing.T) {
+	w := newWizardAtPanel(t, newFakeWizardBackend(t))
+
+	w = typeWizard(t, w, "y")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "short")
+	w = wizardStep(t, w, enterKey())
+
+	if !w.inputActive || w.inputTarget != inputPanelPassword {
+		t.Fatalf("input = (%v, %q), want the password input still open", w.inputActive, w.inputTarget)
+	}
+	if w.err == nil || !strings.Contains(w.err.Error(), "8") {
+		t.Fatalf("err = %v, want a minimum-length error", w.err)
+	}
+	if w.cfg.Panel.Enabled {
+		t.Errorf("Panel.Enabled = true after a short password")
+	}
+}
+
+// TestWizardPanelDisabled turns the panel off with «н».
+func TestWizardPanelDisabled(t *testing.T) {
+	w := newWizardAtPanel(t, newFakeWizardBackend(t))
+
+	w = typeWizard(t, w, "н")
+	w = wizardStep(t, w, enterKey())
+
+	if w.inputActive {
+		t.Fatalf("the panel input stayed open after «н»")
+	}
+	if w.cfg.Panel.Enabled || w.cfg.Panel.PasswordHash != "" {
+		t.Errorf("Panel = %+v, want it disabled and empty", w.cfg.Panel)
 	}
 }
 

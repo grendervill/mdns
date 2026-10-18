@@ -43,6 +43,7 @@ func TestInstallFlagsWire(t *testing.T) {
 		"--strategy", "failover",
 		"--plain-port", "5353", "--doh-port", "8443", "--dot-port", "8853", "--doq-port", "8853",
 		"--filter", "strict",
+		"--panel", "--password", "s3cret-pass",
 	}
 	if err := fs.Parse(args); err != nil {
 		t.Fatalf("parse install flags: %v", err)
@@ -71,6 +72,8 @@ func TestInstallFlagsWire(t *testing.T) {
 		DoTPort:        8853,
 		DoQPort:        8853,
 		FilterPreset:   "strict",
+		Panel:          true,
+		Password:       "s3cret-pass",
 	}
 	if !reflect.DeepEqual(f, want) {
 		t.Errorf("parsed flags = %+v\nwant %+v", f, want)
@@ -99,12 +102,15 @@ func TestInstallSpecFromFlags(t *testing.T) {
 		DoTPort:        8853,
 		DoQPort:        8853,
 		FilterPreset:   "basic",
+		Panel:          true,
+		Password:       "s3cret-pass",
 	}
 
 	spec, err := installSpecFromFlags(f)
 	if err != nil {
 		t.Fatalf("installSpecFromFlags() error = %v, want nil", err)
 	}
+	panelOn := true
 	want := &installer.Spec{
 		Domain:        "dns.example.com",
 		TLSMode:       "acme",
@@ -123,11 +129,61 @@ func TestInstallSpecFromFlags(t *testing.T) {
 		DoTPort:       8853,
 		DoQPort:       8853,
 		FilterPreset:  "basic",
+		PanelPassword: "s3cret-pass",
+		PanelEnabled:  &panelOn,
 	}
 	if !reflect.DeepEqual(spec, want) {
 		t.Errorf("installSpecFromFlags() = %+v\nwant %+v", spec, want)
 	}
 }
+
+// TestInstallSpecFromFlagsPanel pins the panel tristate of the flags:
+// --no-panel forces off, --panel forces on and neither leaves the choice
+// to --password.
+func TestInstallSpecFromFlagsPanel(t *testing.T) {
+	tests := []struct {
+		name    string
+		flags   installFlags
+		want    *bool
+		wantPwd string
+	}{
+		{
+			name:    "no-panel forces off",
+			flags:   installFlags{NonInteractive: true, Domain: "dns.example.com", NoPanel: true, Password: "s3cret-pass"},
+			want:    boolPtr(false),
+			wantPwd: "s3cret-pass",
+		},
+		{
+			name:    "panel forces on",
+			flags:   installFlags{NonInteractive: true, Domain: "dns.example.com", Panel: true},
+			want:    boolPtr(true),
+			wantPwd: "",
+		},
+		{
+			name:    "neither defers to the password",
+			flags:   installFlags{NonInteractive: true, Domain: "dns.example.com", Password: "s3cret-pass"},
+			want:    nil,
+			wantPwd: "s3cret-pass",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec, err := installSpecFromFlags(tt.flags)
+			if err != nil {
+				t.Fatalf("installSpecFromFlags() error = %v, want nil", err)
+			}
+			if !reflect.DeepEqual(spec.PanelEnabled, tt.want) {
+				t.Errorf("PanelEnabled = %v, want %v", spec.PanelEnabled, tt.want)
+			}
+			if spec.PanelPassword != tt.wantPwd {
+				t.Errorf("PanelPassword = %q, want %q", spec.PanelPassword, tt.wantPwd)
+			}
+		})
+	}
+}
+
+// boolPtr returns a pointer to v, for the panel tristate assertions.
+func boolPtr(v bool) *bool { return &v }
 
 // TestInstallSpecFromFlagsRequiresDomain checks the non-interactive
 // contract: without a domain there is nothing to install, and the

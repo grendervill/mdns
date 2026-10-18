@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"mydns/internal/auth"
 	"mydns/internal/config"
 	"mydns/internal/filter"
 	"mydns/internal/providers"
@@ -100,10 +101,45 @@ func buildConfig(spec Spec) (*config.Config, error) {
 	cfg.Filter.Enabled = enabled
 	cfg.Filter.Lists = lists
 
+	panel, err := buildPanel(spec)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Panel = panel
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("installer: built config is invalid: %w", err)
 	}
 	return cfg, nil
+}
+
+// minPanelPasswordLen is the shortest admin password the panel accepts.
+// It matches the wizard's minimum.
+const minPanelPasswordLen = 8
+
+// buildPanel turns the spec's panel settings into a PanelConfig. The
+// panel is on when PanelEnabled says so, or by default when a password
+// was given; an enabled panel without a password is an error. The
+// password is hashed with argon2id and never stored in the clear.
+func buildPanel(spec Spec) (config.PanelConfig, error) {
+	enabled := spec.PanelPassword != ""
+	if spec.PanelEnabled != nil {
+		enabled = *spec.PanelEnabled
+	}
+	if !enabled {
+		return config.PanelConfig{Enabled: false}, nil
+	}
+	if spec.PanelPassword == "" {
+		return config.PanelConfig{}, errors.New("installer: the web panel needs a password (--panel requires --password)")
+	}
+	if len([]rune(spec.PanelPassword)) < minPanelPasswordLen {
+		return config.PanelConfig{}, fmt.Errorf("installer: the web panel password must be at least %d characters", minPanelPasswordLen)
+	}
+	hash, err := auth.HashPassword(spec.PanelPassword)
+	if err != nil {
+		return config.PanelConfig{}, fmt.Errorf("installer: hash the web panel password: %w", err)
+	}
+	return config.PanelConfig{Enabled: true, PasswordHash: hash}, nil
 }
 
 // buildUpstreams maps the catalog IDs to one upstream each: the
