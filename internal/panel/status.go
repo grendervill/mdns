@@ -546,26 +546,43 @@ func fillCert(view *statusView, st api.Status) {
 	}
 
 	view.Cert.Show = true
-	switch c.State {
-	case "ok":
-		name := c.Issuer
-		if name == "" {
-			name = c.Mode
-		}
-		view.Cert.State = "ok"
-		view.Cert.Label = "Действует"
-		view.Cert.Detail = name + " · истекает " + c.NotAfter.Format("02.01.2006")
-	case "waiting":
-		view.Cert.State = "waiting"
-		view.Cert.Label = "Ожидает"
-		view.Cert.Detail = "ожидание выпуска…"
-	case "error":
-		view.Cert.State = "error"
-		view.Cert.Label = "Ошибка"
-		view.Cert.Detail = "ошибка — " + c.Error
-	default:
+	class, label, known := certStateLabel(c.State)
+	if !known {
+		// An unknown state keeps the old rendering: the state word as
+		// the tag class and the mode as the label.
 		view.Cert.State = c.State
 		view.Cert.Label = c.Mode
+		return
+	}
+	view.Cert.State, view.Cert.Label = class, label
+
+	name := c.Issuer
+	if name == "" {
+		name = c.Mode
+	}
+	switch c.State {
+	case "ok":
+		view.Cert.Detail = name + " · истекает " + c.NotAfter.Format("02.01.2006")
+	case "waiting":
+		view.Cert.Detail = "ожидание выпуска…"
+	case "error":
+		view.Cert.Detail = "ошибка — " + c.Error
+	}
+}
+
+// certStateLabel maps a certificate state to the tag class and the
+// Russian word both the status page and the certificate page show, so
+// the two screens cannot describe one state differently.
+func certStateLabel(state string) (class, label string, known bool) {
+	switch state {
+	case "ok":
+		return "ok", "Действует", true
+	case "waiting":
+		return "waiting", "Ожидает", true
+	case "error":
+		return "error", "Ошибка", true
+	default:
+		return state, state, false
 	}
 }
 

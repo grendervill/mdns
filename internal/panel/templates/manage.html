@@ -1,0 +1,322 @@
+{{define "notice"}}{{if .Error}}<p class="alert" role="alert">{{.Error}}</p>{{end}}{{if .OK}}<p class="flash" role="status">{{.OK}}</p>{{end}}{{end}}
+
+{{define "upstreams"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — upstream’ы</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Upstream’ы</h2>
+      <div class="state">стратегия: <b>{{.Strategy}}</b></div>
+    </div>
+    {{template "notice" .}}
+
+    {{if .Upstreams}}
+    <form method="post" action="/panel/upstreams/priority">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr>
+              <th>Сервер</th><th>Протокол</th><th>Адрес</th><th>Состояние</th>
+              <th>Задержка</th><th>Ответил</th><th>Ошибки</th><th>Приоритет</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {{range .Upstreams}}
+            <tr>
+              <td>{{.Name}}</td>
+              <td class="num">{{.Transport}}</td>
+              <td class="num addr" title="{{.Address}}">{{.Address}}</td>
+              <td><span class="tag {{.StateClass}}">{{.StateText}}</span></td>
+              <td class="num">{{.Latency}}</td>
+              <td class="num">{{.Answered}}</td>
+              <td class="num">{{.Errors}}</td>
+              <td><input class="ctl num-input" type="number" name="prio.{{.ID}}" value="{{.Priority}}" min="0" max="99" aria-label="Приоритет {{.Name}}"></td>
+              <td><button class="btn small" type="submit" formaction="/panel/upstreams/toggle" name="id" value="{{.ID}}">{{.Action}}</button></td>
+            </tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+      <p class="row-actions">
+        <button class="btn" type="submit">Сохранить порядок</button>
+        <span class="hint">Чем меньше число, тем раньше upstream выбирается при стратегии failover.</span>
+      </p>
+    </form>
+    {{else}}
+    <p class="note">Upstream’ы не настроены — добавьте их в мастере установки (mdns setup) или в файле конфигурации.</p>
+    {{end}}
+  </main>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "filters"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — фильтры</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Фильтры</h2>
+      <div class="state">
+        {{if .Enabled}}<span class="dot"></span>включены · режим: <b>{{.ModeLabel}}</b>{{if .TotalBlocked}} · заблокировано: <b>{{.TotalBlocked}}</b>{{end}}{{else}}выключены{{end}}
+      </div>
+    </div>
+    {{template "notice" .}}
+    {{if not .Enabled}}<p class="note">Фильтрация выключена — включите её в «Настройках».</p>{{end}}
+
+    <h3>Списки <span class="sub">— обновить один или все</span></h3>
+    <form method="post" action="/panel/filters/refresh">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>Список</th><th>Правил</th><th>Пропуск</th><th>Обновлён</th><th>Статус</th><th></th></tr>
+          </thead>
+          <tbody>
+            {{range .Lists}}
+            <tr>
+              <td>{{.ID}}</td>
+              <td class="num">{{.Rules}}</td>
+              <td class="num">{{.Skipped}}</td>
+              <td class="num">{{.Updated}}</td>
+              <td>{{if .Title}}<span class="tag {{.StateClass}}" title="{{.Title}}">{{.StateText}}</span>{{else}}<span class="tag {{.StateClass}}">{{.StateText}}</span>{{end}}</td>
+              <td><button class="btn small" type="submit" name="id" value="{{.ID}}">Обновить</button></td>
+            </tr>
+            {{end}}
+            {{if not .Lists}}
+            <tr class="empty"><td colspan="6">Списки не заданы — включите фильтрацию и добавьте списки в конфигурации.</td></tr>
+            {{end}}
+          </tbody>
+        </table>
+      </div>
+      <p class="row-actions"><button class="btn" type="submit" name="id" value="">Обновить все</button></p>
+    </form>
+
+    <h3>Режим блокировки</h3>
+    <form method="post" action="/panel/filters/mode" class="inline-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      {{range .Modes}}<label class="radio"><input type="radio" name="mode" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Label}}</label>{{end}}
+      <button class="btn primary" type="submit">Применить режим</button>
+    </form>
+
+    <h3>Свои правила <span class="sub">— правило покрывает домен и все его поддомены</span></h3>
+    <form method="post" action="/panel/filters/rules/add" class="searchrow">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input class="ctl grow" type="text" name="domain" value="{{.AddDomain}}" placeholder="example.com" aria-label="Домен">
+      <select class="ctl" name="kind" aria-label="Что делать с доменом">
+        <option value="block"{{if ne .AddKind "allow"}} selected{{end}}>блокировать</option>
+        <option value="allow"{{if eq .AddKind "allow"}} selected{{end}}>разрешить</option>
+      </select>
+      <button class="btn primary" type="submit">Добавить</button>
+    </form>
+
+    <div class="rules">
+      <div class="rule-col">
+        <h4>Разрешённые</h4>
+        <form method="post" action="/panel/filters/rules/remove" class="rule-chips">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="kind" value="allow">
+          {{range .Allow}}<span class="rule"><b>{{.}}</b><button class="x" type="submit" name="domain" value="{{.}}" aria-label="Убрать правило {{.}}">×</button></span>{{else}}<span class="muted">нет правил</span>{{end}}
+        </form>
+      </div>
+      <div class="rule-col">
+        <h4>Заблокированные</h4>
+        <form method="post" action="/panel/filters/rules/remove" class="rule-chips">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <input type="hidden" name="kind" value="block">
+          {{range .Block}}<span class="rule"><b>{{.}}</b><button class="x" type="submit" name="domain" value="{{.}}" aria-label="Убрать правило {{.}}">×</button></span>{{else}}<span class="muted">нет правил</span>{{end}}
+        </form>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "settings"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — настройки</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Настройки</h2>
+      <div class="state">ключевые поля конфигурации · применение целиком</div>
+    </div>
+    {{template "notice" .}}
+
+    <form method="post" action="/panel/settings">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>Домен</span><input class="ctl" type="text" name="domain" value="{{.FormDomain}}" spellcheck="false"></label>
+        <label class="field"><span>Стратегия</span>
+          <select class="ctl" name="strategy">
+            {{range .Strategies}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+          </select>
+        </label>
+        <label class="field"><span>Размер кеша, записей</span><input class="ctl" type="number" name="cache.size" value="{{.CacheSize}}" min="1"></label>
+        <label class="field"><span>Кеш: min TTL, с</span><input class="ctl" type="number" name="cache.min_ttl" value="{{.CacheMinTTL}}" min="0"></label>
+        <label class="field"><span>Кеш: max TTL, с</span><input class="ctl" type="number" name="cache.max_ttl" value="{{.CacheMaxTTL}}" min="0"></label>
+        <label class="field"><span>Лимит запросов на IP (plain), rps</span><input class="ctl" type="number" name="limits.plain_rps_per_ip" value="{{.PlainRPS}}" min="0"></label>
+        <label class="field"><span>Интервал обновления списков, ч</span><input class="ctl" type="number" name="filter.update_interval_hours" value="{{.FilterInterval}}" min="0"></label>
+        <label class="check"><input type="checkbox" name="filter.enabled"{{if .FilterEnabled}} checked{{end}}> Фильтрация включена</label>
+      </div>
+
+      <h3>Протоколы и порты</h3>
+      <div class="formgrid">
+        {{range .Protocols}}
+        <div class="field">
+          <span>{{.Label}}</span>
+          <div class="protocol">
+            <label class="check"><input type="checkbox" name="{{.Field}}.enabled"{{if .Enabled}} checked{{end}}> включён</label>
+            <input class="ctl num-input" type="number" name="{{.Field}}.port" value="{{.Port}}" min="1" max="65535" aria-label="Порт {{.Label}}">
+          </div>
+        </div>
+        {{end}}
+      </div>
+
+      <p class="row-actions">
+        <button class="btn primary" type="submit">Применить</button>
+        <span class="hint">Домен, протоколы и порты пересобирают слушатели; остальное применяется на месте.</span>
+      </p>
+    </form>
+
+    <h3>Сменить пароль</h3>
+    <form method="post" action="/panel/settings/password">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>Новый пароль (не короче 8 символов)</span><input class="ctl" type="password" name="password" autocomplete="new-password"></label>
+        <label class="field"><span>Повторите пароль</span><input class="ctl" type="password" name="password2" autocomplete="new-password"></label>
+      </div>
+      <p class="row-actions"><button class="btn" type="submit">Сменить пароль</button></p>
+      <p class="note">Панель хранит только argon2id-хэш пароля. Уже открытые сессии остаются действительными до выхода или истечения (сессии живут в памяти демона); новый вход — только с новым паролем.</p>
+    </form>
+  </main>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "cert"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — сертификат</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Сертификат</h2>
+      <div class="state">режим TLS: <b>{{.TLSMode}}</b></div>
+    </div>
+    {{template "notice" .}}
+
+    {{if .Show}}
+    <div class="cert {{.StateClass}}">
+      <span class="big">{{.StateText}}</span>
+      <span class="m">{{if .Issuer}}{{.Issuer}} · {{end}}{{if .NotAfter}}истекает {{.NotAfter}}{{end}}</span>
+    </div>
+    {{end}}
+
+    <h3>Состояние</h3>
+    <dl class="kv">
+      <div><dt>Состояние</dt><dd>{{.StateText}}</dd></div>
+      <div><dt>Издатель</dt><dd>{{if .Issuer}}{{.Issuer}}{{else}}—{{end}}</dd></div>
+      <div><dt>Истекает</dt><dd>{{if .NotAfter}}{{.NotAfter}}{{else}}—{{end}}</dd></div>
+      <div><dt>Последняя проверка</dt><dd>{{if .LastCheck}}{{.LastCheck}}{{else}}—{{end}}</dd></div>
+    </dl>
+    {{if .Error}}<p class="alert" role="alert">{{.Error}}</p>{{end}}
+
+    <h3>Как выдаётся</h3>
+    <dl class="kv">
+      <div><dt>Режим (tls.mode)</dt><dd>{{.TLSMode}}</dd></div>
+      {{if eq .TLSMode "files"}}
+      <div><dt>cert_file</dt><dd>{{.CertFile}}</dd></div>
+      <div><dt>key_file</dt><dd>{{.KeyFile}}</dd></div>
+      {{end}}
+      {{if eq .TLSMode "acme"}}
+      <div><dt>Провайдер</dt><dd>{{if .ACMEProvider}}{{.ACMEProvider}}{{else}}—{{end}}</dd></div>
+      <div><dt>Email</dt><dd>{{if .ACMEEmail}}{{.ACMEEmail}}{{else}}—{{end}}</dd></div>
+      <div><dt>Directory URL</dt><dd>{{if .ACMEDirectory}}{{.ACMEDirectory}}{{else}}—{{end}}</dd></div>
+      {{end}}
+    </dl>
+    <p class="note">Выпуск и продление сертификата делает демон. Мастер ACME (провайдер, EAB-ключи, Directory URL для custom) живёт в TUI и в <code>mdns setup</code> — в веб-панели его пока нет: здесь только состояние.</p>
+  </main>
+</div>
+</body>
+</html>
+{{end}}
+
+{{define "maintenance"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — обслуживание</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Обслуживание</h2>
+      <div class="state">{{if .Version}}версия <b>{{.Version}}</b>{{end}}</div>
+    </div>
+    {{template "notice" .}}
+
+    <dl class="kv">
+      <div><dt>Версия</dt><dd>{{if .Version}}{{.Version}}{{else}}—{{end}}</dd></div>
+      <div><dt>Аптайм</dt><dd>{{if .Uptime}}{{.Uptime}}{{else}}—{{end}}</dd></div>
+      <div><dt>Запущен</dt><dd>{{if .Started}}{{.Started}}{{else}}—{{end}}</dd></div>
+    </dl>
+
+    <h3>Конфигурация</h3>
+    <div class="cards">
+      <div class="card">
+        <div class="k">Скачать конфиг</div>
+        <p class="hint">Текущий конфиг в формате JSON. Файл содержит хэш пароля панели и EAB HMAC для ACME — храните его как секрет.</p>
+        <p class="row-actions"><a class="btn" href="/panel/maintenance/config.json">Скачать конфиг</a></p>
+      </div>
+      <div class="card">
+        <div class="k">Применить конфиг заново</div>
+        <p class="hint">Демон проверит и применит текущий конфиг ещё раз: мягкие настройки применяются на месте, структурные — пересобирают слушатели. Обычно ничего не меняется.</p>
+        <form method="post" action="/panel/maintenance/reapply">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <p class="row-actions"><button class="btn" type="submit">Применить конфиг заново</button></p>
+        </form>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>
+{{end}}

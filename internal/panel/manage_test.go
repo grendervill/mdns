@@ -1,0 +1,1022 @@
+package panel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"mydns/internal/api"
+	"mydns/internal/auth"
+	"mydns/internal/config"
+	"mydns/internal/filter"
+	"mydns/internal/qlog"
+	"mydns/internal/stats"
+	"mydns/internal/tlscert"
+)
+
+// errFakeApply is the scripted failure a manageCtrl returns from
+// UpdateConfig or FilterUpdate in the failure-path tests.
+var errFakeApply = errors.New("fake apply failure")
+
+// authVerify is a shorthand for auth.Verify in the password test.
+func authVerify(hash, pw string) bool { return auth.Verify(hash, pw) }
+
+// tlscertStatus builds a certificate snapshot with the shipped fields.
+func tlscertStatus(_ *testing.T, mode, state, issuer, notAfter, errText string) tlscert.Status {
+	s := tlscert.Status{Mode: mode, State: state, Issuer: issuer, Error: errText}
+	if notAfter != "" {
+		s.NotAfter, _ = time.Parse(time.RFC3339, notAfter)
+		s.LastCheck = time.Date(2026, 10, 18, 11, 0, 0, 0, time.UTC)
+	}
+	return s
+}
+
+// manageHash is a syntactically valid argon2id PHC string. The management
+// tests never sign in, so it only has to satisfy config.Validate's
+// "panel enabled needs a hash" rule; the password-change test asserts on
+// the real hash the panel mints.
+const manageHash = "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHRzYWx0$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+// manageCtrl is a scripted daemon for the management pages. It records
+// every configuration it is handed and every list refresh, so a test can
+// assert exactly what a page sent. UpdateConfig validates the config the
+// way the real app does, then honours a scripted failure.
+type manageCtrl struct {
+	mu sync.Mutex
+
+	cfg   *config.Config
+	st    api.Status
+	lists []filter.ListStatus
+
+	updates   []*config.Config
+	updateErr error
+
+	refreshes  []string
+	refreshErr error
+
+	started time.Time
+}
+
+func (c *manageCtrl) Config() *config.Config {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfg
+}
+
+func (c *manageCtrl) Status(context.Context) (api.Status, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.st, nil
+}
+
+// UpdateConfig validates first, exactly like app.UpdateConfig, so an
+// invalid form reaches the page as a real error even without a daemon.
+func (c *manageCtrl) UpdateConfig(_ context.Context, next *config.Config) error {
+	if err := next.Validate(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.updateErr != nil {
+		return c.updateErr
+	}
+	c.updates = append(c.updates, next)
+	c.cfg = next
+	return nil
+}
+
+func (c *manageCtrl) Stats() stats.Snapshot { return stats.Snapshot{} }
+
+func (c *manageCtrl) Requests(int) []qlog.Entry { return nil }
+
+func (c *manageCtrl) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) { return nil, 0 }
+
+func (c *manageCtrl) FilterStatus() []filter.ListStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lists
+}
+
+func (c *manageCtrl) FilterUpdate(_ context.Context, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refreshErr != nil {
+		return c.refreshErr
+	}
+	c.refreshes = append(c.refreshes, id)
+	return nil
+}
+
+func (c *manageCtrl) Started() time.Time { return c.started }
+
+// sent returns the configs UpdateConfig accepted, oldest first.
+func (c *manageCtrl) sent() []*config.Config {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]*config.Config(nil), c.updates...)
+}
+
+// refreshed returns the list IDs FilterUpdate was asked for.
+func (c *manageCtrl) refreshed() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.refreshes...)
+}
+
+// manageConfig is a valid config with the panel on, so a management
+// form can round-trip through config.Validate.
+func manageConfig(t *testing.T) *config.Config {
+	t.Helper()
+
+	cfg := config.Default()
+	cfg.Domain = "dns.example.test"
+	cfg.Panel = config.PanelConfig{Enabled: true, PasswordHash: manageHash}
+	return cfg
+}
+
+// manageUpstreams is the two-upstream fixture: one live, one off.
+func manageUpstreams(cfg *config.Config) {
+	cfg.Upstreams = []config.UpstreamConfig{
+		{ID: "cloudflare", Name: "Cloudflare", Transport: "doh", Address: "https://cloudflare-dns.com/dns-query", Priority: 0, Enabled: true},
+		{ID: "quad9", Name: "Quad9", Transport: "doq", Address: "dns.quad9.net:853", Priority: 1, Enabled: false},
+	}
+}
+
+// managePOST posts a form to a panel page with a fresh session and the
+// matching CSRF token. It does not follow redirects, so the caller sees
+// the 303 and its Location.
+func managePOST(t *testing.T, p *Panel, srv *httptest.Server, path string, form url.Values) (*http.Response, string) {
+	t.Helper()
+
+	token, err := p.sessions.Create()
+	if err != nil {
+		t.Fatalf("creating a session: %v", err)
+	}
+	if form == nil {
+		form = url.Values{}
+	}
+	form.Set(csrfField, p.csrfToken(sessionCSRFBinding(token)))
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+
+	return doManage(t, srv, req)
+}
+
+// rawPOST posts with a valid session but no CSRF token, for the
+// rejection check.
+func rawPOST(t *testing.T, p *Panel, srv *httptest.Server, path string, form url.Values) (*http.Response, string) {
+	t.Helper()
+
+	token, err := p.sessions.Create()
+	if err != nil {
+		t.Fatalf("creating a session: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: token})
+	return doManage(t, srv, req)
+}
+
+// doManage performs a request with a redirect-refusing client and drains
+// the body.
+func doManage(t *testing.T, srv *httptest.Server, req *http.Request) (*http.Response, string) {
+	t.Helper()
+
+	client := srv.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", req.Method, req.URL.Path, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading %s: %v", req.URL.Path, err)
+	}
+	return resp, string(body)
+}
+
+// wantRedirect asserts a 303 to exactly want.
+func wantRedirect(t *testing.T, resp *http.Response, want string) {
+	t.Helper()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != want {
+		t.Errorf("Location = %q, want %q", got, want)
+	}
+}
+
+// managePanel mounts a panel over ctrl with the version the status tests
+// use, so the maintenance page has something to render.
+func managePanel(t *testing.T, ctrl *manageCtrl) (*Panel, *httptest.Server) {
+	t.Helper()
+	return statusPanel(t, ctrl)
+}
+
+// ---- upstreams ---------------------------------------------------
+
+// TestUpstreamsPage checks the table: both upstreams, the live state
+// from Status, the per-row flip control and the priority editor.
+func TestUpstreamsPage(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		st: api.Status{Upstreams: []api.UpstreamStatus{
+			{ID: "cloudflare", Name: "Cloudflare", Transport: "doh", Address: "https://cloudflare-dns.com/dns-query", Enabled: true, Healthy: true, LatencyMS: 21, Sent: 98, Failed: 2},
+			{ID: "quad9", Name: "Quad9", Transport: "doq", Address: "dns.quad9.net:853", Enabled: false},
+		}},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/upstreams")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/upstreams = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Upstream’ы",
+		"стратегия", "fastest",
+		"Cloudflare", "Quad9",
+		"doh", "https://cloudflare-dns.com/dns-query",
+		"здоров", "выключен",
+		"21 мс", "98 %",
+		`name="prio.cloudflare" value="0"`,
+		`name="prio.quad9" value="1"`,
+		`action="/panel/upstreams/priority"`,
+		`formaction="/panel/upstreams/toggle"`,
+		`name="id" value="cloudflare"`,
+		`name="id" value="quad9"`,
+		"Выключить", "Включить",
+		"Сохранить порядок",
+		` class="on" aria-current="page" href="/panel/upstreams"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstreams page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+}
+
+// TestUpstreamToggle checks the soft flip: the whole config goes to
+// UpdateConfig with exactly one flag changed.
+func TestUpstreamToggle(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	original := cfg
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"quad9"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0]
+
+	if !got.Upstreams[1].Enabled {
+		t.Error("quad9 was not enabled")
+	}
+	if !got.Upstreams[0].Enabled || got.Upstreams[0].Address != "https://cloudflare-dns.com/dns-query" {
+		t.Errorf("the other upstream changed: %+v", got.Upstreams[0])
+	}
+	// The whole config travels, not a patch.
+	if got.Domain != cfg.Domain || got.Strategy != cfg.Strategy || got.Cache != cfg.Cache || got.Panel.PasswordHash != manageHash {
+		t.Errorf("the full config did not travel:\n%+v", got)
+	}
+	if len(got.Upstreams) != 2 {
+		t.Errorf("upstreams = %d, want the full list of 2", len(got.Upstreams))
+	}
+
+	// The page edits a copy: the config it read from the daemon is
+	// untouched, so a rejected apply cannot have changed anything.
+	if original.Upstreams[1].Enabled {
+		t.Error("the page mutated the live config in place instead of sending a copy")
+	}
+	if got == original {
+		t.Error("the page sent the live config pointer instead of a copy")
+	}
+}
+
+// TestUpstreamToggleFailure checks the failure path: the page re-renders
+// with the error and never claims the change landed.
+func TestUpstreamToggleFailure(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{cfg: cfg, updateErr: errFakeApply}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"quad9"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, errFakeApply.Error()) {
+		t.Errorf("the page does not show the failure %q", errFakeApply)
+	}
+	if strings.Contains(body, "upstream переключён") || strings.Contains(body, `class="flash"`) {
+		t.Error("the page claims the toggle succeeded after a failure")
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a failed toggle was recorded as applied")
+	}
+}
+
+// TestUpstreamPriority saves the whole priority column at once.
+func TestUpstreamPriority(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/priority", url.Values{
+		"prio.cloudflare": {"2"},
+		"prio.quad9":      {"0"},
+	})
+	wantRedirect(t, resp, "/panel/upstreams?ok=priority")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if got := sent[0].Upstreams[0].Priority; got != 2 {
+		t.Errorf("cloudflare priority = %d, want 2", got)
+	}
+	if got := sent[0].Upstreams[1].Priority; got != 0 {
+		t.Errorf("quad9 priority = %d, want 0", got)
+	}
+	if sent[0].Upstreams[0].Enabled != cfg.Upstreams[0].Enabled {
+		t.Error("the priority save changed the enabled flags")
+	}
+}
+
+// ---- filters -----------------------------------------------------
+
+// manageFilterConfig is a config with the filter engine on. It carries
+// no list so a test can add one without failing the built-in catalog
+// lookup (the panel never resolves list URLs).
+func manageFilters(cfg *config.Config) {
+	cfg.Filter.Enabled = true
+	cfg.Filter.Mode = "nxdomain"
+	cfg.Filter.UserAllow = []string{"good.example.com"}
+	cfg.Filter.UserBlock = []string{"ads.example.com"}
+}
+
+// TestFiltersPage checks the lists table, the mode radios and the user
+// rules, plus the disabled note.
+func TestFiltersPage(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		st:  api.Status{Filter: api.FilterSnapshot{Enabled: true, Mode: "nxdomain", TotalBlocked: 12481}},
+		lists: []filter.ListStatus{
+			{ID: "oisd", URL: "https://example.test/oisd.txt", UpdatedAt: time.Date(2026, 10, 18, 9, 30, 0, 0, time.UTC), Applied: 101_000, Skipped: 42},
+			{ID: "user", Error: "fetch failed"},
+		},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/filters")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Фильтры",
+		"Списки", "oisd", "user",
+		"101 000", "42",
+		"18.10 09:30:00",
+		"ок", "ошибка",
+		`action="/panel/filters/refresh"`,
+		"Обновить", "Обновить все",
+		`name="id" value=""`,
+		`action="/panel/filters/mode"`,
+		`name="mode" value="zero"`, `name="mode" value="nxdomain"`, `name="mode" value="refused"`,
+		`value="nxdomain" checked`,
+		"12 481",
+		"Разрешённые", "Заблокированные",
+		"good.example.com", "ads.example.com",
+		`action="/panel/filters/rules/add"`,
+		`action="/panel/filters/rules/remove"`,
+		`name="kind"`,
+		` class="on" aria-current="page" href="/panel/filters"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("filters page is missing %q", want)
+		}
+	}
+
+	t.Run("disabled filter", func(t *testing.T) {
+		off := manageConfig(t)
+		c := &manageCtrl{cfg: off}
+		p2, srv2 := managePanel(t, c)
+		code, body := authedGET(t, p2, srv2, "/panel/filters")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/filters = %d, want 200", code)
+		}
+		if !strings.Contains(body, "Фильтрация выключена") {
+			t.Error("the disabled filter note is missing")
+		}
+		if !strings.Contains(body, "Списки не заданы") {
+			t.Error("the empty-lists note is missing")
+		}
+	})
+}
+
+// TestFiltersRefresh checks both the single-list and the all-lists
+// refresh post the right id.
+func TestFiltersRefresh(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, _ := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
+	wantRedirect(t, resp, "/panel/filters?ok=lists")
+
+	resp, _ = managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
+	wantRedirect(t, resp, "/panel/filters?ok=lists")
+
+	if got := ctrl.refreshed(); len(got) != 2 || got[0] != "oisd" || got[1] != "" {
+		t.Errorf("FilterUpdate ids = %q, want [oisd ]", got)
+	}
+
+	t.Run("failure", func(t *testing.T) {
+		ctrl.refreshErr = errFakeApply
+		resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, errFakeApply.Error()) {
+			t.Errorf("the page does not show the failure %q", errFakeApply)
+		}
+	})
+}
+
+// TestFilterMode sends the whole config with a new block mode.
+func TestFilterMode(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/filters/mode", url.Values{"mode": {"refused"}})
+	wantRedirect(t, resp, "/panel/filters?ok=mode")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if sent[0].Filter.Mode != "refused" {
+		t.Errorf("Filter.Mode = %q, want refused", sent[0].Filter.Mode)
+	}
+	if !sent[0].Filter.Enabled || len(sent[0].Filter.UserBlock) != 1 {
+		t.Error("the mode change dropped other filter settings")
+	}
+
+	t.Run("unknown mode is rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/mode", url.Values{"mode": {"nonsense"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "nonsense") {
+			t.Error("the page does not name the rejected mode")
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("an unknown mode was sent to UpdateConfig")
+		}
+	})
+}
+
+// TestFilterRules adds and removes one rule in the right list.
+func TestFilterRules(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	// Add an allow rule; it is normalized and lands in UserAllow.
+	resp, body := managePOST(t, p, srv, "/panel/filters/rules/add", url.Values{
+		"kind": {"allow"}, "domain": {"Extra.Example.COM."},
+	})
+	wantRedirect(t, resp, "/panel/filters?ok=rule")
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if got := sent[0].Filter.UserAllow; len(got) != 2 || got[1] != "extra.example.com" {
+		t.Errorf("UserAllow = %q, want [good.example.com extra.example.com]", got)
+	}
+	if got := sent[0].Filter.UserBlock; len(got) != 1 || got[0] != "ads.example.com" {
+		t.Errorf("UserBlock = %q, want it untouched", got)
+	}
+
+	// Remove an allow rule; only that list shrinks.
+	resp, _ = managePOST(t, p, srv, "/panel/filters/rules/remove", url.Values{
+		"kind": {"allow"}, "domain": {"good.example.com"},
+	})
+	wantRedirect(t, resp, "/panel/filters?ok=rule")
+	sent = ctrl.sent()
+	if len(sent) != 2 {
+		t.Fatalf("UpdateConfig called %d times, want 2", len(sent))
+	}
+	if got := sent[1].Filter.UserAllow; len(got) != 1 || got[0] != "extra.example.com" {
+		t.Errorf("UserAllow = %q, want [extra.example.com]", got)
+	}
+	if got := sent[1].Filter.UserBlock; len(got) != 1 {
+		t.Errorf("UserBlock = %q, want it untouched", got)
+	}
+
+	t.Run("empty domain", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/rules/add", url.Values{
+			"kind": {"block"}, "domain": {"  "},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Укажите домен") {
+			t.Errorf("the empty-domain message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an empty domain reached UpdateConfig")
+		}
+	})
+
+	t.Run("single-label domain", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/rules/add", url.Values{
+			"kind": {"block"}, "domain": {"localhost"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "localhost") {
+			t.Error("the rejected domain is not echoed")
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a single-label domain reached UpdateConfig")
+		}
+	})
+}
+
+// ---- settings ----------------------------------------------------
+
+// validSettingsForm is a complete, valid settings submission.
+func validSettingsForm() url.Values {
+	return url.Values{
+		"domain":                       {"dns.example.test"},
+		"plain.enabled":                {"on"},
+		"plain.port":                   {"53"},
+		"doh.enabled":                  {"on"},
+		"doh.port":                     {"443"},
+		"dot.enabled":                  {"on"},
+		"dot.port":                     {"853"},
+		"doq.enabled":                  {"on"},
+		"doq.port":                     {"853"},
+		"strategy":                     {"fastest"},
+		"cache.size":                   {"10000"},
+		"cache.min_ttl":                {"0"},
+		"cache.max_ttl":                {"86400"},
+		"limits.plain_rps_per_ip":      {"50"},
+		"filter.enabled":               {"on"},
+		"filter.update_interval_hours": {"24"},
+	}
+}
+
+// TestSettingsPage renders the form from the live config.
+func TestSettingsPage(t *testing.T) {
+	cfg := manageConfig(t)
+	cfg.Filter.Enabled = true
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/settings")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/settings = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Настройки",
+		`action="/panel/settings"`,
+		`name="domain" value="dns.example.test"`,
+		`name="plain.enabled" checked`,
+		`name="plain.port" value="53"`,
+		`name="doh.port" value="443"`,
+		`name="dot.port" value="853"`,
+		`name="doq.port" value="853"`,
+		`name="strategy"`,
+		`value="fastest" selected`,
+		`name="cache.size" value="10000"`,
+		`name="cache.min_ttl" value="0"`,
+		`name="cache.max_ttl" value="86400"`,
+		`name="limits.plain_rps_per_ip" value="50"`,
+		`name="filter.enabled" checked`,
+		`name="filter.update_interval_hours" value="24"`,
+		"Применить",
+		`action="/panel/settings/password"`,
+		"Сменить пароль",
+		`name="password"`, `name="password2"`,
+		` class="on" aria-current="page" href="/panel/settings"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("settings page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+}
+
+// TestSettingsApply sends the edited values in the full config.
+func TestSettingsApply(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	form := validSettingsForm()
+	form.Set("domain", "new.example.test")
+	form.Set("strategy", "failover")
+	form.Set("cache.size", "20000")
+	form.Set("plain.port", "5533")
+	form.Del("doq.enabled") // the checkbox was cleared
+
+	resp, body := managePOST(t, p, srv, "/panel/settings", form)
+	wantRedirect(t, resp, "/panel/settings?ok=settings")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0]
+	if got.Domain != "new.example.test" || got.Strategy != "failover" {
+		t.Errorf("domain/strategy = %q/%q, want new.example.test/failover", got.Domain, got.Strategy)
+	}
+	if got.Cache.Size != 20000 {
+		t.Errorf("cache size = %d, want 20000", got.Cache.Size)
+	}
+	if got.Protocols.Plain.Port != 5533 {
+		t.Errorf("plain port = %d, want 5533", got.Protocols.Plain.Port)
+	}
+	if got.Protocols.DoQ.Enabled {
+		t.Error("doq was not disabled by the cleared checkbox")
+	}
+	if got.Panel.PasswordHash != manageHash {
+		t.Error("the apply dropped the panel password hash")
+	}
+	if len(got.Limits.TrustedCIDRs) != len(cfg.Limits.TrustedCIDRs) {
+		t.Error("the apply did not preserve the fields the form does not edit")
+	}
+
+	t.Run("success banner", func(t *testing.T) {
+		code, body := authedGET(t, p, srv, "/panel/settings?ok=settings")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/settings?ok=settings = %d, want 200", code)
+		}
+		if !strings.Contains(body, "применено") {
+			t.Errorf("the success banner «применено» is missing:\n%s", body)
+		}
+	})
+}
+
+// TestSettingsInvalid checks that a rejected apply re-renders the form
+// with the error and the values the admin typed.
+func TestSettingsInvalid(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	t.Run("port 0", func(t *testing.T) {
+		form := validSettingsForm()
+		form.Set("domain", "typed.example.test")
+		form.Set("plain.port", "0")
+
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "port 0 out of range") {
+			t.Errorf("the validation error is missing:\n%s", body)
+		}
+		// The submitted values survive the re-render.
+		if !strings.Contains(body, `name="plain.port" value="0"`) {
+			t.Error("the submitted port was not preserved")
+		}
+		if !strings.Contains(body, `name="domain" value="typed.example.test"`) {
+			t.Error("the submitted domain was not preserved")
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("an invalid config was applied")
+		}
+	})
+
+	t.Run("unknown strategy", func(t *testing.T) {
+		form := validSettingsForm()
+		form.Set("strategy", "bogus")
+
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "unknown strategy") {
+			t.Errorf("the validation error is missing:\n%s", body)
+		}
+		if !strings.Contains(body, `value="bogus" selected`) {
+			t.Errorf("the submitted strategy was not preserved:\n%s", body)
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("an invalid config was applied")
+		}
+	})
+
+	t.Run("non-numeric port", func(t *testing.T) {
+		form := validSettingsForm()
+		form.Set("doh.port", "https")
+
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "ожидается число") {
+			t.Errorf("the parse error is missing:\n%s", body)
+		}
+	})
+}
+
+// TestPasswordChange hashes the new password and stores only the hash.
+func TestPasswordChange(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	const newPassword = "a much better password"
+	resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+		"password": {newPassword}, "password2": {newPassword},
+	})
+	wantRedirect(t, resp, "/panel/settings?ok=password")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	hash := sent[0].Panel.PasswordHash
+	if hash == newPassword || !strings.HasPrefix(hash, "$argon2id$") {
+		t.Fatalf("stored password = %q, want an argon2id hash of the plaintext", hash)
+	}
+	if !authVerify(hash, newPassword) {
+		t.Error("the stored hash does not verify the submitted password")
+	}
+	if authVerify(hash, "not the password") {
+		t.Error("the stored hash verifies a wrong password")
+	}
+	if !sent[0].Panel.Enabled {
+		t.Error("the password change disabled the panel")
+	}
+
+	t.Run("too short", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+			"password": {"short"}, "password2": {"short"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "8") {
+			t.Errorf("the minimum-length message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("a too-short password was applied")
+		}
+	})
+
+	t.Run("mismatch", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+			"password": {"a much better password"}, "password2": {"a much better passwore"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "не совпадают") {
+			t.Errorf("the mismatch message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("a mismatched password was applied")
+		}
+	})
+}
+
+// ---- certificate -------------------------------------------------
+
+// TestCertPage renders the certificate block from Status and the TLS
+// mode from the config.
+func TestCertPage(t *testing.T) {
+	cfg := manageConfig(t)
+	cfg.TLS = config.TLS{
+		Mode: "acme",
+		ACME: config.ACME{Provider: "letsencrypt", Email: "admin@example.test"},
+	}
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		st:  api.Status{Cert: tlscertStatus(t, "acme", "ok", "Let's Encrypt", "2027-01-15T12:00:00Z", "")},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/cert")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/cert = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Сертификат", "Действует", "Let&#39;s Encrypt", "15.01.2027",
+		"acme", "letsencrypt", "admin@example.test",
+		"mdns setup",
+		` class="on" aria-current="page" href="/panel/cert"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("cert page is missing %q", want)
+		}
+	}
+
+	t.Run("error state", func(t *testing.T) {
+		badCfg := manageConfig(t)
+		c := &manageCtrl{cfg: badCfg, st: api.Status{Cert: tlscertStatus(t, "acme", "error", "", "", "dns-01 challenge failed")}}
+		p2, srv2 := managePanel(t, c)
+		_, body := authedGET(t, p2, srv2, "/panel/cert")
+		if !strings.Contains(body, "Ошибка") || !strings.Contains(body, "dns-01 challenge failed") {
+			t.Errorf("the certificate error is not rendered:\n%s", body)
+		}
+	})
+}
+
+// ---- maintenance -------------------------------------------------
+
+// TestMaintenancePage renders the version, the uptime and both actions.
+func TestMaintenancePage(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg, started: time.Now().Add(-50 * time.Hour)}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/maintenance")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/maintenance = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Обслуживание", "v-test", "2 дня",
+		`href="/panel/maintenance/config.json"`, "Скачать конфиг",
+		`action="/panel/maintenance/reapply"`, "Применить конфиг заново",
+		"хэш пароля", "EAB",
+		` class="on" aria-current="page" href="/panel/maintenance"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("maintenance page is missing %q", want)
+		}
+	}
+}
+
+// TestConfigDownload streams the config as a pretty JSON attachment.
+func TestConfigDownload(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/maintenance/config.json")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/maintenance/config.json = %d, want 200", code)
+	}
+
+	var got config.Config
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("the download is not JSON: %v\n%s", err, body)
+	}
+	if got.Domain != cfg.Domain || got.Panel.PasswordHash != cfg.Panel.PasswordHash {
+		t.Errorf("the download does not carry the live config: %+v", got)
+	}
+	if len(got.Upstreams) != 2 || len(got.Filter.UserBlock) != 1 {
+		t.Error("the download dropped the parts of the config the panel never touches")
+	}
+	if !strings.Contains(body, "{\n  \"version\"") {
+		t.Errorf("the JSON is not indented:\n%s", body[:min(len(body), 120)])
+	}
+}
+
+// TestReapply sends the current config back through UpdateConfig.
+func TestReapply(t *testing.T) {
+	cfg := manageConfig(t)
+	original := cfg
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/reapply", nil)
+	wantRedirect(t, resp, "/panel/maintenance?ok=reapply")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if sent[0].Domain != cfg.Domain || sent[0].Strategy != cfg.Strategy {
+		t.Errorf("the reapplied config differs: %+v", sent[0])
+	}
+	// The page hands over a copy, so the daemon's config is not aliased.
+	if sent[0] == original {
+		t.Error("the reapply passed the live config pointer instead of a copy")
+	}
+}
+
+// ---- cross-cutting ------------------------------------------------
+
+// TestManagePagesSharedShell walks the five new pages: each renders the
+// full rail and keeps the strict CSP promise (no inline style/script).
+func TestManagePagesSharedShell(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		st: api.Status{
+			Filter: api.FilterSnapshot{Enabled: true, Mode: "zero"},
+			Cert:   tlscertStatus(t, "self-signed", "ok", "mdns self-signed", "2027-01-15T12:00:00Z", ""),
+		},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	pages := []string{"/panel/upstreams", "/panel/filters", "/panel/settings", "/panel/cert", "/panel/maintenance"}
+	rail := []string{
+		`href="/panel/"`, `href="/panel/history"`, `href="/panel/upstreams"`,
+		`href="/panel/filters"`, `href="/panel/cert"`, `href="/panel/settings"`,
+		`href="/panel/maintenance"`, `action="/logout"`,
+	}
+	for _, path := range pages {
+		code, body := authedGET(t, p, srv, path)
+		if code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200\n%s", path, code, body)
+			continue
+		}
+		for _, want := range rail {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s is missing the rail entry %q", path, want)
+			}
+		}
+		if n := strings.Count(body, `aria-current="page"`); n != 1 {
+			t.Errorf("%s marks %d rail entries active, want 1", path, n)
+		}
+		assertNoInlineAssets(t, body)
+	}
+}
+
+// TestManageCSRFRejected spot-checks the token gate on a brand-new route.
+func TestManageCSRFRejected(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := rawPOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"quad9"}})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /panel/upstreams/toggle without a token = %d, want 403\n%s", resp.StatusCode, body)
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a CSRF-less request changed the config")
+	}
+}
+
+// assertNoInlineAssets fails when a page carries an inline style or a
+// script element, which the panel's CSP forbids.
+func assertNoInlineAssets(t *testing.T, body string) {
+	t.Helper()
+
+	if strings.Contains(body, "style=") {
+		t.Error(`page carries an inline style="…" attribute (forbidden by the CSP)`)
+	}
+	if strings.Contains(body, "<style") {
+		t.Error("page carries an inline <style> element (forbidden by the CSP)")
+	}
+	if strings.Contains(body, "<script>") {
+		t.Error("page carries an inline <script> element (forbidden by the CSP)")
+	}
+}

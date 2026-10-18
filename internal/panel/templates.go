@@ -24,9 +24,14 @@ var templateFS embed.FS
 // (see layout.html's feed_row). The shared shell (the rail) and the
 // feed row live in layout.html, which every page parses.
 var templates = map[string]*template.Template{
-	"login":   template.Must(template.New("login").Parse(loginPage)),
-	"status":  pageTemplates("status", "templates/status.html"),
-	"history": pageTemplates("history", "templates/history.html"),
+	"login":       template.Must(template.New("login").Parse(loginPage)),
+	"status":      pageTemplates("status", "templates/status.html"),
+	"history":     pageTemplates("history", "templates/history.html"),
+	"upstreams":   pageTemplates("upstreams", "templates/manage.html"),
+	"filters":     pageTemplates("filters", "templates/manage.html"),
+	"settings":    pageTemplates("settings", "templates/manage.html"),
+	"cert":        pageTemplates("cert", "templates/manage.html"),
+	"maintenance": pageTemplates("maintenance", "templates/manage.html"),
 }
 
 // pageTemplates parses one page file together with the shared fragments.

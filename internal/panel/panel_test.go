@@ -15,11 +15,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/argon2"
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/filter"
 	"mydns/internal/panel"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
@@ -37,17 +39,26 @@ type fakeController struct{ cfg *config.Config }
 
 func (f *fakeController) Config() *config.Config { return f.cfg }
 
+// UpdateConfig is a no-op here: the shell tests never mutate.
+func (f *fakeController) UpdateConfig(context.Context, *config.Config) error { return nil }
+
 func (f *fakeController) Status(context.Context) (api.Status, error) {
 	return api.Status{Version: "v-test"}, nil
 }
 
 func (f *fakeController) Stats() stats.Snapshot { return stats.Snapshot{} }
 
+func (f *fakeController) Started() time.Time { return time.Time{} }
+
 func (f *fakeController) Requests(int) []qlog.Entry { return nil }
 
 func (f *fakeController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) {
 	return nil, 0
 }
+
+func (f *fakeController) FilterStatus() []filter.ListStatus { return nil }
+
+func (f *fakeController) FilterUpdate(context.Context, string) error { return nil }
 
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {

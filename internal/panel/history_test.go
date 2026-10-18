@@ -12,6 +12,7 @@ import (
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/filter"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -52,9 +53,18 @@ func newHistoryCtrl(t *testing.T, entries ...qlog.Entry) *historyCtrl {
 
 func (c *historyCtrl) Config() *config.Config { return c.cfg }
 
+// UpdateConfig is a no-op: the history tests read, they do not write.
+func (c *historyCtrl) UpdateConfig(context.Context, *config.Config) error { return nil }
+
 func (c *historyCtrl) Status(context.Context) (api.Status, error) { return api.Status{}, nil }
 
 func (c *historyCtrl) Stats() stats.Snapshot { return stats.Snapshot{} }
+
+func (c *historyCtrl) Started() time.Time { return time.Time{} }
+
+func (c *historyCtrl) FilterStatus() []filter.ListStatus { return nil }
+
+func (c *historyCtrl) FilterUpdate(context.Context, string) error { return nil }
 
 func (c *historyCtrl) Requests(n int) []qlog.Entry { return c.ring.Recent(n) }
 

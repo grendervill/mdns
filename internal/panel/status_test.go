@@ -15,6 +15,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
+	"mydns/internal/filter"
 	"mydns/internal/links"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
@@ -33,9 +34,18 @@ type statusCtrl struct {
 
 func (c *statusCtrl) Config() *config.Config { return c.cfg }
 
+// UpdateConfig is a no-op: the status tests render, they do not write.
+func (c *statusCtrl) UpdateConfig(context.Context, *config.Config) error { return nil }
+
 func (c *statusCtrl) Status(context.Context) (api.Status, error) { return c.st, nil }
 
 func (c *statusCtrl) Stats() stats.Snapshot { return c.sn }
+
+func (c *statusCtrl) Started() time.Time { return time.Time{} }
+
+func (c *statusCtrl) FilterStatus() []filter.ListStatus { return nil }
+
+func (c *statusCtrl) FilterUpdate(context.Context, string) error { return nil }
 
 // Requests returns the newest n entries, oldest first — the contract the
 // real daemon has (qlog.Log.Recent).

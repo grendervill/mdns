@@ -16,6 +16,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/filter"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -47,10 +48,17 @@ const (
 type Controller interface {
 	// Config returns the current configuration.
 	Config() *config.Config
+	// UpdateConfig validates, applies and persists a new configuration.
+	// It is transactional: a rejected change leaves the running daemon
+	// untouched, so a management page can re-render with the error.
+	UpdateConfig(ctx context.Context, c *config.Config) error
 	// Status returns the read-only daemon snapshot.
 	Status(ctx context.Context) (api.Status, error)
 	// Stats returns the cumulative query statistics since start.
 	Stats() stats.Snapshot
+	// Started is when the daemon was constructed; the maintenance page
+	// renders its uptime.
+	Started() time.Time
 	// Requests returns the newest n query records, oldest first. The
 	// status feed backfills its buffer with it.
 	Requests(n int) []qlog.Entry
@@ -58,6 +66,10 @@ type Controller interface {
 	// filtered history, newest first, with the total match count. The
 	// history page and its CSV export use it.
 	RequestsQuery(q qlog.Query, page, per int) ([]qlog.Entry, int)
+	// FilterStatus returns the per-list block-list updater status.
+	FilterStatus() []filter.ListStatus
+	// FilterUpdate reloads one block list, or every list when id is "".
+	FilterUpdate(ctx context.Context, id string) error
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -230,6 +242,29 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	// parser. Both are read-only and non-live.
 	mux.Handle("GET /panel/history", p.requireSession(http.HandlerFunc(p.handleHistory)))
 	mux.Handle("GET /panel/history.csv", p.requireSession(http.HandlerFunc(p.handleHistoryCSV)))
+
+	// Management pages. Every mutation is a POST behind the session and
+	// the CSRF token; the pages carry no script and redirect after a
+	// successful change, so a reload never resubmits.
+	mux.Handle("GET /panel/upstreams", p.requireSession(http.HandlerFunc(p.handleUpstreams)))
+	mux.Handle("POST /panel/upstreams/toggle", p.requireSession(http.HandlerFunc(p.handleUpstreamToggle)))
+	mux.Handle("POST /panel/upstreams/priority", p.requireSession(http.HandlerFunc(p.handleUpstreamPriority)))
+
+	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))
+	mux.Handle("POST /panel/filters/refresh", p.requireSession(http.HandlerFunc(p.handleFiltersRefresh)))
+	mux.Handle("POST /panel/filters/mode", p.requireSession(http.HandlerFunc(p.handleFilterMode)))
+	mux.Handle("POST /panel/filters/rules/add", p.requireSession(http.HandlerFunc(p.handleFilterRuleAdd)))
+	mux.Handle("POST /panel/filters/rules/remove", p.requireSession(http.HandlerFunc(p.handleFilterRuleRemove)))
+
+	mux.Handle("GET /panel/settings", p.requireSession(http.HandlerFunc(p.handleSettings)))
+	mux.Handle("POST /panel/settings", p.requireSession(http.HandlerFunc(p.handleSettingsApply)))
+	mux.Handle("POST /panel/settings/password", p.requireSession(http.HandlerFunc(p.handlePasswordChange)))
+
+	mux.Handle("GET /panel/cert", p.requireSession(http.HandlerFunc(p.handleCert)))
+
+	mux.Handle("GET /panel/maintenance", p.requireSession(http.HandlerFunc(p.handleMaintenance)))
+	mux.Handle("GET /panel/maintenance/config.json", p.requireSession(http.HandlerFunc(p.handleConfigDownload)))
+	mux.Handle("POST /panel/maintenance/reapply", p.requireSession(http.HandlerFunc(p.handleReapply)))
 
 	// Catch-alls for the wrong method or an unknown subpath. They gate
 	// on the session like the rest of /panel/, and answer 404 behind
