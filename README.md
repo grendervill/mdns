@@ -555,6 +555,13 @@ the oldest entries are overwritten as new queries arrive, and a restart
 starts the ring empty. Set `log.file` if you need an on-disk JSONL
 archive beyond the ring.
 
+The **Статус** page's period charts are a separate, smaller aggregate:
+one daily bucket per UTC day (totals, outcomes, protocols, upstreams and
+capped client counts) is kept for the last 400 days in
+`<data_dir>/stats.json` (mode 0600, written atomically every 30 seconds
+and on shutdown). A restart therefore keeps the period windows and the
+all-time gauges; deleting that file resets both.
+
 ### Security
 
 - The password is stored only as an argon2id PHC hash (64 MiB, 3
