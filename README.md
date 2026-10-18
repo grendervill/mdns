@@ -603,6 +603,10 @@ readable.
 
 ![History filtered to blocked queries](docs/img/panel-history.png)
 
+![Upstreams with the provider trust table](docs/img/panel-upstreams.png)
+
+![Filters with the regional list catalog](docs/img/panel-filters.png)
+
 ![The panel at 390 px wide](docs/img/panel-mobile.png)
 
 ## Performance
