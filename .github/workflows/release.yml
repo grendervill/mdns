@@ -79,8 +79,9 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          # v0.x: still a pre-1.0 milestone.
-          prerelease: true
+          # A regular release on purpose: install.sh's default (no --version)
+          # fetches releases/latest/download/..., and that URL skips
+          # prereleases, so a prerelease would 404 the plain one-liner.
           generate_release_notes: true
           files: |
             dist/mdns-linux-amd64
