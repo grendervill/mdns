@@ -58,6 +58,26 @@
       <p class="row-actions"><button class="btn primary" type="submit">Добавить upstream</button></p>
     </form>
 
+    <h3>Доверие провайдерам</h3>
+    <p class="hint">Публичные источники; проект не связан с провайдерами и не даёт гарантий.</p>
+    <div class="tablewrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>Провайдер</th><th>Оценка</th><th>Примечание</th><th>Источник</th></tr>
+        </thead>
+        <tbody>
+          {{range .TrustProviders}}
+          <tr>
+            <td>{{.Provider}}</td>
+            <td><span class="tag {{.Class}}">{{.Label}}</span></td>
+            <td>{{.Note}}</td>
+            <td><a href="{{.SourceURL}}" target="_blank" rel="noopener">{{.SourceName}}</a></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+
     {{if .Upstreams}}
     <form method="post" action="/panel/upstreams/priority">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -72,7 +92,7 @@
           <tbody>
             {{range .Upstreams}}
             <tr>
-              <td>{{.Name}}</td>
+              <td>{{.Name}}{{if .TrustLabel}} <span class="tag {{.TrustClass}}">{{.TrustLabel}}</span>{{end}}</td>
               <td class="num">{{.Transport}}</td>
               <td class="num addr" title="{{.Address}}">{{.Address}}</td>
               <td><span class="tag {{.StateClass}}">{{.StateText}}</span></td>

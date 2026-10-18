@@ -225,6 +225,11 @@ type upstreamRow struct {
 	Latency    string
 	Answered   string
 	Errors     string
+
+	// TrustClass and TrustLabel describe the catalog provider this
+	// upstream was added from; empty when the ID matches no provider.
+	TrustClass string
+	TrustLabel string
 }
 
 // endpointOption is one reachable provider endpoint in the catalog
@@ -233,6 +238,48 @@ type upstreamRow struct {
 type endpointOption struct {
 	Value string
 	Label string
+}
+
+// trustRow is one line of the provider trust table: the provider name,
+// the badge class and label, the note and the cited source.
+type trustRow struct {
+	Provider   string
+	Class      string
+	Label      string
+	Note       string
+	SourceName string
+	SourceURL  string
+}
+
+// trustTagClass maps a trust level to its badge class, the same classes
+// the tables use for health: ok, warn and muted.
+func trustTagClass(level string) string {
+	switch level {
+	case providers.TrustRecommended:
+		return "ok"
+	case providers.TrustLimited:
+		return "warn"
+	default:
+		return "muted"
+	}
+}
+
+// providerTrustRows builds the trust table from the provider catalog, in
+// the catalog's stable order, one row per provider.
+func providerTrustRows() []trustRow {
+	list := providers.List()
+	out := make([]trustRow, 0, len(list))
+	for _, p := range list {
+		out = append(out, trustRow{
+			Provider:   p.Name,
+			Class:      trustTagClass(p.Trust.Level),
+			Label:      p.Trust.Label,
+			Note:       p.Trust.Note,
+			SourceName: p.Trust.SourceName,
+			SourceURL:  p.Trust.SourceURL,
+		})
+	}
+	return out
 }
 
 // upstreamsView is the whole upstreams page.
@@ -245,6 +292,7 @@ type upstreamsView struct {
 	StrategyOptions []strategyOption
 	Endpoints       []endpointOption
 	Upstreams       []upstreamRow
+	TrustProviders  []trustRow
 }
 
 // upstreamRowFor renders one upstream: the config supplies the identity
@@ -295,11 +343,12 @@ func (p *Panel) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 // renderUpstreams renders the page from the live config and status.
 func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status int, n manageNotice) {
 	view := upstreamsView{
-		manageNotice: n,
-		Domain:       p.pageDomain(),
-		CSRF:         p.manageCSRF(r),
-		Nav:          "upstreams",
-		Endpoints:    endpointOptions(),
+		manageNotice:   n,
+		Domain:         p.pageDomain(),
+		CSRF:           p.manageCSRF(r),
+		Nav:            "upstreams",
+		Endpoints:      endpointOptions(),
+		TrustProviders: providerTrustRows(),
 	}
 
 	strategy := ""
@@ -314,7 +363,15 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 		}
 		view.Upstreams = make([]upstreamRow, 0, len(cfg.Upstreams))
 		for _, u := range cfg.Upstreams {
-			view.Upstreams = append(view.Upstreams, upstreamRowFor(u, live[u.ID]))
+			row := upstreamRowFor(u, live[u.ID])
+			// A configured upstream that came from the catalog carries
+			// its provider's trust badge; a hand-written one matches no
+			// provider and stays bare.
+			if trust, ok := providers.TrustForUpstream(u.ID); ok {
+				row.TrustClass = trustTagClass(trust.Level)
+				row.TrustLabel = trust.Label
+			}
+			view.Upstreams = append(view.Upstreams, row)
 		}
 	}
 	view.StrategyOptions = strategyOptions(strategy)
