@@ -942,3 +942,72 @@ func TestReleaseListenersFreesPortsKeepsResponses(t *testing.T) {
 		t.Errorf("log = %q, want no \"listener stopped\" warning after ReleaseListeners", got)
 	}
 }
+
+// TestReleaseListenersFreesChallengePort covers the ACME HTTP-01
+// responder in the same async swap: ReleaseListeners frees its port for
+// the next generation while the old HTTP server stays up, so an
+// in-flight challenge response can still be written.
+func TestReleaseListenersFreesChallengePort(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "challenge-token")
+	})
+	// The released listener makes Serve return net.ErrClosed; a quiet
+	// logger keeps the run from printing the deliberate release.
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, false), quiet)
+	if err := srv.StartChallengeHTTP(handler, port); err != nil {
+		t.Fatalf("StartChallengeHTTP() = %v, want nil", err)
+	}
+
+	// A keep-alive connection is already accepted by the old server.
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("Dial(challenge) = %v, want nil", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	first := rawHTTPGet(t, conn, br, "/.well-known/acme-challenge/x")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first challenge status = %d, want 200", first.StatusCode)
+	}
+	_ = first.Body.Close()
+
+	// Release the socket: the port must be free for the next generation.
+	srv.ReleaseListeners()
+
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, false), quiet)
+	if err := srv2.StartChallengeHTTP(handler, port); err != nil {
+		t.Fatalf("StartChallengeHTTP() on the released port = %v, want nil (the port must be free)", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv2.StopChallengeHTTP(ctx)
+		// The released listener is already closed, so the stop reports
+		// net.ErrClosed and only needs to finish the HTTP server.
+		_ = srv.StopChallengeHTTP(ctx)
+	})
+
+	// The in-flight connection still gets its response from the released
+	// but not yet stopped HTTP server.
+	second := rawHTTPGet(t, conn, br, "/.well-known/acme-challenge/x")
+	if second.StatusCode != http.StatusOK {
+		t.Errorf("in-flight challenge status = %d, want 200 (the old server must still write it)", second.StatusCode)
+	}
+	_ = second.Body.Close()
+
+	// The next generation answers on the same port.
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/.well-known/acme-challenge/x", port))
+	if err != nil {
+		t.Fatalf("GET challenge on the rebind = %v, want nil", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("rebound challenge status = %d, want 200", resp.StatusCode)
+	}
+}

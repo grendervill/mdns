@@ -63,8 +63,12 @@ type Server struct {
 	h3Srv     *http3.Server
 	quicLn    *quic.Listener
 	challenge *http.Server
-	baseCtx   context.Context
-	cancel    context.CancelFunc
+	// challengeLn is the socket behind the ACME HTTP-01 responder. It
+	// is kept so ReleaseListeners can free the port on a runtime swap
+	// while the HTTP server stays up to finish in-flight responses.
+	challengeLn net.Listener
+	baseCtx     context.Context
+	cancel      context.CancelFunc
 }
 
 // New builds the server; a nil logger falls back to slog.Default.
@@ -271,9 +275,10 @@ func (s *Server) StartChallengeHTTP(handler http.Handler, port int) error {
 		MaxHeaderBytes:    dohMaxHeaderBytes,
 	}
 	s.challenge = srv
+	s.challengeLn = ln
 
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			s.logger.Warn("challenge HTTP listener stopped", "port", port, "error", err)
 		}
 	}()
@@ -344,6 +349,14 @@ func (s *Server) ReleaseListeners() {
 	if s.quicLn != nil {
 		_ = s.quicLn.Close()
 		s.quicLn = nil
+	}
+	// The challenge listener goes too so the port is free for the next
+	// generation, but s.challenge stays up: the in-flight challenge
+	// response must remain writable. The retirement stop calls Shutdown
+	// on the already-closed listener and finishes it.
+	if s.challengeLn != nil {
+		_ = s.challengeLn.Close()
+		s.challengeLn = nil
 	}
 }
 
@@ -477,6 +490,7 @@ func (s *Server) stopChallengeLocked(ctx context.Context) error {
 	}
 	err := s.challenge.Shutdown(ctx)
 	s.challenge = nil
+	s.challengeLn = nil
 	return err
 }
 
