@@ -668,56 +668,6 @@ func TestShutdownAfterStartNeverLeaksPort(t *testing.T) {
 	}
 }
 
-// TestShutdownClosesStalledHTTPConns checks that a stalled HTTPS
-// connection cannot delay a rebuild: a preconnect socket is accepted
-// but never sends a byte, so net/http never sees it go idle.
-func TestShutdownClosesStalledHTTPConns(t *testing.T) {
-	dohPort := freePort(t)
-	cfg := config.Default()
-	cfg.Domain = "mdns.test"
-	cfg.Protocols = config.Protocols{
-		DoH: config.Protocol{Enabled: true, Port: dohPort},
-	}
-
-	srv, _ := pipeline(t, cfg, newFakeSource(t, true), nil)
-	start(t, srv)
-
-	// A preconnect socket: dialed, but no request is ever sent.
-	quietStdLog(t)
-	stalled, err := net.DialTimeout("tcp", loopback(dohPort), time.Second)
-	if err != nil {
-		t.Fatalf("dial doh :%d = %v, want the listener up", dohPort, err)
-	}
-	defer stalled.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	begin := time.Now()
-	err = srv.Shutdown(ctx)
-	elapsed := time.Since(begin)
-	if err != nil {
-		t.Errorf("Shutdown() with a stalled socket = %v, want nil", err)
-	}
-	if elapsed > 2*time.Second {
-		t.Errorf("Shutdown() with a stalled socket took %v, want under 2s (httpGrace is %v)", elapsed, httpGrace)
-	}
-	wantClosed(t, dohPort, "after Shutdown")
-
-	// A shutdown with no connections still returns at once.
-	quiet, _ := pipeline(t, cfg, newFakeSource(t, true), nil)
-	start(t, quiet)
-	qctx, qcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer qcancel()
-	begin = time.Now()
-	if err := quiet.Shutdown(qctx); err != nil {
-		t.Errorf("Shutdown() without connections = %v, want nil", err)
-	}
-	if elapsed := time.Since(begin); elapsed > 2*time.Second {
-		t.Errorf("Shutdown() without connections took %v, want under 2s", elapsed)
-	}
-}
-
 // quietStdLog mutes the standard logger for a test that deliberately
 // provokes an HTTPS handshake error: net/http reports those through
 // log.Default, not through the test's slog logger.

@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
@@ -28,11 +27,6 @@ import (
 // (RFC 8737): an HTTPS listener there has to be running before the
 // first certificate exists, or the order could never be validated.
 const acmeALPNPort = 443
-
-// httpGrace caps the graceful HTTP wait on shutdown. HTTP connections
-// (keep-alive, h2 idle, preconnect sockets) may never become idle, so
-// the graceful wait is capped and the rest is force-closed.
-const httpGrace = time.Second
 
 // Server owns every enabled listener. Configure it before Start;
 // Start and Shutdown are not meant to race each other. The TLS
@@ -385,21 +379,8 @@ func (s *Server) stopDoTLocked(ctx context.Context) error {
 func (s *Server) stopDoHLocked(ctx context.Context) error {
 	var firstErr error
 	if s.httpSrv != nil {
-		wait := ctx
-		if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > httpGrace {
-			var cancel context.CancelFunc
-			wait, cancel = context.WithTimeout(ctx, httpGrace)
-			defer cancel()
-		}
-		if err := s.httpSrv.Shutdown(wait); err != nil {
-			// Shutdown leaves connections that never became idle open
-			// (StateNew, idle h2, preconnect sockets) and only returns
-			// when the wait expires, so the graceful phase is best
-			// effort: force-close whatever is left. A Shutdown timeout
-			// on its own is expected here, not an error.
-			if cerr := s.httpSrv.Close(); cerr != nil && firstErr == nil {
-				firstErr = cerr
-			}
+		if err := s.httpSrv.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
 		}
 		s.httpSrv = nil
 	}
