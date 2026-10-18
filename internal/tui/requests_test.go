@@ -93,7 +93,120 @@ func TestBlockedMarked(t *testing.T) {
 	}
 }
 
-// TestUpstreamsView checks the detailed upstream table.
+// TestRequestsClientColumn checks that the feed renders the client
+// address and names the column.
+func TestRequestsClientColumn(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, requestEvent(qlog.Entry{
+		QName: "a.example.com.", Proto: "udp", ClientIP: "192.168.1.50",
+	}))
+
+	view := m.View()
+	for _, want := range []string{"клиент", "192.168.1.50", "a.example.com."} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() misses %q:\n%s", want, view)
+		}
+	}
+}
+
+// TestRequestsFilter checks the f-key feed filter: it narrows live and
+// backfilled rows, keeps a cancelled edit and clears on Esc.
+func TestRequestsFilter(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, requestEvent(qlog.Entry{QName: "ads.example.com.", Proto: "udp", ClientIP: "10.0.0.1"}))
+	m = step(m, requestEvent(qlog.Entry{QName: "safe.example.com.", Proto: "dot", ClientIP: "10.0.0.2"}))
+
+	// f opens the filter input; Enter commits the typed substring.
+	m = step(m, key('f'))
+	if !m.inputActive || m.inputMode != inputRequestsFilter {
+		t.Fatalf("f did not open the feed filter input (active=%v mode=%v)", m.inputActive, m.inputMode)
+	}
+	m = typeText(m, "ads")
+	m = step(m, enterKey())
+
+	if m.requestsFilter != "ads" {
+		t.Fatalf("requestsFilter = %q, want ads", m.requestsFilter)
+	}
+	view := m.View()
+	if !strings.Contains(view, "Фильтр: «ads» · найдено 1 из 2") {
+		t.Errorf("View() misses the filter note:\n%s", view)
+	}
+	if !strings.Contains(view, "ads.example.com.") {
+		t.Errorf("View() dropped a matching row:\n%s", view)
+	}
+	if strings.Contains(view, "safe.example.com.") {
+		t.Errorf("View() kept a row the filter excludes:\n%s", view)
+	}
+
+	// A live append that does not match stays buffered but hidden.
+	m = step(m, requestEvent(qlog.Entry{QName: "other.example.com.", Proto: "tcp"}))
+	if len(m.requests) != 3 {
+		t.Fatalf("buffer = %d entries, want the row kept", len(m.requests))
+	}
+	if strings.Contains(m.View(), "other.example.com.") {
+		t.Errorf("a non-matching live row leaked into the view:\n%s", m.View())
+	}
+
+	// The filter also matches the client address; re-opening the input
+	// prefills the current value.
+	m = step(m, key('f'))
+	if m.input != "ads" {
+		t.Fatalf("the filter input prefilled %q, want the current filter", m.input)
+	}
+	for range m.input {
+		m = step(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeText(m, "10.0.0.2")
+	m = step(m, enterKey())
+	view = m.View()
+	if !strings.Contains(view, "safe.example.com.") || strings.Contains(view, "ads.example.com.") {
+		t.Errorf("the client filter did not narrow the feed:\n%s", view)
+	}
+
+	// Back to the domain filter: the backfill respects it too.
+	m = step(m, key('f'))
+	for range m.input {
+		m = step(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = typeText(m, "ads")
+	m = step(m, enterKey())
+	m = step(m, requestsLoadedMsg{entries: []qlog.Entry{
+		{QName: "ads2.example.com.", Proto: "udp"},
+		{QName: "nodomain.example.net.", Proto: "udp"},
+	}})
+	view = m.View()
+	if !strings.Contains(view, "ads2.example.com.") {
+		t.Errorf("the filtered backfill dropped a matching row:\n%s", view)
+	}
+	if strings.Contains(view, "nodomain.example.net.") {
+		t.Errorf("the filtered backfill kept a non-matching row:\n%s", view)
+	}
+
+	// Esc inside the input keeps the previous filter, unlike Enter.
+	m = step(m, key('f'))
+	m = typeText(m, "zzz")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.requestsFilter != "ads" {
+		t.Errorf("esc in the input changed the filter to %q, want the previous ads", m.requestsFilter)
+	}
+	if !strings.Contains(m.View(), "ads2.example.com.") {
+		t.Errorf("the cancelled edit dropped the filter:\n%s", m.View())
+	}
+
+	// Esc on the screen clears the filter and restores every row.
+	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.requestsFilter != "" {
+		t.Fatalf("esc on the requests screen left the filter %q", m.requestsFilter)
+	}
+	view = m.View()
+	for _, want := range []string{"ads2.example.com.", "nodomain.example.net."} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() misses %q after clearing the filter:\n%s", want, view)
+		}
+	}
+}
+
 func TestUpstreamsView(t *testing.T) {
 	st := sampleStatus()
 	st.Upstreams = append(st.Upstreams, api.UpstreamStatus{

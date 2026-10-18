@@ -24,6 +24,9 @@ const (
 	screenUpstreams
 	screenFilters
 	screenSettings
+	screenDiag
+	// screenHelp is not a tab: the ? key opens it as an overlay and
+	// Esc (or any digit) leaves it.
 	screenHelp
 )
 
@@ -38,7 +41,7 @@ var screenTabs = []struct {
 	{"Upstream'ы", screenUpstreams},
 	{"Фильтры", screenFilters},
 	{"Настройки", screenSettings},
-	{"Помощь", screenHelp},
+	{"Диагностика", screenDiag},
 }
 
 // Options configure the model.
@@ -57,6 +60,9 @@ type Model struct {
 	width  int
 	height int
 
+	// helpReturn is the screen the ? overlay was opened from.
+	helpReturn screen
+
 	status    api.Status
 	statusErr error
 
@@ -65,6 +71,10 @@ type Model struct {
 	requests       []qlog.Entry
 	requestsPaused bool
 	requestsScroll int
+	requestsFilter string
+
+	diagChecks []diagCheck
+	diagLoaded bool
 
 	filterLists  []filter.ListStatus
 	filterCursor int
@@ -108,6 +118,8 @@ func parseScreen(name string) screen {
 		return screenFilters
 	case "settings", "настройки":
 		return screenSettings
+	case "diag", "диагностика":
+		return screenDiag
 	case "help", "помощь":
 		return screenHelp
 	default:
@@ -309,6 +321,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case diagLoadedMsg:
+		m.diagChecks = buildDiagChecks(msg)
+		m.diagLoaded = true
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -325,6 +342,8 @@ func (m Model) refreshCmd() tea.Cmd {
 		cmds = append(cmds, loadConfig(m.client))
 	case screenRequests:
 		cmds = append(cmds, loadRequests(m.client))
+	case screenDiag:
+		cmds = append(cmds, loadDiag(m.client))
 	}
 	return tea.Batch(cmds...)
 }
@@ -344,6 +363,10 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 		if m.requests == nil {
 			return loadRequests(m.client)
 		}
+	case screenDiag:
+		if !m.diagLoaded {
+			return loadDiag(m.client)
+		}
 	}
 	return nil
 }
@@ -360,6 +383,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "r":
 		return m, m.refreshCmd()
+	case "?":
+		if m.screen != screenHelp {
+			m.helpReturn = m.screen
+		}
+		m.screen = screenHelp
+		return m, nil
 	case "1", "2", "3", "4", "5", "6", "7":
 		idx := int(msg.String()[0] - '1')
 		m.screen = screenTabs[idx].screen
@@ -377,8 +406,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "x":
 			m.requests = nil
 			m.requestsScroll = 0
+		case "f":
+			m.inputActive = true
+			m.inputMode = inputRequestsFilter
+			m.input = m.requestsFilter // editing an existing filter
+		case "esc":
+			// Outside an input line Esc clears the feed filter; inside
+			// it (handleInputKey) Esc keeps the previous value.
+			m.requestsFilter = ""
+			m.requestsScroll = 0
 		case "up", "k":
-			if m.requestsScroll < len(m.requests)-1 {
+			if m.requestsScroll < len(m.filteredRequests())-1 {
 				m.requestsScroll++
 			}
 		case "down", "j":
@@ -444,6 +482,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, applySettingsCmd(m.client, cloneConfig(m.settingsCfg))
 		case "w":
 			return m.openWizard()
+		}
+
+	case screenHelp:
+		if msg.String() == "esc" {
+			m.screen = m.helpReturn
+			if m.screen == screenHelp {
+				m.screen = screenStatus
+			}
 		}
 	}
 	return m, nil
@@ -512,6 +558,12 @@ func (m Model) commitInput() (tea.Model, tea.Cmd) {
 	switch m.inputMode {
 	case inputRule:
 		return m.commitRule()
+	case inputRequestsFilter:
+		m.inputActive = false
+		m.requestsFilter = strings.TrimSpace(m.input)
+		m.input = ""
+		m.requestsScroll = 0
+		return m, nil
 	case inputSettingsField:
 		m.inputActive = false
 		field := m.settingsFields()[m.inputField]
@@ -574,6 +626,8 @@ func (m Model) View() string {
 		b.WriteString(m.filtersView())
 	case screenSettings:
 		b.WriteString(m.settingsView())
+	case screenDiag:
+		b.WriteString(m.diagView())
 	case screenHelp:
 		b.WriteString(m.helpView())
 	default:
@@ -588,7 +642,7 @@ func (m Model) View() string {
 
 	if m.width > 0 {
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("q — выход · r — обновить · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"))
+		b.WriteString(dimStyle.Render("q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"))
 	}
 	return b.String()
 }
@@ -607,13 +661,19 @@ func (m Model) tabsView() string {
 	return strings.Join(parts, "  ")
 }
 
-// helpView is the shortcut reference.
+// helpView is the shortcut reference, shown by the ? overflow screen.
 func (m *Model) helpView() string {
 	lines := []string{
 		titleStyle.Render("mdns — горячие клавиши"),
 		"",
-		"  1-7   переключение экранов",
+		"  1-7   переключение экранов (7 — Диагностика)",
 		"  r     перечитать данные с демона",
+		"  f     фильтр ленты «Запросы» (Enter — применить, esc — отменить)",
+		"  esc   сбросить фильтр ленты / выйти из справки",
+		"  пробел пауза ленты запросов",
+		"  x     очистить ленту запросов",
+		"  ↑↓    прокрутка ленты",
+		"  ?     эта справка",
 		"  q     выход",
 		"",
 		dimStyle.Render("Все настройки выполняются в TUI и в веб-панели одинаково:"),
