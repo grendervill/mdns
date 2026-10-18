@@ -207,8 +207,11 @@ func TestStatusRenders(t *testing.T) {
 
 	// The mockup's dasharrays and offsets, straight from its figure:
 	// slice starts are 0, 74, 93 and 99.7 percent, so the offsets are
-	// 25 minus each of those.
+	// 25 minus each of those. The 48-unit viewBox keeps the 14-wide
+	// stroke (16 on hover) around r=15.9 inside the box instead of
+	// clipping the rings into octagons.
 	geometry := []string{
+		`viewBox="0 0 48 48"`, `cx="24" cy="24"`, `r="15.9"`,
 		`stroke-dasharray="74 26"`, `stroke-dashoffset="25"`,
 		`stroke-dasharray="19 81"`, `stroke-dashoffset="-49"`,
 		`stroke-dasharray="6.7 93.3"`, `stroke-dashoffset="-68"`,

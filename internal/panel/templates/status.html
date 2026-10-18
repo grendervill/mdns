@@ -64,8 +64,8 @@
 {{define "donut"}}
 <div class="pie">
   <div class="t">{{.Title}}</div>
-  <svg viewBox="0 0 42 42" role="img" aria-label="{{.Title}}">
-    <circle class="track" cx="21" cy="21" r="15.9"></circle>
+  <svg viewBox="0 0 48 48" role="img" aria-label="{{.Title}}">
+    <circle class="track" cx="24" cy="24" r="15.9"></circle>
     {{range .Segments}}{{template "segment" .}}{{end}}
   </svg>
   <div class="legend">
@@ -73,4 +73,4 @@
   </div>
 </div>
 {{end}}
-{{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}
+{{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="24" cy="24" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="24" cy="24" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}
