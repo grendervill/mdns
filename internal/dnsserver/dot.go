@@ -27,8 +27,8 @@ func (s *Server) startDoT() error {
 		Listener: tls.NewListener(ln, tlsCfg),
 		Handler:  &coreHandler{core: s.core, proto: "dot", ctx: s.baseCtx, logger: s.logger},
 	}
-	s.track(srv)
-	go s.serve(srv, "dot", port)
+	s.trackTLS(srv)
+	s.serve(srv, "dot", port)
 
 	s.logger.Info("DoT listening", "port", port)
 	return nil

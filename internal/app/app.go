@@ -11,10 +11,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
+	"mydns/internal/acmecert"
 	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
@@ -63,22 +66,59 @@ type runtime struct {
 	specs          []filter.ListSpec
 	filterInterval time.Duration
 
+	// certSource provides the TLS certificate; acmeMgr is the same
+	// object when the source is the ACME manager. certDomain, certCfg
+	// and dataDir scope the manager's reuse across generations: the
+	// manager is bound to one domain, TLS section and cache directory.
+	// challengeHTTP asks start to bind the ACME HTTP-01 responder on :80.
+	certSource    tlscert.Source
+	acmeMgr       *acmecert.Manager
+	certDomain    string
+	certCfg       config.TLS
+	challengeHTTP bool
+
 	// logCfg and dataDir scope resource reuse across generations: a
 	// changed query-log config or data dir must rebuild its component.
 	logCfg  config.LogConfig
 	dataDir string
 
+	bus    *api.Bus
+	logger *slog.Logger
+
 	ctx    context.Context
 	cancel context.CancelFunc
+	// wg tracks the background loops the current generation's start
+	// launched, so stop can wait for them: the ACME manager and the
+	// filter updater write under the data directory. start replaces it
+	// with a fresh group on every generation, so a stop that times out
+	// (leaving a parked Wait) can never race a later generation's Add
+	// on the same group — the same runtime is restarted on the
+	// UpdateConfig rollback paths.
+	wg *sync.WaitGroup
+}
+
+// goRun starts a tracked background loop. stop waits for every loop
+// this way, so a caller that removes the data directory right after
+// Stop cannot race the ACME manager or the filter updater writing into
+// it. The group is captured at launch so a later generation replacing
+// rt.wg cannot complete the wrong group.
+func (rt *runtime) goRun(fn func()) {
+	wg := rt.wg
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		fn()
+	}()
 }
 
 // start binds the listeners and starts the background loops.
 func (rt *runtime) start(parent context.Context) error {
 	rt.ctx, rt.cancel = context.WithCancel(parent)
+	rt.wg = new(sync.WaitGroup)
 
-	go rt.monitor.Run(rt.ctx)
+	rt.goRun(func() { rt.monitor.Run(rt.ctx) })
 	if rt.updater != nil {
-		go rt.updater.Run(rt.ctx, rt.filterInterval)
+		rt.goRun(func() { rt.updater.Run(rt.ctx, rt.filterInterval) })
 	}
 
 	if err := rt.server.Start(rt.ctx); err != nil {
@@ -86,7 +126,80 @@ func (rt *runtime) start(parent context.Context) error {
 		rt.cancel = nil
 		return err
 	}
+
+	if err := rt.startCert(); err != nil {
+		_ = rt.stop(context.Background())
+		return err
+	}
 	return nil
+}
+
+// startCert wires the certificate lifecycle. In ACME mode the manager
+// starts issuing in the background; unless DoH already terminates TLS
+// on :443 (where the tls-alpn-01 challenge is served), the HTTP-01
+// responder binds :80, as ACME validates by reaching the domain. The
+// status loop runs for every source and stops with the runtime context.
+func (rt *runtime) startCert() error {
+	if rt.acmeMgr != nil {
+		if rt.challengeHTTP {
+			if err := rt.server.StartChallengeHTTP(rt.acmeMgr.HTTPHandler(), 80); err != nil {
+				return fmt.Errorf("app: acme challenge listener: %w", err)
+			}
+		}
+		rt.goRun(func() { rt.acmeMgr.Run(rt.ctx, nil) })
+	}
+	rt.goRun(func() { rt.certLoop(rt.ctx) })
+	return nil
+}
+
+// certPollInterval is how often certLoop checks the certificate source.
+const certPollInterval = time.Second
+
+// certLoop watches the certificate source: it publishes status changes
+// on the event bus and brings the TLS listeners up as soon as the
+// source is ready (the ACME manager after its first issuance). The TLS
+// listeners are normally already up for a static source, so the
+// StartTLS call is a no-op there. It returns when ctx ends.
+func (rt *runtime) certLoop(ctx context.Context) {
+	ticker := time.NewTicker(certPollInterval)
+	defer ticker.Stop()
+
+	var prev tlscert.Status
+	first := true
+	for {
+		st := rt.certSource.Status()
+		if first || !sameCertStatus(prev, st) {
+			first = false
+			prev = st
+			if rt.bus != nil {
+				rt.bus.Publish(api.Event{Type: "cert", Data: st})
+			}
+		}
+
+		if rt.certSource.Ready() && !rt.server.TLSStarted() {
+			if err := rt.server.StartTLS(); err != nil {
+				rt.logger.Warn("app: starting the TLS listeners", "error", err)
+			} else {
+				rt.logger.Info("app: TLS listeners started", "mode", st.Mode, "issuer", st.Issuer)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// sameCertStatus compares two certificate statuses, ignoring the check
+// time, which moves on every lookup without a real change.
+func sameCertStatus(a, b tlscert.Status) bool {
+	return a.Mode == b.Mode &&
+		a.State == b.State &&
+		a.Issuer == b.Issuer &&
+		a.NotAfter.Equal(b.NotAfter) &&
+		a.Error == b.Error
 }
 
 // stop shuts the listeners down and stops the background loops.
@@ -95,7 +208,27 @@ func (rt *runtime) stop(ctx context.Context) error {
 		rt.cancel()
 		rt.cancel = nil
 	}
-	return rt.server.Shutdown(ctx)
+	err := rt.server.Shutdown(ctx)
+
+	// Wait for the background loops of this generation. The ACME
+	// manager and the filter updater write into the data directory, so a
+	// caller that removes it right after Stop (as the tests do) must not
+	// race those writes. The wait honours ctx so a stuck loop cannot
+	// hang shutdown forever. Wait on the snapshot: start may replace
+	// rt.wg for a later generation while this Wait is still parked.
+	wg := rt.wg
+	if wg != nil {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	return err
 }
 
 // closeResources releases what outlives one generation: the query log
@@ -137,7 +270,8 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		return nil, fmt.Errorf("app: invalid config: %w", err)
 	}
 
-	rt, err := buildRuntime(cfg, nil, opts, logger)
+	bus := api.NewBus()
+	rt, err := buildRuntime(cfg, nil, opts, logger, bus)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +282,7 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		opts:   opts,
 		cfg:    &cfgCopy,
 		rt:     rt,
-		bus:    api.NewBus(),
+		bus:    bus,
 	}
 	a.wireEvents(rt)
 	return a, nil
@@ -262,7 +396,7 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 		return a.applySoft(old, next)
 	}
 
-	newRT, err := buildRuntime(next, a.rt, a.opts, a.logger)
+	newRT, err := buildRuntime(next, a.rt, a.opts, a.logger, a.bus)
 	if err != nil {
 		return err
 	}
@@ -390,11 +524,11 @@ func (a *App) filterIntervalFor(cfg *config.Config) time.Duration {
 
 // buildRuntime assembles a runtime generation. prev may be nil for the
 // first generation; otherwise reusable pieces (the query log, the
-// filter engine with its loaded lists) carry over.
-func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.Logger) (*runtime, error) {
-	certs, err := tlscert.New(cfg.TLS, cfg.Domain)
+// filter engine with its loaded lists, the ACME manager) carry over.
+func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.Logger, bus *api.Bus) (*runtime, error) {
+	certSource, acmeMgr, err := buildCertSource(cfg, prev, logger)
 	if err != nil {
-		return nil, fmt.Errorf("app: certificates: %w", err)
+		return nil, err
 	}
 
 	ups := make([]*upstream.Upstream, 0, len(cfg.Upstreams))
@@ -509,7 +643,7 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 	}
 
 	return &runtime{
-		server:         dnsserver.New(cfg, c, certs, limiter, logger),
+		server:         dnsserver.New(cfg, c, certSource, limiter, logger),
 		monitor:        upstream.NewMonitor(ups, opts.Monitor, logger),
 		upstreams:      ups,
 		queryLog:       queryLog,
@@ -521,9 +655,87 @@ func buildRuntime(cfg *config.Config, prev *runtime, opts Options, logger *slog.
 		updater:        updater,
 		specs:          specs,
 		filterInterval: interval,
+		certSource:     certSource,
+		acmeMgr:        acmeMgr,
+		certDomain:     cfg.Domain,
+		certCfg:        cfg.TLS,
+		challengeHTTP:  acmeMgr != nil && !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443),
 		logCfg:         cfg.Log,
 		dataDir:        cfg.DataDir,
+		bus:            bus,
+		logger:         logger,
 	}, nil
+}
+
+// buildCertSource assembles the certificate source for a generation: a
+// static store for files/self-signed, an ACME manager for acme mode.
+// The manager carries over from prev when it still matches the
+// configuration (see reuseACMEManager), so a rebuild for another
+// section does not restart issuance; a structural certificate change
+// builds a new one.
+func buildCertSource(cfg *config.Config, prev *runtime, logger *slog.Logger) (tlscert.Source, *acmecert.Manager, error) {
+	if cfg.TLS.Mode != "acme" {
+		store, err := tlscert.New(cfg.TLS, cfg.Domain)
+		if err != nil {
+			return nil, nil, fmt.Errorf("app: certificates: %w", err)
+		}
+		return store, nil, nil
+	}
+
+	if reuseACMEManager(prev, cfg) {
+		return prev.acmeMgr, prev.acmeMgr, nil
+	}
+
+	dir, err := cfg.TLS.ACMEDirectoryURL()
+	if err != nil {
+		return nil, nil, fmt.Errorf("app: acme: %w", err)
+	}
+
+	opts := acmecert.Options{
+		Domain:             cfg.Domain,
+		Email:              cfg.TLS.ACME.Email,
+		DirectoryURL:       dir,
+		CacheDir:           filepath.Join(cfg.DataDir, "certs", "acme"),
+		InsecureSkipVerify: cfg.TLS.ACME.InsecureSkipVerify,
+		Logger:             logger,
+	}
+	opts.BackoffMin, opts.BackoffMax = acmeBackoffFromEnv()
+	if cfg.TLS.ACME.EABKeyID != "" || cfg.TLS.ACME.EABHMAC != "" {
+		eab, err := acmecert.ParseEAB(cfg.TLS.ACME.EABKeyID, cfg.TLS.ACME.EABHMAC)
+		if err != nil {
+			return nil, nil, fmt.Errorf("app: acme: %w", err)
+		}
+		opts.EAB = eab
+	}
+
+	m, err := acmecert.New(opts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("app: acme: %w", err)
+	}
+	return m, m, nil
+}
+
+// reuseACMEManager reports whether the previous generation's ACME
+// manager can serve this configuration. The manager is bound to one
+// domain (the ACME HostPolicy and the name it fetches), one TLS section
+// and one cache directory, so any of those changing needs a fresh
+// manager; the caller has already established that cfg selects acme
+// mode.
+func reuseACMEManager(prev *runtime, cfg *config.Config) bool {
+	if prev == nil || prev.acmeMgr == nil {
+		return false
+	}
+	return prev.certDomain == cfg.Domain && prev.certCfg == cfg.TLS && prev.dataDir == cfg.DataDir
+}
+
+// acmeBackoffFromEnv reads the test-only backoff overrides
+// MDNS_ACME_BACKOFF_MIN and MDNS_ACME_BACKOFF_MAX (Go duration strings,
+// e.g. "5s"). A malformed value is ignored so the manager keeps its
+// default, which is what production wants.
+func acmeBackoffFromEnv() (min, max time.Duration) {
+	min, _ = time.ParseDuration(os.Getenv("MDNS_ACME_BACKOFF_MIN"))
+	max, _ = time.ParseDuration(os.Getenv("MDNS_ACME_BACKOFF_MAX"))
+	return min, max
 }
 
 // listSpecs resolves the configured lists into fetch specs.

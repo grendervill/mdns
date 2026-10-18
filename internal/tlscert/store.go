@@ -1,8 +1,8 @@
 // Package tlscert provides the server TLS certificate store. The
 // certificate pair is either loaded from files or generated
 // self-signed in memory, and is handed to the TLS listeners through
-// GetCertificate — the fixed interface contract that the future ACME
-// manager will implement as well.
+// Source — the fixed interface contract that the future ACME manager
+// will implement as well.
 package tlscert
 
 import (
@@ -23,9 +23,30 @@ import (
 // stays valid.
 const selfSignedValidity = 90 * 24 * time.Hour
 
+// Source provides the server certificate to the TLS listeners; a
+// static store and the ACME manager both implement it.
+type Source interface {
+	GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	Ready() bool    // a usable certificate is available
+	ACMEALPN() bool // the 443 listener must advertise acme-tls/1
+	Status() Status
+}
+
+// Status is a snapshot of the certificate source for the control API
+// and the interfaces.
+type Status struct {
+	Mode      string    `json:"mode"`                // self-signed | files | acme
+	State     string    `json:"state"`               // ok | waiting | error
+	Issuer    string    `json:"issuer,omitempty"`    // issuer common name
+	NotAfter  time.Time `json:"not_after,omitempty"` // leaf expiry
+	Error     string    `json:"error,omitempty"`
+	LastCheck time.Time `json:"last_check,omitempty"`
+}
+
 // Store holds the server certificate. The zero Store is not usable;
 // build one with New.
 type Store struct {
+	mode string
 	cert *tls.Certificate
 }
 
@@ -53,7 +74,7 @@ func New(cfg config.TLS, domain string) (*Store, error) {
 		return nil, fmt.Errorf("tls: unknown mode %q (want files or self-signed)", cfg.Mode)
 	}
 
-	return &Store{cert: &cert}, nil
+	return &Store{mode: cfg.Mode, cert: &cert}, nil
 }
 
 // GetCertificate returns the stored certificate for every handshake.
@@ -62,6 +83,30 @@ func New(cfg config.TLS, domain string) (*Store, error) {
 // is ignored because one certificate serves every name.
 func (s *Store) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return s.cert, nil
+}
+
+// Ready reports whether a usable certificate is available. A store
+// built by New always holds one.
+func (s *Store) Ready() bool {
+	return s.cert != nil
+}
+
+// ACMEALPN reports whether the 443 listener must advertise the
+// acme-tls/1 protocol. The static store never serves ACME challenges.
+func (s *Store) ACMEALPN() bool {
+	return false
+}
+
+// Status reports the stored certificate: the mode the store was built
+// with, the issuer common name and the expiry from the leaf. The store
+// always holds a usable certificate, so the state is ok.
+func (s *Store) Status() Status {
+	return Status{
+		Mode:     s.mode,
+		State:    "ok",
+		Issuer:   s.cert.Leaf.Issuer.CommonName,
+		NotAfter: s.cert.Leaf.NotAfter,
+	}
 }
 
 // selfSigned generates a self-signed ECDSA P-256 certificate for

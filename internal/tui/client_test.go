@@ -17,6 +17,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/tlscert"
 	"mydns/internal/tui"
 )
 
@@ -148,6 +149,46 @@ func TestUnixClientEvents(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("events channel did not close after cancellation")
 		}
+	}
+}
+
+// TestUnixClientCertEvent checks that a cert SSE event is decoded into
+// a tlscert.Status by the client.
+func TestUnixClientCertEvent(t *testing.T) {
+	ctl := &stubController{}
+	sock, bus := startAPIServer(t, ctl)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c := tui.NewUnixClient(sock)
+	events, err := c.Events(ctx)
+	if err != nil {
+		t.Fatalf("Events() = %v, want nil", err)
+	}
+
+	bus.Publish(api.Event{Type: "cert", Data: tlscert.Status{
+		Mode: "acme", State: "ok", Issuer: "Let's Encrypt",
+		NotAfter: time.Date(2027, 1, 15, 10, 0, 0, 0, time.UTC),
+	}})
+
+	select {
+	case e, ok := <-events:
+		if !ok {
+			t.Fatalf("events channel closed early")
+		}
+		cert, isCert := e.Data.(tlscert.Status)
+		if e.Type != "cert" || !isCert {
+			t.Fatalf("event = %+v, want a tlscert.Status", e)
+		}
+		if cert.Issuer != "Let's Encrypt" || cert.State != "ok" {
+			t.Errorf("cert = %+v, want the published status", cert)
+		}
+		if cert.NotAfter.Year() != 2027 {
+			t.Errorf("NotAfter = %v, want 2027", cert.NotAfter)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("cert event did not arrive")
 	}
 }
 

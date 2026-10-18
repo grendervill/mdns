@@ -39,7 +39,12 @@ func (m *Model) statusView() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(dimStyle.Render("Стратегия: " + m.status.Strategy))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
+	if line := m.certLine(); line != "" {
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
 
 	if len(m.status.Links) > 0 {
 		b.WriteString(titleStyle.Render("Ссылки для устройств"))
@@ -77,6 +82,30 @@ func (m *Model) statusView() string {
 	}
 
 	return b.String()
+}
+
+// certLine renders the certificate state line, empty when the daemon
+// reports no certificate information at all (an older daemon).
+func (m *Model) certLine() string {
+	c := m.status.Cert
+	if c.Mode == "" {
+		return ""
+	}
+
+	switch c.State {
+	case "ok":
+		name := c.Issuer
+		if name == "" {
+			name = c.Mode
+		}
+		return okStyle.Render(fmt.Sprintf("Сертификат: %s, истекает %s",
+			name, c.NotAfter.Format("02.01.2006")))
+	case "waiting":
+		return warnStyle.Render("Сертификат: ожидание выпуска…")
+	case "error":
+		return errStyle.Render("Сертификат: ошибка — " + c.Error)
+	}
+	return ""
 }
 
 // offlineView renders the daemon-unavailable state.

@@ -1,0 +1,110 @@
+# Local ACME end-to-end environment for mdns.
+#
+# pebble plays the CA, pebble-challtestsrv is its DNS server, the daemon
+# under test runs `mdns serve` and the client container holds the tools
+# the checks need. The script scripts/e2e-pebble.sh drives the whole
+# thing with the fixed project name mdns-e2e-pebble.
+#
+# MDNS_BIN must point at the linux binary the script builds; E2E_SUBNET
+# and E2E_DAEMON_IP give the daemon a fixed address, so challtestsrv can
+# be pointed at it before the daemon ever starts (a first ACME attempt
+# against an unresolvable name would cost a multi-minute backoff).
+# scripts/e2e-pebble.sh picks a subnet that no existing network uses.
+#
+# Both images are deliberately unpinned and pulled on every run
+# (pull_policy: always), so the e2e always exercises the current pebble
+# release instead of a stale cached image.
+
+services:
+  # Authoritative DNS for the test domain (and the management API the
+  # script uses to aim mdns.test at the daemon container).
+  challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv
+    # Always pull: the e2e must run against the current release, not a
+    # stale cached image.
+    pull_policy: always
+    # No AAAA by default: pebble must not pick a broken IPv6 path.
+    command: ["-defaultIPv6", ""]
+    ports:
+      - "8055:8055"
+    networks:
+      - e2e
+
+  # The CA itself. Its default config validates challenges on ports
+  # 5001/5002, so the custom config mounted below moves tls-alpn-01 to
+  # 443 and http-01 to 80.
+  pebble:
+    image: ghcr.io/letsencrypt/pebble
+    # Always pull: the e2e must run against the current release, not a
+    # stale cached image.
+    pull_policy: always
+    depends_on:
+      - challtestsrv
+    command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "challtestsrv:8053"]
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    volumes:
+      - ./pebble-config.json:/test/config/pebble-config.json:ro
+    ports:
+      - "14000:14000"
+    networks:
+      - e2e
+
+  # The server under test. The e2e phases pick a config file with
+  # MDNS_CONFIG_FILE (default: the ACME one) and the command copies it
+  # to /etc/mdns/config.json, which is writable on purpose: a PUT
+  # /api/v1/config has to persist the applied configuration. The e2e
+  # shrinks the ACME retry backoff through the test hooks
+  # MDNS_ACME_BACKOFF_MIN/MAX so a failed order retries every few
+  # seconds instead of every few minutes.
+  daemon:
+    image: ubuntu:24.04
+    depends_on:
+      - pebble
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        mkdir -p /etc/mdns
+        cp "/mnt/pebble-config/$${MDNS_CONFIG_FILE:-daemon-config.json}" /etc/mdns/config.json
+        exec /mnt/mdns serve --config /etc/mdns/config.json
+    environment:
+      MDNS_CONFIG_FILE: ${MDNS_CONFIG_FILE:-daemon-config.json}
+      MDNS_ACME_BACKOFF_MIN: "5s"
+      MDNS_ACME_BACKOFF_MAX: "30s"
+    volumes:
+      - ${MDNS_BIN:?MDNS_BIN must point at the linux mdns binary}:/mnt/mdns:ro
+      - ./daemon-config.json:/mnt/pebble-config/daemon-config.json:ro
+      - ./daemon-config-selfsigned.json:/mnt/pebble-config/daemon-config-selfsigned.json:ro
+      - mdns-data:/var/lib/mdns
+      - sock:/run/mdns
+    networks:
+      e2e:
+        ipv4_address: ${E2E_DAEMON_IP:?E2E_DAEMON_IP must be set}
+
+  # Test client: shares the control socket with the daemon and speaks
+  # DNS/TLS/HTTPS to it over the compose network. It also carries the
+  # ACME config file the phase D live switch PUTs over the unix socket.
+  client:
+    build:
+      context: .
+      dockerfile: client.Dockerfile
+    depends_on:
+      - daemon
+    command: ["sleep", "infinity"]
+    volumes:
+      - sock:/run/mdns
+      - ${DNSPROBE_BIN:?DNSPROBE_BIN must point at the linux dnsprobe binary}:/mnt/dnsprobe:ro
+      - ./daemon-config.json:/mnt/pebble-config/daemon-config.json:ro
+    networks:
+      - e2e
+
+networks:
+  e2e:
+    ipam:
+      config:
+        - subnet: ${E2E_SUBNET:?E2E_SUBNET must be set}
+
+volumes:
+  mdns-data:
+  sock:

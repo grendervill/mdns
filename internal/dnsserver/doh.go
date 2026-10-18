@@ -34,11 +34,19 @@ const (
 
 // buildDoHServers builds the HTTPS (HTTP/1.1 + HTTP/2) and HTTP/3
 // servers sharing one handler. certs may be nil in tests; when set,
-// its GetCertificate signs every handshake.
-func buildDoHServers(mux http.Handler, certs *tlscert.Store, addr string) (*http.Server, *http3.Server) {
+// its GetCertificate signs every handshake. An ACME source makes the
+// HTTPS listener also advertise the acme-tls/1 protocol (RFC 8737), so
+// a tls-alpn-01 challenge reaches GetCertificate; HTTP/3 keeps its
+// QUIC-only protocols.
+func buildDoHServers(mux http.Handler, certs tlscert.Source, addr string) (*http.Server, *http3.Server) {
 	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	if certs != nil {
 		getCert = certs.GetCertificate
+	}
+
+	nextProtos := []string{"h2", "http/1.1"}
+	if certs != nil && certs.ACMEALPN() {
+		nextProtos = append(nextProtos, "acme-tls/1")
 	}
 
 	httpSrv := &http.Server{
@@ -46,7 +54,7 @@ func buildDoHServers(mux http.Handler, certs *tlscert.Store, addr string) (*http
 		Handler: mux,
 		TLSConfig: &tls.Config{
 			GetCertificate: getCert,
-			NextProtos:     []string{"h2", "http/1.1"},
+			NextProtos:     nextProtos,
 		},
 		ReadHeaderTimeout: dohReadHeaderTimeout,
 		ReadTimeout:       dohReadTimeout,

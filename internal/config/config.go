@@ -34,9 +34,82 @@ type Protocols struct {
 
 // TLS selects how the server certificate is obtained.
 type TLS struct {
-	Mode     string `json:"mode"` // "files" or "self-signed"
+	Mode     string `json:"mode"` // "files", "self-signed" or "acme"
 	CertFile string `json:"cert_file"`
 	KeyFile  string `json:"key_file"`
+	ACME     ACME   `json:"acme,omitempty"`
+}
+
+// ACME configures automatic certificate issuance via the ACME
+// protocol. It is used only when the TLS mode is "acme". Provider is
+// letsencrypt, zerossl or custom: the first two use their well-known
+// directory and require Email (ZeroSSL also requires the EAB
+// credentials issued by the CA), while custom requires DirectoryURL.
+// InsecureSkipVerify disables the directory TLS check, e.g. for a CA on
+// the local network.
+type ACME struct {
+	Provider           string `json:"provider"` // letsencrypt | zerossl | custom
+	Email              string `json:"email,omitempty"`
+	DirectoryURL       string `json:"directory_url,omitempty"`
+	EABKeyID           string `json:"eab_kid,omitempty"`
+	EABHMAC            string `json:"eab_hmac,omitempty"`
+	InsecureSkipVerify bool   `json:"insecure_skip_verify,omitempty"`
+}
+
+// acmeDirectoryURLs maps the built-in CA providers to their ACME
+// directory URLs.
+var acmeDirectoryURLs = map[string]string{
+	"letsencrypt": "https://acme-v02.api.letsencrypt.org/directory",
+	"zerossl":     "https://acme.zerossl.com/v2/DV90",
+}
+
+// ACMEDirectoryURL resolves the provider to its ACME directory URL: the
+// built-in CAs map to a fixed URL, custom returns its configured
+// DirectoryURL, which must be https.
+func (t TLS) ACMEDirectoryURL() (string, error) {
+	if dir, ok := acmeDirectoryURLs[t.ACME.Provider]; ok {
+		return dir, nil
+	}
+	if t.ACME.Provider != "custom" {
+		return "", fmt.Errorf("tls.acme: unknown provider %q (want letsencrypt, zerossl or custom)", t.ACME.Provider)
+	}
+	if t.ACME.DirectoryURL == "" {
+		return "", errors.New("tls.acme: custom provider requires directory_url")
+	}
+	u, err := url.Parse(t.ACME.DirectoryURL)
+	if err != nil {
+		return "", fmt.Errorf("tls.acme: directory_url %q is not valid: %w", t.ACME.DirectoryURL, err)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("tls.acme: directory_url %q must be an https URL", t.ACME.DirectoryURL)
+	}
+	return t.ACME.DirectoryURL, nil
+}
+
+// validateACME checks the ACME settings: a known provider with a
+// usable directory URL (delegated to ACMEDirectoryURL, the single
+// source of truth for both) plus the credentials each CA requires —
+// a contact email for the public CAs, and the ZeroSSL external
+// account binding.
+func (t TLS) validateACME() error {
+	if _, err := t.ACMEDirectoryURL(); err != nil {
+		return err
+	}
+
+	switch t.ACME.Provider {
+	case "letsencrypt":
+		if t.ACME.Email == "" {
+			return errors.New("tls.acme: letsencrypt requires email")
+		}
+	case "zerossl":
+		if t.ACME.Email == "" {
+			return errors.New("tls.acme: zerossl requires email")
+		}
+		if t.ACME.EABKeyID == "" || t.ACME.EABHMAC == "" {
+			return errors.New("tls.acme: zerossl requires eab_kid and eab_hmac")
+		}
+	}
+	return nil
 }
 
 // UpstreamConfig is one upstream resolver. Address is host:port for
@@ -195,9 +268,9 @@ func (c *Config) applyDefaults() {
 }
 
 // Validate checks the config for consistency: domain shape, port ranges,
-// known strategy and TLS mode, upstream fields, data directory and the
-// filter settings. Disabled upstreams are exempt from address
-// validation.
+// known strategy and TLS mode (including the ACME settings when that
+// mode is selected), upstream fields, data directory and the filter
+// settings. Disabled upstreams are exempt from address validation.
 func (c *Config) Validate() error {
 	if c.Domain == "" {
 		return errors.New("domain must not be empty")
@@ -232,8 +305,12 @@ func (c *Config) Validate() error {
 
 	switch c.TLS.Mode {
 	case "files", "self-signed":
+	case "acme":
+		if err := c.TLS.validateACME(); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("tls: unknown mode %q (want files or self-signed)", c.TLS.Mode)
+		return fmt.Errorf("tls: unknown mode %q (want files, self-signed or acme)", c.TLS.Mode)
 	}
 
 	if c.DataDir == "" {

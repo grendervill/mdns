@@ -1,18 +1,21 @@
 # mdns
 
+[![CI](https://github.com/grendervill/mdns/actions/workflows/ci.yml/badge.svg)](https://github.com/grendervill/mdns/actions/workflows/ci.yml)
+
 A self-hosted DNS service for personal VPS: it answers DNS-over-HTTPS,
 DNS-over-TLS, DNS-over-QUIC and plain DNS queries for your devices and
 forwards them to a pool of public upstream resolvers, picking the
 fastest healthy one, caching answers and keeping a query log.
 
-The current repository state implements the core engine, the filter
-engine and the control surfaces (plans 1–3 of 4): config, certificate
-store, upstream transports (plain/DoT/DoH/DoQ), answer cache, health
-monitor, routing strategies, query log, rate limiting, the server
-listeners for all four protocols, the own block-list engine, and the
-management layer — a control API on a unix socket, a terminal UI
-(`mdns`) and the first-run wizard (`mdns setup`). The web panel, ACME
-certificates and the one-command installer arrive in the last plan.
+All four plans of the project are implemented (plans 1–4 of 4): the core
+engine (config, upstream transports plain/DoT/DoH/DoQ, answer cache,
+health monitor, routing strategies, query log, rate limiting, the
+listeners for all four protocols), the own block-list engine, the
+management layer (a control API on a unix socket, a terminal UI
+(`mdns`) and the first-run wizard (`mdns setup`)), and — in the last
+plan — automatic ACME certificates with renewal, the one-command
+installer and the `status` / `diag` / `logs` / `install` / `uninstall`
+CLI. The web panel is the remaining milestone.
 
 Design and plans live in `docs/superpowers/`:
 
@@ -20,12 +23,122 @@ Design and plans live in `docs/superpowers/`:
 - `docs/superpowers/plans/2026-10-17-mdns-core.md` — the core plan.
 - `docs/superpowers/plans/2026-10-17-mdns-filters.md` — filtering.
 - `docs/superpowers/plans/2026-10-17-mdns-control.md` — the control layer.
+- `docs/superpowers/plans/2026-10-17-mdns-tls-install.md` —
+  certificates and the installer.
 
 ## Requirements
 
-- Go 1.26 or newer (quic-go v0.64 needs it).
-- Linux (Ubuntu 24.04 / Debian 13) for deployment; macOS works for
-  local development.
+- Go 1.26 or newer (quic-go v0.64 needs it) to build from source.
+- Linux (Ubuntu 24.04 / Debian 13) with systemd for deployment; macOS
+  works for local development.
+- The installer runs as root (it writes `/usr/local/bin`,
+  `/etc/systemd/system` and `/etc/mdns`). `iproute2` is recommended:
+  the port preflight uses `ss` from it to tell the running `mdns`
+  holding its own ports from a foreign listener; without `ss` a busy
+  port is reported as taken and the install stops.
+
+## Install (one command)
+
+On a fresh Ubuntu 24.04 or Debian 13 VPS, as root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/grendervill/mdns/main/install.sh | sudo bash
+```
+
+The wizard asks for the domain, the certificate, the ports, the DNS
+providers and the filter preset. The same install without any question:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/grendervill/mdns/main/install.sh | sudo bash -s -- \
+  --non-interactive --domain dns.example.com --tls acme --acme-email me@example.com
+```
+
+`install.sh` is served from the repository's `main` branch, but the
+binary it installs comes from a GitHub release. Releases appear from
+`v0.1.0` on, so until the first release tag exists the download step
+fails; build the binary yourself (`make build`) and pass it with
+`--local` in the meantime:
+
+```sh
+sudo bash install.sh --local ./bin/mdns --non-interactive --domain dns.example.com
+```
+
+Flags of `install.sh` (`bash install.sh --help`):
+
+| Flag | Effect |
+| --- | --- |
+| `--local <file>` | install the given binary instead of downloading a release |
+| `--version vX.Y.Z` | download that release instead of the latest one |
+| `-h`, `--help` | print the help |
+
+Every other argument is passed to `mdns install` unchanged.
+
+The script picks the release for this machine (`mdns-linux-amd64` or
+`mdns-linux-arm64`), verifies it against the release `SHA256SUMS` and
+aborts if the checksum does not match, installs it as
+`/usr/local/bin/mdns`, and hands over to `mdns install`.
+
+### What `mdns install` does
+
+1. **Preflight** (a failure aborts before anything is written, a
+   warning is printed and does not stop the install):
+   root rights; a supported distribution (Ubuntu 24.04 / Debian 13);
+   architecture amd64 or arm64; systemd present; the ports the selected
+   protocols need are bindable — a port held by the running `mdns`
+   itself is fine, the re-run restarts it; a running `systemd-resolved`
+   stub listener on `:53` is a warning with the fix to apply
+   (`DNSStubListener=no`); the public A/AAAA record of the domain
+   should point at this server, otherwise ACME cannot issue a
+   certificate; at least 500 MB free on the install filesystem.
+2. **Directories** — `/etc/mdns` (0755) and the data directory
+   `/var/lib/mdns` (0700).
+3. **Binary** — installed as `/usr/local/bin/mdns`.
+4. **Config** — the wizard writes `/etc/mdns/config.json`, or the
+   non-interactive spec builds it from the flags.
+5. **systemd unit** — `/etc/systemd/system/mdns.service`
+   (`ExecStart=/usr/local/bin/mdns serve --config /etc/mdns/config.json`,
+   `Restart=always`, `LimitNOFILE=65536`), then `daemon-reload`,
+   `enable` and `restart`.
+6. **Firewall** — when ufw is active its rules are added (plain DNS,
+   DoH, DoT, DoQ, plus `80/tcp` when ACME falls back to HTTP-01);
+   otherwise the exact `ufw allow` lines to run by hand are printed.
+7. **Summary** — the domain, the enabled protocols with ready-to-use
+   device links, the upstreams, the strategy and the installed paths.
+
+The non-interactive flags (`mdns install --help`): `--non-interactive`,
+`--dry-run`, `--reconfigure`, `--config`, `--data-dir`, `--domain`,
+`--tls` (`acme`, `self-signed`, `files`), `--acme-provider`,
+`--acme-email`, `--acme-directory`, `--acme-insecure`, `--eab-kid`,
+`--eab-hmac`, `--cert-file`, `--key-file`, `--provider` (repeatable,
+resolver catalog id), `--strategy`, `--plain-port`, `--doh-port`,
+`--dot-port`, `--doq-port`, `--filter` (`off`, `basic`, `strict`).
+Only `--domain` is required with `--non-interactive`. `--dry-run`
+prints the plan and changes nothing (it still runs the full preflight,
+so it needs root).
+
+### Re-running, updating, removing
+
+Re-running the one-liner is the upgrade path: the binary and the unit
+are replaced and the service restarts. In the non-interactive form an
+existing `/etc/mdns/config.json` is kept (the run says so);
+`--reconfigure` rewrites it — the running daemon picks the new
+configuration up without a manual restart. Without `--non-interactive`
+the wizard opens again.
+
+```sh
+sudo mdns uninstall                 # asks for confirmation on a terminal
+sudo mdns uninstall --yes           # no question
+sudo mdns uninstall --purge         # also remove the config, the data and the certificates
+sudo mdns uninstall --keep-binary   # leave /usr/local/bin/mdns in place
+```
+
+`mdns uninstall` stops and disables the service, removes the unit and
+the binary, and keeps `/etc/mdns/config.json`, `/var/lib/mdns` and the
+certificates by default, so a reinstall finds them again; `--purge`
+removes them too. A second uninstall does not fail: missing paths are
+reported, not treated as errors. The ufw rules `mdns install` added are
+not removed by `mdns uninstall`; close the ports by hand (`sudo ufw
+delete allow …`) if you no longer need them.
 
 ## Build
 
@@ -70,7 +183,8 @@ schema is in `internal/config/config.go`; the example shows every
 section:
 
 - `protocols` — which listeners are on and on which ports.
-- `tls` — `self-signed` or `files` (paths to a certificate pair).
+- `tls` — `self-signed`, `files` (paths to a certificate pair) or
+  `acme` (automatic issuance and renewal; see below).
 - `upstreams` — public resolvers: `transport` is one of `plain`, `dot`,
   `doh` (a full URL) or `doq`; `server_name` sets the TLS SNI when the
   address is an IP; `insecure_skip_verify` allows self-signed upstreams.
@@ -80,8 +194,92 @@ section:
 - `limits` — plain-DNS per-IP rate limit and trusted CIDRs
   (exempt from it).
 - `log` — in-memory entry count and an optional JSONL file.
-- `data_dir` — where persistent data lives (filter list caches);
-  defaults to `/var/lib/mdns`.
+- `data_dir` — where persistent data lives (filter list caches and the
+  ACME certificates); defaults to `/var/lib/mdns`.
+
+### Certificates (ACME)
+
+`tls.mode` selects where the server certificate comes from:
+
+- `self-signed` — an ECDSA P-256 certificate for the domain, generated
+  in memory at every startup and never written to disk, so each restart
+  regenerates it. It is valid for 90 days — that is only its lifetime,
+  not something a restart extends. Good for a first try; every client
+  needs `-k` / an explicit trust.
+- `files` — the PEM pair given by `tls.cert_file` and `tls.key_file`.
+  It is loaded at startup, so a missing or broken pair fails the start
+  instead of the first handshake.
+- `acme` — the certificate is issued and renewed automatically:
+
+```json
+"tls": {
+  "mode": "acme",
+  "acme": {
+    "provider": "letsencrypt",
+    "email": "me@example.com"
+  }
+}
+```
+
+| Provider | Directory | Required |
+| --- | --- | --- |
+| `letsencrypt` (default) | `https://acme-v02.api.letsencrypt.org/directory` | `email` |
+| `zerossl` | `https://acme.zerossl.com/v2/DV90` | `email`, the EAB pair `eab_kid` + `eab_hmac` issued by ZeroSSL |
+| `custom` | your own `directory_url` (must be https) | `directory_url` |
+
+`acme.insecure_skip_verify` (CLI `--acme-insecure`) skips the TLS
+verification of the ACME directory; it exists for a test CA on the
+local network and is not meant for production.
+
+The non-interactive install takes the same values as flags:
+`--tls acme --acme-provider zerossl --acme-email … --eab-kid … --eab-hmac …`
+(or `--acme-directory` for a custom CA); the wizard asks for them in
+the certificate step.
+
+**How the domain is validated.** With DoH enabled on port 443 the
+daemon uses TLS-ALPN-01 (RFC 8737): that DoH listener starts before any
+certificate exists and advertises the `acme-tls/1` protocol, so the CA
+can validate the name on the DoH port itself. In every other
+configuration it falls back to HTTP-01: a responder binds `:80` and
+answers `/.well-known/acme-challenge/…`, returning 404 to anything
+else, while the DoH listener waits for the certificate like DoT and
+DoQ.
+
+**While there is no certificate yet, or when issuance fails.** The
+daemon is up and useful: plain DNS and the local management (control
+API, TUI, `mdns status`) work, while the TLS listeners stay closed —
+apart from the DoH listener on 443, which is up for the challenge only
+(a normal handshake there fails). The certificate state is visible as
+`waiting` or `error` with the CA's message in `mdns status`, TUI and
+the API (`/api/v1/status`), and the event stream publishes every
+change. Failed attempts are retried with a backoff from 5 minutes,
+doubling up to 6 hours, spread by ±20% jitter, until the first
+success; once the certificate arrives the TLS listeners start without
+a restart of the daemon.
+
+**Switching a running daemon to ACME.** Changing `tls.mode` to `acme`
+on a daemon that is already serving (a config update or
+`mdns install --reconfigure`) takes DoT and DoQ offline until the
+certificate is issued, and the status shows the `waiting` state
+meanwhile. The switch is a structural config change, so the daemon
+rebinds its listeners: plain DNS can see a refused window of up to a
+few seconds while the old runtime stops and the new one starts. If the
+new runtime fails to come up, the old one is restored and keeps
+serving (rollback). A fresh install configured with ACME from the
+start has no such window — nothing was serving TLS before.
+
+**Renewal.** autocert renews over the handshake path before the leaf
+expires — at the lesser of 30 days or a third of the certificate
+lifetime (30 days for a 90-day certificate) — and the daemon rechecks
+the certificate once a day. There is no restart and no gap.
+
+**Where the certificate lives.** The ACME account key and the issued
+certificates are kept under `<data_dir>/certs/acme`
+(`/var/lib/mdns/certs/acme` with the default data directory), written
+0600 into the 0700 data directory. They survive a reinstall — `mdns
+install` never touches them — and `mdns uninstall` keeps them unless
+`--purge` is given, so a reinstall (or a restart while the CA is
+unreachable) keeps serving the stored certificate.
 
 ### Filtering (block lists)
 
@@ -121,6 +319,30 @@ The own block-list engine is off by default; turn it on in the config:
 - Filtering happens in the core before cache and upstream, so blocked
   names are answered the same way over plain DNS, DoT, DoH and DoQ.
 
+## CLI
+
+One binary, `mdns`; every command has a `--help`.
+
+| Command | What it does |
+| --- | --- |
+| `mdns` | open the TUI (prints a hint when the daemon is not running) |
+| `mdns setup [--config <path>]` | first-run wizard: writes the config, prints the device links |
+| `mdns serve [--config <path>] [--socket <path>]` | run the DNS server in the foreground (this is what the unit runs) |
+| `mdns check [--config <path>]` | validate the configuration file, print `ok` |
+| `mdns status [--json] [--socket <path>]` | daemon state from the control API: listeners, certificate, upstream health, cache, filters |
+| `mdns diag [--config <path>] [--socket <path>] [--data-dir <path>]` | installation self-check: config, ports, certificate, upstream reachability, data dir, unit |
+| `mdns logs [-n <N>] [-f] [--config <path>]` | tail the daemon log: the configured log file, the systemd journal otherwise |
+| `mdns install [flags]` | install or update the service: binary, config, systemd unit, firewall (see above) |
+| `mdns uninstall [--purge] [--keep-binary] [--config <path>] [--data-dir <path>] [--yes]` | remove the service; config, data and certificates survive unless `--purge` (`--non-interactive` is the same as `--yes`) |
+| `mdns tui [--socket <path>]` | open the terminal interface |
+| `mdns version` | print the version |
+
+`mdns status` needs the running daemon (it reads the control API over
+the unix socket). `mdns diag` works either way: it reads the config,
+the ports, the data directory and the unit from the filesystem and
+reports the certificate and the upstream health from the daemon when
+it answers.
+
 ## Control: TUI, wizard and the daemon API
 
 The daemon exposes a control API on a unix socket (`/run/mdns/mdns.sock`
@@ -157,7 +379,8 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
 mdns setup --config /etc/mdns/config.json
 ```
 
-The steps: domain, certificate (self-signed or your own PEM files),
+The steps: domain, certificate (Let's Encrypt, ZeroSSL with its EAB
+credentials, a custom ACME CA, self-signed or your own PEM files),
 protocols and ports, DNS providers with live latency probes (pick
 several, choose the per-provider transport with `t`), routing
 strategy, filter preset. On save it writes the config and prints the
@@ -217,4 +440,16 @@ DoH and the persisted rules:
 ```sh
 scripts/docker-smoke.sh            # both images
 scripts/docker-smoke.sh ubuntu:24.04
+```
+
+Two more end-to-end scripts need Docker; they exercise the parts the
+in-process test cannot:
+
+```sh
+scripts/e2e-pebble.sh    # ACME against a local pebble CA: issuance over
+                         # tls-alpn-01, failure and self-heal, certificate
+                         # cache reuse, live switch to ACME on a running daemon
+scripts/e2e-install.sh   # the installer in a systemd container: download
+                         # mode, idempotent re-run, --reconfigure, uninstall,
+                         # and that a failed install leaves no half-state
 ```

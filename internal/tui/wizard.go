@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -41,6 +42,28 @@ var stageNames = []string{
 	"Фильтрация",
 	"Итог",
 }
+
+// Certificate options of the TLS step, in the order they are shown.
+const (
+	tlsOptionLetsEncrypt = iota
+	tlsOptionZeroSSL
+	tlsOptionCustom
+	tlsOptionSelfSigned
+	tlsOptionFiles
+)
+
+// tlsOptionCount is the number of certificate options.
+const tlsOptionCount = tlsOptionFiles + 1
+
+// Input targets of the TLS step: the ACME options ask for a chain of
+// values before the step is done.
+const (
+	inputACMEEmail     = "acme-email"
+	inputACMEDirectory = "acme-directory"
+	inputACMEEABKeyID  = "acme-eab-kid"
+	inputACMEEABHMAC   = "acme-eab-hmac"
+	inputACMEInsecure  = "acme-insecure"
+)
 
 // WizardBackend is the environment the wizard works against: the local
 // setup backend before the first run, or the daemon API from the TUI.
@@ -157,6 +180,12 @@ func (w *WizardModel) Summary() string {
 	b.WriteString("Готово! Настройка сохранена.\n\n")
 	b.WriteString("Домен: " + w.cfg.Domain + "\n")
 	b.WriteString("Сертификат: " + w.cfg.TLS.Mode + "\n")
+	if note, warn := acmeSummaryNote(w.cfg); note != "" {
+		b.WriteString(note + "\n")
+		if warn != "" {
+			b.WriteString(warn + "\n")
+		}
+	}
 
 	b.WriteString("Протоколы: ")
 	protos := make([]string, 0, 4)
@@ -264,7 +293,7 @@ func (w WizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stageTLS:
 		switch msg.String() {
 		case "j", "down":
-			if w.cursor < 1 {
+			if w.cursor < tlsOptionCount-1 {
 				w.cursor++
 			}
 		case "k", "up":
@@ -273,12 +302,22 @@ func (w WizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			w.err = nil
-			if w.cursor == 0 {
+			switch w.cursor {
+			case tlsOptionLetsEncrypt:
+				w.pickACMECertificate("letsencrypt")
+				w.openInput(inputACMEEmail, "")
+			case tlsOptionZeroSSL:
+				w.pickACMECertificate("zerossl")
+				w.openInput(inputACMEEmail, "")
+			case tlsOptionCustom:
+				w.pickACMECertificate("custom")
+				w.openInput(inputACMEDirectory, "")
+			case tlsOptionSelfSigned:
 				w.cfg.TLS = config.TLS{Mode: "self-signed"}
-				return w, nil
+			case tlsOptionFiles:
+				w.cfg.TLS = config.TLS{Mode: "files"}
+				w.openInput("cert", "")
 			}
-			w.cfg.TLS = config.TLS{Mode: "files"}
-			w.openInput("cert", "")
 		}
 
 	case stageProtocols:
@@ -385,11 +424,83 @@ func (w WizardModel) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return w, nil
 }
 
-// openInput starts an input line.
+// openInput starts an input line. An earlier error belongs to the
+// previous value, so opening a (new) input clears it.
 func (w *WizardModel) openInput(target, prefill string) {
 	w.inputActive = true
 	w.inputTarget = target
 	w.input = prefill
+	w.err = nil
+}
+
+// closeInput ends the open input line of a finished chain.
+func (w *WizardModel) closeInput() {
+	w.inputActive = false
+	w.inputTarget = ""
+	w.input = ""
+	w.err = nil
+}
+
+// pickACMECertificate switches the certificate mode to ACME with a CA
+// provider; the following input chain fills in the credentials.
+func (w *WizardModel) pickACMECertificate(provider string) {
+	w.cfg.TLS = config.TLS{Mode: "acme", ACME: config.ACME{Provider: provider}}
+}
+
+// validEmail checks an ACME contact address: a non-empty, space-free
+// address with a "@" is all the ACME clients require.
+func validEmail(s string) bool {
+	return strings.Contains(s, "@") && !strings.ContainsAny(s, " \t\r\n")
+}
+
+// acmeDirectoryError checks a custom ACME directory URL: it must be an
+// absolute https URL with a host.
+func acmeDirectoryError(s string) error {
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("URL %q не разбирается: %v", s, err)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return fmt.Errorf("URL %q должен быть https-адресом с хостом, например https://acme.example/directory", s)
+	}
+	return nil
+}
+
+// parseYes answers a yes/no prompt: y and yes (in any case) are true,
+// everything else, an empty answer included, is false.
+func parseYes(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "y", "yes":
+		return true
+	}
+	return false
+}
+
+// acmeProviderTitle names the CA in the summaries.
+func acmeProviderTitle(provider string) string {
+	switch provider {
+	case "letsencrypt":
+		return "Let's Encrypt"
+	case "zerossl":
+		return "ZeroSSL"
+	default:
+		return "свой ACME"
+	}
+}
+
+// acmeSummaryNote describes an ACME certificate for both summaries: it
+// is issued after the daemon starts, and unless DoH already listens on
+// 443 the HTTP-01 challenge opens port 80 while it is being obtained.
+// Both strings are empty for the other TLS modes.
+func acmeSummaryNote(cfg *config.Config) (note, warn string) {
+	if cfg.TLS.Mode != "acme" {
+		return "", ""
+	}
+	note = "Сертификат " + acmeProviderTitle(cfg.TLS.ACME.Provider) + " будет выпущен после запуска демона"
+	if !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443) {
+		warn = "ACME использует HTTP-01: на время работы будет открыт порт 80"
+	}
+	return note, warn
 }
 
 // enterStage switches steps and arms the step's behaviour.
@@ -457,6 +568,66 @@ func (w WizardModel) commitInput() (tea.Model, tea.Cmd) {
 		w.inputActive = false
 		w.input = ""
 		return w, w.enterStage(stageProtocols)
+
+	case w.inputTarget == inputACMEDirectory:
+		if err := acmeDirectoryError(value); err != nil {
+			w.err = err
+			return w, nil
+		}
+		w.cfg.TLS.ACME.DirectoryURL = value
+		w.openInput(inputACMEEmail, "")
+		return w, nil
+
+	case w.inputTarget == inputACMEEmail:
+		// The custom server treats the contact as optional; the public
+		// CAs require it.
+		if value == "" && w.cfg.TLS.ACME.Provider == "custom" {
+			w.cfg.TLS.ACME.Email = ""
+			w.openInput(inputACMEInsecure, "")
+			return w, nil
+		}
+		if value == "" {
+			w.err = errors.New("email не может быть пустым")
+			return w, nil
+		}
+		if !validEmail(value) {
+			w.err = errors.New("email должен содержать @ и не содержать пробелов")
+			return w, nil
+		}
+		w.cfg.TLS.ACME.Email = value
+		switch w.cfg.TLS.ACME.Provider {
+		case "zerossl":
+			w.openInput(inputACMEEABKeyID, "")
+			return w, nil
+		case "custom":
+			w.openInput(inputACMEInsecure, "")
+			return w, nil
+		}
+		w.closeInput()
+		return w, nil
+
+	case w.inputTarget == inputACMEEABKeyID:
+		if value == "" {
+			w.err = errors.New("EAB Key ID не может быть пустым")
+			return w, nil
+		}
+		w.cfg.TLS.ACME.EABKeyID = value
+		w.openInput(inputACMEEABHMAC, "")
+		return w, nil
+
+	case w.inputTarget == inputACMEEABHMAC:
+		if value == "" {
+			w.err = errors.New("EAB HMAC не может быть пустым")
+			return w, nil
+		}
+		w.cfg.TLS.ACME.EABHMAC = value
+		w.closeInput()
+		return w, nil
+
+	case w.inputTarget == inputACMEInsecure:
+		w.cfg.TLS.ACME.InsecureSkipVerify = parseYes(value)
+		w.closeInput()
+		return w, nil
 
 	case strings.HasPrefix(w.inputTarget, "port:"):
 		name := strings.TrimPrefix(w.inputTarget, "port:")
@@ -790,6 +961,9 @@ func (w WizardModel) View() string {
 	case stageTLS:
 		b.WriteString("Как выпускать TLS-сертификат?\n\n")
 		options := []string{
+			"Let's Encrypt (рекомендуется)",
+			"ZeroSSL (нужны EAB-ключи)",
+			"Свой ACME-сервер (advanced)",
 			"Самоподписанный (быстрый старт; устройствам нужно доверие)",
 			"Свои файлы сертификата (cert + key)",
 		}
@@ -800,7 +974,7 @@ func (w WizardModel) View() string {
 			}
 			b.WriteString(marker + opt + "\n")
 		}
-		b.WriteString("\n" + dimStyle.Render("Let's Encrypt появится в следующем обновлении (план ACME)."))
+		b.WriteString("\n" + dimStyle.Render("С ACME сертификат будет выпущен автоматически после запуска демона."))
 		b.WriteString("\n")
 	case stageProtocols:
 		b.WriteString("Протоколы и порты (enter — вкл/выкл, p — порт):\n\n")
@@ -887,6 +1061,12 @@ func (w WizardModel) View() string {
 		b.WriteString("Проверьте настройки:\n\n")
 		b.WriteString(fmt.Sprintf("  Домен: %s\n", w.cfg.Domain))
 		b.WriteString(fmt.Sprintf("  TLS: %s\n", w.cfg.TLS.Mode))
+		if note, warn := acmeSummaryNote(w.cfg); note != "" {
+			b.WriteString("  " + note + "\n")
+			if warn != "" {
+				b.WriteString("  " + warnStyle.Render(warn) + "\n")
+			}
+		}
 		b.WriteString(fmt.Sprintf("  Стратегия: %s\n", w.cfg.Strategy))
 		b.WriteString(fmt.Sprintf("  Фильтрация: %v (%d списков)\n", w.cfg.Filter.Enabled, len(w.cfg.Filter.Lists)))
 		b.WriteString("  Провайдеры:\n")
@@ -927,6 +1107,16 @@ func inputPrompt(target string) string {
 		return "Путь к сертификату (PEM):"
 	case target == "key":
 		return "Путь к ключу (PEM):"
+	case target == inputACMEDirectory:
+		return "Directory URL ACME-сервера (https):"
+	case target == inputACMEEmail:
+		return "Email для ACME:"
+	case target == inputACMEEABKeyID:
+		return "EAB Key ID:"
+	case target == inputACMEEABHMAC:
+		return "EAB HMAC:"
+	case target == inputACMEInsecure:
+		return "Пропускать проверку сертификата ACME-сервера? (y/N):"
 	case strings.HasPrefix(target, "port:"):
 		name := strings.TrimPrefix(target, "port:")
 		return fmt.Sprintf("Порт для %s (Enter — стандартный %d):", name, defaultPort(name))

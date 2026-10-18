@@ -22,6 +22,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/tlscert"
 )
 
 // Client is everything the TUI needs from the daemon.
@@ -191,6 +192,11 @@ func decodeEventData(eventType, raw string) any {
 		var f api.FilterSnapshot
 		if err := json.Unmarshal([]byte(raw), &f); err == nil {
 			return f
+		}
+	case "cert":
+		var cs tlscert.Status
+		if err := json.Unmarshal([]byte(raw), &cs); err == nil {
+			return cs
 		}
 	}
 	return nil

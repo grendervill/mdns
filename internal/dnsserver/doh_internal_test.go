@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"net/http"
+	"slices"
 	"testing"
 )
 
@@ -31,5 +32,27 @@ func TestDoHServersHardened(t *testing.T) {
 	}
 	if h3Srv.MaxHeaderBytes <= 0 {
 		t.Errorf("HTTP/3 MaxHeaderBytes = 0, want > 0")
+	}
+}
+
+// TestDoHServersACMEALPN checks the RFC 8737 wiring: an ACME source
+// puts acme-tls/1 next to h2 and http/1.1 on the HTTPS listener, while
+// a plain source and the HTTP/3 server keep it out.
+func TestDoHServersACMEALPN(t *testing.T) {
+	httpSrv, h3Srv := buildDoHServers(http.NewServeMux(), &fakeSource{ready: true, acmeALPN: true}, ":443")
+
+	protos := httpSrv.TLSConfig.NextProtos
+	for _, want := range []string{"h2", "http/1.1", "acme-tls/1"} {
+		if !slices.Contains(protos, want) {
+			t.Errorf("HTTPS NextProtos = %v, want %q", protos, want)
+		}
+	}
+	if slices.Contains(h3Srv.TLSConfig.NextProtos, "acme-tls/1") {
+		t.Errorf("HTTP/3 NextProtos = %v, want no acme-tls/1", h3Srv.TLSConfig.NextProtos)
+	}
+
+	plain, _ := buildDoHServers(http.NewServeMux(), &fakeSource{ready: true}, ":443")
+	if slices.Contains(plain.TLSConfig.NextProtos, "acme-tls/1") {
+		t.Errorf("plain source NextProtos = %v, want no acme-tls/1", plain.TLSConfig.NextProtos)
 	}
 }
