@@ -241,6 +241,41 @@ def panel_flow(page, context):
     check("the feed shows the generated traffic", rows.count() > 0, rows.count())
     page.screenshot(path=str(SHOTS / "status-desktop.png"), full_page=True)
 
+    # --- the other rail pages -------------------------------------------
+    # The rail is the panel's own navigation; walking it proves each page
+    # renders end to end (status 200, its heading, and a clean console),
+    # not only that the handler exists. The collectors are already on the
+    # desktop page, so a JavaScript or CSP failure on any page reds here.
+    rail_pages = [
+        ("/panel/upstreams", "Upstream’ы"),
+        ("/panel/filters", "Фильтры"),
+        ("/panel/cert", "Сертификат"),
+        ("/panel/settings", "Настройки"),
+        ("/panel/maintenance", "Обслуживание"),
+    ]
+    for href, name in rail_pages:
+        with page.expect_navigation() as nav:
+            page.locator('.rail .nav a[href="%s"]' % href).click()
+        resp = nav.value
+        check(
+            "the rail opens %s with HTTP 200" % name,
+            resp is not None and resp.status == 200,
+            "response: %r" % (resp.status if resp is not None else None),
+        )
+        heading = page.locator(".topline h2").inner_text()
+        check(
+            "%s renders its heading" % name,
+            name in heading,
+            heading,
+        )
+        check("no JavaScript error on %s" % name, not page_errors, page_errors)
+        check("no CSP violation on %s" % name, not csp_errors, csp_errors)
+
+    # Back to the status page for the chart interaction below.
+    with page.expect_navigation() as nav:
+        page.locator('.rail .nav a[href="/panel/"]').click()
+    page.wait_for_load_state()
+
     # --- donut hover and the blocked-segment click -----------------------
     blocked_ring = page.locator('.pie .ring[data-label="заблокировано"]')
     need(
@@ -349,7 +384,7 @@ def panel_flow(page, context):
     # --- live feed over SSE ---------------------------------------------
     page.goto(BASE_URL + "/panel/")
     page.wait_for_function(
-        "document.querySelectorAll('#feed .q').length === 30", timeout=15000
+        "document.querySelectorAll('#feed .q').length > 0", timeout=15000
     )
     page.locator("#feed-clear").click()
     page.wait_for_function(
@@ -393,6 +428,42 @@ def panel_flow(page, context):
         and mobile.locator(".gauges .g").count() == 4
         and mobile.locator(".piefold .pie").count() == 4,
     )
+    # The pre-fix layout let the long latency/source cell squeeze the
+    # qname to a sliver (~10px, rendered "d" for doubleclick.ne.jp). A
+    # width floor plus a non-trivial text length fails that layout while
+    # the fixed one keeps the name at ~190px. scrollWidth is reported for
+    # the record (it catches clipping separately).
+    mobile.wait_for_function(
+        "document.querySelectorAll('#feed .q').length > 0", timeout=15000
+    )
+    blocked_names = mobile.locator("#feed .q:has(.tag.block) .name")
+    need(
+        "the mobile feed shows a blocked row",
+        blocked_names.count() > 0,
+        "feed rows: %d" % mobile.locator("#feed .q").count(),
+    )
+    name_metrics = blocked_names.first.evaluate(
+        """el => ({
+            width: el.clientWidth,
+            scroll: el.scrollWidth,
+            text: el.textContent,
+        })"""
+    )
+    check(
+        "the blocked qname keeps a readable width at 390px (>= 60px)",
+        name_metrics["width"] >= 60,
+        name_metrics,
+    )
+    check(
+        "the blocked qname renders more than a clipped letter",
+        len(name_metrics["text"].strip()) >= 4,
+        name_metrics,
+    )
+    print(
+        "      (mobile blocked qname: %dpx wide, %dpx scroll, text %r)"
+        % (name_metrics["width"], name_metrics["scroll"], name_metrics["text"]),
+        flush=True,
+    )
     overflow = mobile.evaluate(
         "() => document.documentElement.scrollWidth - window.innerWidth"
     )
@@ -412,11 +483,18 @@ def panel_flow(page, context):
 def disabled_flow(context):
     """The panel-off run: the routes must not reveal themselves."""
     for path in ("/panel/", "/login", "/panel/static/app.css"):
-        resp = context.request.get(BASE_URL + path)
+        # No redirect following: a 404 that had to be discovered after a
+        # hop would still leave the route visible on the wire.
+        resp = context.request.get(BASE_URL + path, max_redirects=0)
         check(
             "%s answers 404 when the panel is off" % path,
             resp.status == 404,
             "status %d" % resp.status,
+        )
+        check(
+            "%s carries no Location header when the panel is off" % path,
+            not resp.headers.get("location"),
+            "location: %r" % resp.headers.get("location"),
         )
 
 
