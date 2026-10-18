@@ -469,3 +469,54 @@ func TestHistoryEscaping(t *testing.T) {
 		t.Errorf("the client IP with a quote is not escaped:\n%s", csv)
 	}
 }
+
+// TestHistoryCSVFormulaInjection checks the export's second escaping
+// rule: a cell that begins with a spreadsheet formula character is
+// prefix'd with a single quote, so Excel, LibreOffice and Numbers show
+// the text instead of evaluating it. Any DNS client chooses the query
+// name, so a cell like "=cmd|' /C calc'!A0…" is reachable and must never
+// be executable.
+func TestHistoryCSVFormulaInjection(t *testing.T) {
+	ctrl := newHistoryCtrl(t,
+		qlog.Entry{Time: historyBase, QName: `=cmd|' /C calc'!A0.evil.example.`, QType: 1, Proto: "udp", Rcode: 0,
+			ClientIP: "192.168.1.12", Blocked: true, BlockSource: "ads"},
+		qlog.Entry{Time: historyBase.Add(time.Second), QName: `+1234567890.evil.example.`, QType: 1, Proto: "udp", Rcode: 0,
+			ClientIP: "192.168.1.12", Upstream: "cloudflare"},
+		qlog.Entry{Time: historyBase.Add(2 * time.Second), QName: `-2+3.evil.example.`, QType: 1, Proto: "udp", Rcode: 0,
+			ClientIP: "192.168.1.12", CacheHit: true},
+		qlog.Entry{Time: historyBase.Add(3 * time.Second), QName: `@SUM(1).evil.example.`, QType: 1, Proto: "udp", Rcode: 0,
+			ClientIP: "192.168.1.12", Upstream: "quad9"},
+	)
+	p, srv := statusPanel(t, ctrl)
+
+	resp := authedRequest(t, p, srv, "/panel/history.csv")
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the CSV: %v", err)
+	}
+	csv := string(data)
+
+	// Each formula-shaped cell reaches the file as text, with the
+	// neutralizing single quote in front.
+	for _, want := range []string{
+		`'=cmd|' /C calc'!A0.evil.example.`,
+		`'+1234567890.evil.example.`,
+		`'-2+3.evil.example.`,
+		`'@SUM(1).evil.example.`,
+	} {
+		if !strings.Contains(csv, want) {
+			t.Errorf("the export does not neutralize the formula cell %q:\n%s", want, csv)
+		}
+	}
+
+	// No cell may begin with a bare formula character. Every data line
+	// is время;протокол;домен;…, so the domain (the third field) is
+	// always preceded by ";" — a bare ";" plus a formula character means
+	// the neutering was skipped.
+	for _, bare := range []string{";=cmd", ";+1234567890", ";-2+3", ";@SUM"} {
+		if strings.Contains(csv, bare) {
+			t.Errorf("the export leaks a bare formula cell %q:\n%s", bare, csv)
+		}
+	}
+}

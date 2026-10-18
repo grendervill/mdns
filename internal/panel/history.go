@@ -400,11 +400,25 @@ func writeCSVRecord(bw *bufio.Writer, fields []string) {
 	bw.WriteString("\r\n")
 }
 
-// csvField quotes one RFC4180 field when it needs it. The delimiter is
-// ';', so a field is quoted when it contains a semicolon, a quote, a
-// newline — or a plain comma, which is not strictly required but keeps
-// the file readable by tools that assume a comma delimiter.
+// csvField renders one CSV cell. Every column goes through it, so both
+// promises below hold for all of them.
+//
+// First, spreadsheet formula injection is neutralized: a cell whose text
+// begins with '=', '+', '-', '@', a tab or a carriage return is prefix'd
+// with a single quote (OWASP's guidance), so Excel, LibreOffice and
+// Numbers show it as text instead of evaluating it as a formula. The
+// query name is attacker-chosen — any DNS client picks it — so a cell
+// like "=cmd|' /C calc'!A0.attacker.example." must never be executable.
+//
+// Then the field is quoted for RFC4180 when it needs it: the delimiter
+// is ';', so a field is quoted when it contains a semicolon, a quote, a
+// newline — or a plain comma, which is not strictly required with a
+// semicolon delimiter but keeps the file readable by tools that assume
+// commas.
 func csvField(s string) string {
+	if strings.IndexAny(s, "=+-@\t\r") == 0 {
+		s = "'" + s
+	}
 	if strings.ContainsAny(s, ";,\"\r\n") {
 		return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 	}
