@@ -22,3 +22,12 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test ./... -race -count=1
+      - name: perf harness module
+        run: |
+          cd e2e/perf
+          go build ./...
+          go vet ./...
+          # hashgen carries //go:build ignore and imports mydns/internal/auth,
+          # so it compiles from the repository module, not the nested one.
+          cd ../..
+          go run ./e2e/perf/hashgen/main.go test
