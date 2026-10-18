@@ -15,5 +15,8 @@
 /tmp/
 /.cache/
 
+# Python-окружение Playwright для e2e панели (создаётся scripts/e2e-panel.sh)
+/.venv-pw/
+
 # Workspace SDD (служебный)
 .superpowers/
