@@ -1,0 +1,1161 @@
+// Management screens: upstreams, filters, settings, certificate and
+// maintenance. Every mutation loads the live configuration, edits a
+// private copy and hands the whole thing to UpdateConfig, which is
+// transactional in the daemon — a rejected change leaves the running
+// daemon untouched and the page re-renders the form with the error.
+// The pages carry no script: they are plain forms with a redirect after
+// a successful POST, the same server-rendered approach as the history
+// screen, so the strict CSP holds.
+package panel
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"mydns/internal/api"
+	"mydns/internal/auth"
+	"mydns/internal/config"
+	"mydns/internal/dnsname"
+	"mydns/internal/filter"
+	"mydns/internal/tlscert"
+)
+
+// The management screens are addressed by these paths; every redirect
+// after a successful POST returns to the page it came from.
+const (
+	upstreamsPath   = "/panel/upstreams"
+	filtersPath     = "/panel/filters"
+	settingsPath    = "/panel/settings"
+	maintenancePath = "/panel/maintenance"
+)
+
+// filterRefresh is the single-flight state of the block-list update.
+// The DoH listener has a 10 s write timeout, while «обновить все» may
+// download dozens of lists for up to a minute each, so the POST only
+// starts the work and returns; a second POST while it runs is refused
+// rather than queued (two concurrent updaters would race on one list).
+type filterRefresh struct {
+	mu      sync.Mutex
+	running bool
+}
+
+// start launches fn in the background unless a refresh is already
+// running. It reports false when the caller found one in flight. The
+// background work uses context.Background(): it must not inherit the
+// request context, which the listener cancels after its write deadline.
+func (f *filterRefresh) start(fn func()) bool {
+	f.mu.Lock()
+	if f.running {
+		f.mu.Unlock()
+		return false
+	}
+	f.running = true
+	f.mu.Unlock()
+
+	go func() {
+		defer func() {
+			f.mu.Lock()
+			f.running = false
+			f.mu.Unlock()
+		}()
+		fn()
+	}()
+	return true
+}
+
+// isRunning reports whether a refresh is in flight (tests and pages).
+func (f *filterRefresh) isRunning() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running
+}
+
+// errNoDaemon is what a management page reports when the panel is
+// mounted without a daemon behind it (a test that only exercises the
+// shell).
+var errNoDaemon = errors.New("панель не подключена к демону")
+
+// manageNotice is the result banner of a management page: an error left
+// by a rejected submission, or a short confirmation shown after a
+// successful POST redirects back to the page.
+type manageNotice struct {
+	Error string
+	OK    string
+}
+
+// okMessage maps the ?ok= key of a redirect to the banner it shows. An
+// unknown key shows nothing, so a hand-written URL cannot make the page
+// claim a change that never happened.
+func okMessage(key string) string {
+	switch key {
+	case "upstream":
+		return "upstream переключён"
+	case "priority":
+		return "порядок сохранён"
+	case "lists":
+		return "обновление запущено"
+	case "mode":
+		return "режим применён"
+	case "rule":
+		return "правило применено"
+	case "settings":
+		return "применено"
+	case "password":
+		return "пароль изменён"
+	case "reapply":
+		return "конфиг применён заново"
+	default:
+		return ""
+	}
+}
+
+// notice reads the confirmation banner of a page request.
+func notice(r *http.Request) manageNotice {
+	return manageNotice{OK: okMessage(r.URL.Query().Get("ok"))}
+}
+
+// cloneConfig copies a configuration deeply enough for a form to edit it
+// without touching the live one: every slice the panel can change is
+// cloned, and every other field is a value. Config() hands out the
+// daemon's live pointer, so mutating it in place would change the daemon
+// even when UpdateConfig later rejects the change.
+func cloneConfig(cfg *config.Config) *config.Config {
+	out := *cfg
+	out.Upstreams = append([]config.UpstreamConfig(nil), cfg.Upstreams...)
+	out.Limits.TrustedCIDRs = append([]string(nil), cfg.Limits.TrustedCIDRs...)
+	out.Filter.Lists = append([]config.FilterList(nil), cfg.Filter.Lists...)
+	out.Filter.UserAllow = append([]string(nil), cfg.Filter.UserAllow...)
+	out.Filter.UserBlock = append([]string(nil), cfg.Filter.UserBlock...)
+	return &out
+}
+
+// currentConfig returns the daemon's configuration, or nil when the
+// panel has no daemon.
+func (p *Panel) currentConfig() *config.Config {
+	if p.ctrl == nil {
+		return nil
+	}
+	return p.ctrl.Config()
+}
+
+// pageDomain is the domain shown in the rail brand; empty without a
+// daemon.
+func (p *Panel) pageDomain() string {
+	if cfg := p.currentConfig(); cfg != nil {
+		return cfg.Domain
+	}
+	return ""
+}
+
+// manageCSRF is the CSRF token for the current session, the value every
+// management form carries.
+func (p *Panel) manageCSRF(r *http.Request) string {
+	return p.csrfToken(sessionCSRFBinding(p.sessionToken(r)))
+}
+
+// finishApply hands next to the daemon and either redirects to okHref or
+// re-renders the page with the failure. render fills the page with the
+// error banner; the caller's form values are already in its closure.
+func (p *Panel) finishApply(w http.ResponseWriter, r *http.Request, next *config.Config, okHref string, render func(status int, n manageNotice)) {
+	if err := p.applyConfig(r, next); err != nil {
+		p.logger.Warn("panel: applying a management change", "error", err)
+		render(http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, okHref, http.StatusSeeOther)
+}
+
+// applyConfig validates, applies and persists next through the daemon.
+func (p *Panel) applyConfig(r *http.Request, next *config.Config) error {
+	if p.ctrl == nil {
+		return errNoDaemon
+	}
+	return p.ctrl.UpdateConfig(r.Context(), next)
+}
+
+// statusSnapshot reads the daemon status, tolerating a failure: the page
+// still renders, its live columns just read «—».
+func (p *Panel) statusSnapshot(r *http.Request) api.Status {
+	if p.ctrl == nil {
+		return api.Status{}
+	}
+	st, err := p.ctrl.Status(r.Context())
+	if err != nil {
+		p.logger.Warn("panel: reading the daemon status", "error", err)
+		return api.Status{}
+	}
+	return st
+}
+
+// ---- upstreams ----------------------------------------------------
+
+// upstreamRow is one line of the upstreams table: the configured fields
+// plus the live state when the daemon reports the upstream.
+type upstreamRow struct {
+	ID        string
+	Name      string
+	Transport string
+	Address   string
+	Priority  int
+	Action    string // the flip button's label
+
+	StateClass string
+	StateText  string
+	Latency    string
+	Answered   string
+	Errors     string
+}
+
+// upstreamsView is the whole upstreams page.
+type upstreamsView struct {
+	manageNotice
+	Domain    string
+	CSRF      string
+	Nav       string
+	Strategy  string
+	Upstreams []upstreamRow
+}
+
+// upstreamRowFor renders one upstream: the config supplies the identity
+// and the enabled flag, the status the live health and counters.
+func upstreamRowFor(u config.UpstreamConfig, live api.UpstreamStatus) upstreamRow {
+	row := upstreamRow{
+		ID:        u.ID,
+		Name:      u.Name,
+		Transport: u.Transport,
+		Address:   u.Address,
+		Priority:  u.Priority,
+		Action:    "Включить",
+		Latency:   "—",
+		Answered:  "—",
+		Errors:    "—",
+	}
+	if row.Name == "" {
+		row.Name = u.ID
+	}
+
+	switch {
+	case !u.Enabled:
+		row.StateText = "выключен"
+	case live.Healthy:
+		row.StateClass, row.StateText = "ok", "здоров"
+	default:
+		row.StateClass, row.StateText = "err", "сбой"
+	}
+
+	if u.Enabled {
+		row.Action = "Выключить"
+		if live.Healthy && live.LatencyMS > 0 {
+			row.Latency = formatMS(live.LatencyMS)
+		}
+		if total := live.Sent + live.Failed; total > 0 {
+			row.Answered = formatPercent(float64(live.Sent)/float64(total)*100) + " %"
+			row.Errors = formatPercent(float64(live.Failed)/float64(total)*100) + " %"
+		}
+	}
+	return row
+}
+
+// handleUpstreams renders the upstreams screen.
+func (p *Panel) handleUpstreams(w http.ResponseWriter, r *http.Request) {
+	p.renderUpstreams(w, r, http.StatusOK, notice(r))
+}
+
+// renderUpstreams renders the page from the live config and status.
+func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status int, n manageNotice) {
+	view := upstreamsView{
+		manageNotice: n,
+		Domain:       p.pageDomain(),
+		CSRF:         p.manageCSRF(r),
+		Nav:          "upstreams",
+	}
+
+	cfg := p.currentConfig()
+	if cfg != nil {
+		view.Strategy = cfg.Strategy
+		st := p.statusSnapshot(r)
+		live := make(map[string]api.UpstreamStatus, len(st.Upstreams))
+		for _, u := range st.Upstreams {
+			live[u.ID] = u
+		}
+		view.Upstreams = make([]upstreamRow, 0, len(cfg.Upstreams))
+		for _, u := range cfg.Upstreams {
+			view.Upstreams = append(view.Upstreams, upstreamRowFor(u, live[u.ID]))
+		}
+	}
+
+	p.render(w, status, "upstreams", view)
+}
+
+// handleUpstreamToggle flips one upstream's enabled flag. The whole
+// config travels to UpdateConfig, which is what makes the daemon rebuild
+// (or, for a soft change, reapply) atomically.
+func (p *Panel) handleUpstreamToggle(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	next := cloneConfig(cfg)
+	found := false
+	for i := range next.Upstreams {
+		if next.Upstreams[i].ID != id {
+			continue
+		}
+		next.Upstreams[i].Enabled = !next.Upstreams[i].Enabled
+		found = true
+		break
+	}
+	if !found {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream не найден: " + id})
+		return
+	}
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamPriority saves the whole priority column at once, which
+// is the order a failover strategy walks.
+func (p *Panel) handleUpstreamPriority(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	for i := range next.Upstreams {
+		raw := strings.TrimSpace(r.PostFormValue("prio." + next.Upstreams[i].ID))
+		if raw == "" {
+			continue // a field the form did not carry keeps its value
+		}
+		priority, err := strconv.Atoi(raw)
+		if err != nil || priority < 0 {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+				Error: fmt.Sprintf("приоритет для «%s»: ожидается целое число не меньше нуля", next.Upstreams[i].ID),
+			})
+			return
+		}
+		next.Upstreams[i].Priority = priority
+	}
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=priority", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// ---- filters ------------------------------------------------------
+
+// filterListRow is one line of the block-list table.
+type filterListRow struct {
+	ID         string
+	Rules      string
+	Skipped    string
+	Updated    string
+	Title      string // the full error, kept in the row's tooltip
+	StateClass string
+	StateText  string
+}
+
+// filterModeOption is one block-mode radio.
+type filterModeOption struct {
+	Value   string
+	Label   string
+	Checked bool
+}
+
+// filterModes is the fixed set of block modes, in the order the engine
+// documents them (filter.config: zero | nxdomain | refused).
+var filterModes = []struct{ value, label string }{
+	{"zero", "zero (0.0.0.0 / ::)"},
+	{"nxdomain", "nxdomain (несуществующий домен)"},
+	{"refused", "refused (отказ)"},
+}
+
+// filterModeOptions marks the current mode.
+func filterModeOptions(current string) []filterModeOption {
+	opts := make([]filterModeOption, 0, len(filterModes))
+	for _, m := range filterModes {
+		opts = append(opts, filterModeOption{Value: m.value, Label: m.label, Checked: m.value == current})
+	}
+	return opts
+}
+
+// filterModeLabel is the short prose name of a mode, shared by the mode
+// radios and the topline.
+func filterModeLabel(mode string) string {
+	for _, m := range filterModes {
+		if m.value == mode {
+			return m.label
+		}
+	}
+	return mode
+}
+
+// validFilterMode reports whether mode is one the engine accepts.
+func validFilterMode(mode string) bool {
+	for _, m := range filterModes {
+		if m.value == mode {
+			return true
+		}
+	}
+	return false
+}
+
+// ruleForm is the state of the «add a rule» form, echoed back when a
+// submission is rejected so the admin does not retype it.
+type ruleForm struct {
+	Domain string
+	Kind   string
+}
+
+// filtersView is the whole filters page.
+type filtersView struct {
+	manageNotice
+	Domain string
+	CSRF   string
+	Nav    string
+
+	Enabled      bool
+	ModeLabel    string
+	TotalBlocked string
+
+	Lists []filterListRow
+	Modes []filterModeOption
+
+	Allow []string
+	Block []string
+
+	AddDomain string
+	AddKind   string
+}
+
+// handleFilters renders the filters screen.
+func (p *Panel) handleFilters(w http.ResponseWriter, r *http.Request) {
+	p.renderFilters(w, r, http.StatusOK, notice(r), ruleForm{Kind: "block"})
+}
+
+// renderFilters renders the page with the current config, the engine's
+// per-list status and the add-rule form's state.
+func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form ruleForm) {
+	view := filtersView{
+		manageNotice: n,
+		Domain:       p.pageDomain(),
+		CSRF:         p.manageCSRF(r),
+		Nav:          "filters",
+		AddDomain:    form.Domain,
+		AddKind:      form.Kind,
+	}
+
+	mode := "zero"
+	if cfg := p.currentConfig(); cfg != nil {
+		view.Enabled = cfg.Filter.Enabled
+		mode = cfg.Filter.Mode
+		view.Allow = cfg.Filter.UserAllow
+		view.Block = cfg.Filter.UserBlock
+	}
+	view.ModeLabel = filterModeLabel(mode)
+	view.Modes = filterModeOptions(mode)
+
+	if p.ctrl != nil {
+		if st := p.statusSnapshot(r); st.Filter.TotalBlocked > 0 {
+			view.TotalBlocked = formatCount(st.Filter.TotalBlocked)
+		}
+		for _, l := range p.ctrl.FilterStatus() {
+			view.Lists = append(view.Lists, filterListRowFor(l))
+		}
+	}
+
+	p.render(w, status, "filters", view)
+}
+
+// filterListRowFor renders one list's live state.
+func filterListRowFor(l filter.ListStatus) filterListRow {
+	row := filterListRow{
+		ID:      l.ID,
+		Rules:   formatCount(uint64(l.Applied)),
+		Skipped: formatCount(uint64(l.Skipped)),
+		Updated: "—",
+	}
+	if !l.UpdatedAt.IsZero() {
+		row.Updated = l.UpdatedAt.Format("02.01 15:04:05")
+	}
+
+	switch {
+	case l.Error != "":
+		row.StateClass, row.StateText, row.Title = "err", "ошибка", l.Error
+	case l.UpdatedAt.IsZero():
+		row.StateClass, row.StateText = "warn", "не загружен"
+	default:
+		row.StateClass, row.StateText = "ok", "ок"
+	}
+	return row
+}
+
+// handleFiltersRefresh starts reloading one block list, or every list
+// when the posted id is empty. The work runs in the background: the DoH
+// listener's 10 s write timeout would otherwise truncate the response
+// and cancel the update mid-loop, leaving some lists refreshed and some
+// not. The POST redirects at once with «обновление запущено»; a second
+// POST while the update runs is refused with a banner.
+func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
+	if p.ctrl == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	started := p.refresh.start(func() {
+		// The update runs outside net/http's per-request recover, so a
+		// panicking controller would otherwise take the daemon down.
+		// Recover first (innermost defer) so the single-flight reset
+		// registered by start still runs after the panic is contained.
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("panel: block list refresh panicked",
+					"id", id, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
+		if err := p.ctrl.FilterUpdate(context.Background(), id); err != nil {
+			p.logger.Warn("panel: refreshing block lists", "id", id, "error", err)
+			return
+		}
+		p.logger.Info("panel: block lists refreshed", "id", id)
+	})
+	if !started {
+		p.renderFilters(w, r, http.StatusConflict,
+			manageNotice{Error: "обновление уже идёт"}, ruleForm{Kind: "block"})
+		return
+	}
+	http.Redirect(w, r, filtersPath+"?ok=lists", http.StatusSeeOther)
+}
+
+// handleFilterMode switches the block mode through the whole config.
+func (p *Panel) handleFilterMode(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		return
+	}
+
+	mode := strings.TrimSpace(r.PostFormValue("mode"))
+	if !validFilterMode(mode) {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный режим блокировки: " + mode}, ruleForm{Kind: "block"})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	next.Filter.Mode = mode
+	p.finishApply(w, r, next, filtersPath+"?ok=mode", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, ruleForm{Kind: "block"})
+	})
+}
+
+// handleFilterRuleAdd appends one user rule to the allow or block list.
+func (p *Panel) handleFilterRuleAdd(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		return
+	}
+
+	kind := r.PostFormValue("kind")
+	raw := strings.TrimSpace(r.PostFormValue("domain"))
+	form := ruleForm{Domain: raw, Kind: kind}
+	if kind != "allow" && kind != "block" {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
+		return
+	}
+	domain := dnsname.Normalize(raw)
+	if domain == "" {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "Укажите домен"}, form)
+		return
+	}
+	if !dnsname.Valid(domain) {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{
+			Error: fmt.Sprintf("«%s» — не домен: нужно минимум две метки, только буквы, цифры и дефис", raw),
+		}, form)
+		return
+	}
+
+	next := cloneConfig(cfg)
+	if kind == "allow" {
+		next.Filter.UserAllow = appendRule(next.Filter.UserAllow, domain)
+	} else {
+		next.Filter.UserBlock = appendRule(next.Filter.UserBlock, domain)
+	}
+
+	p.finishApply(w, r, next, filtersPath+"?ok=rule", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, form)
+	})
+}
+
+// handleFilterRuleRemove drops one user rule from its list.
+func (p *Panel) handleFilterRuleRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		return
+	}
+
+	kind := r.PostFormValue("kind")
+	domain := dnsname.Normalize(strings.TrimSpace(r.PostFormValue("domain")))
+	form := ruleForm{Domain: domain, Kind: kind}
+	if kind != "allow" && kind != "block" {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
+		return
+	}
+
+	next := cloneConfig(cfg)
+	if kind == "allow" {
+		next.Filter.UserAllow = deleteRule(next.Filter.UserAllow, domain)
+	} else {
+		next.Filter.UserBlock = deleteRule(next.Filter.UserBlock, domain)
+	}
+
+	p.finishApply(w, r, next, filtersPath+"?ok=rule", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, form)
+	})
+}
+
+// appendRule adds domain unless it is already present, so a double
+// submission cannot store the same rule twice.
+func appendRule(rules []string, domain string) []string {
+	for _, r := range rules {
+		if r == domain {
+			return rules
+		}
+	}
+	return append(rules, domain)
+}
+
+// deleteRule removes every occurrence of domain. It builds a fresh
+// slice instead of filtering in place, so it never mutates the argument:
+// the caller's clone and the daemon's own slice stay untouched even if
+// this helper is reused beyond the current form flow.
+func deleteRule(rules []string, domain string) []string {
+	out := make([]string, 0, len(rules))
+	for _, r := range rules {
+		if r != domain {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ---- settings -----------------------------------------------------
+
+// protocolField names one listener protocol and its form prefix.
+type protocolField struct {
+	field string
+	label string
+}
+
+// protocolFields is the fixed protocol list of the settings form.
+var protocolFields = []protocolField{
+	{"plain", "Обычный DNS (UDP/TCP)"},
+	{"doh", "DoH (HTTPS)"},
+	{"dot", "DoT (TLS)"},
+	{"doq", "DoQ (QUIC)"},
+}
+
+// protocolRow is one protocol's controls in the form.
+type protocolRow struct {
+	Field   string
+	Label   string
+	Enabled bool
+	Port    string
+}
+
+// strategyOption is one routing strategy in the select. A strategy the
+// config validation rejects (an admin typed it into the file) is
+// preserved as an extra option so a rejected save does not silently
+// rewrite it.
+type strategyOption struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
+// strategies is the set routing knows, with the prose the mockup uses.
+var strategies = []struct{ value, label string }{
+	{"fastest", "fastest — по задержке"},
+	{"failover", "failover — по приоритету"},
+	{"round_robin", "round_robin — по кругу"},
+	{"random", "random — случайно"},
+}
+
+// strategyOptions marks the current strategy, appending an unknown one.
+func strategyOptions(current string) []strategyOption {
+	opts := make([]strategyOption, 0, len(strategies)+1)
+	known := false
+	for _, s := range strategies {
+		if s.value == current {
+			known = true
+		}
+		opts = append(opts, strategyOption{Value: s.value, Label: s.label, Selected: s.value == current})
+	}
+	if current != "" && !known {
+		opts = append([]strategyOption{{Value: current, Label: current + " (неизвестная)", Selected: true}}, opts...)
+	}
+	return opts
+}
+
+// settingsView is the whole settings page. Its string fields hold what
+// the form shows, which on a rejected submission is what the admin
+// typed, not what the daemon stores.
+type settingsView struct {
+	manageNotice
+	Domain string
+	CSRF   string
+	Nav    string
+
+	FormDomain string
+	Strategies []strategyOption
+
+	Protocols []protocolRow
+
+	CacheSize      string
+	CacheMinTTL    string
+	CacheMaxTTL    string
+	PlainRPS       string
+	FilterEnabled  bool
+	FilterInterval string
+}
+
+// settingsFromConfig fills the form from the live configuration.
+func settingsFromConfig(cfg *config.Config) settingsView {
+	view := settingsView{
+		FormDomain:     cfg.Domain,
+		CacheSize:      strconv.Itoa(cfg.Cache.Size),
+		CacheMinTTL:    strconv.FormatUint(uint64(cfg.Cache.MinTTL), 10),
+		CacheMaxTTL:    strconv.FormatUint(uint64(cfg.Cache.MaxTTL), 10),
+		PlainRPS:       strconv.Itoa(cfg.Limits.PlainRPSPerIP),
+		FilterEnabled:  cfg.Filter.Enabled,
+		FilterInterval: strconv.Itoa(cfg.Filter.UpdateIntervalHours),
+	}
+	protocols := map[string]config.Protocol{
+		"plain": cfg.Protocols.Plain,
+		"doh":   cfg.Protocols.DoH,
+		"dot":   cfg.Protocols.DoT,
+		"doq":   cfg.Protocols.DoQ,
+	}
+	for _, f := range protocolFields {
+		p := protocols[f.field]
+		view.Protocols = append(view.Protocols, protocolRow{
+			Field: f.field, Label: f.label, Enabled: p.Enabled, Port: strconv.Itoa(p.Port),
+		})
+	}
+	view.Strategies = strategyOptions(cfg.Strategy)
+	return view
+}
+
+// settingsFromForm fills the form from a submission, so a rejected save
+// shows the values the admin typed.
+func settingsFromForm(r *http.Request) settingsView {
+	view := settingsView{
+		FormDomain:     r.PostFormValue("domain"),
+		Strategies:     strategyOptions(strings.TrimSpace(r.PostFormValue("strategy"))),
+		CacheSize:      strings.TrimSpace(r.PostFormValue("cache.size")),
+		CacheMinTTL:    strings.TrimSpace(r.PostFormValue("cache.min_ttl")),
+		CacheMaxTTL:    strings.TrimSpace(r.PostFormValue("cache.max_ttl")),
+		PlainRPS:       strings.TrimSpace(r.PostFormValue("limits.plain_rps_per_ip")),
+		FilterEnabled:  r.PostFormValue("filter.enabled") != "",
+		FilterInterval: strings.TrimSpace(r.PostFormValue("filter.update_interval_hours")),
+	}
+	for _, f := range protocolFields {
+		view.Protocols = append(view.Protocols, protocolRow{
+			Field:   f.field,
+			Label:   f.label,
+			Enabled: r.PostFormValue(f.field+".enabled") != "",
+			Port:    strings.TrimSpace(r.PostFormValue(f.field + ".port")),
+		})
+	}
+	return view
+}
+
+// handleSettings renders the settings screen.
+func (p *Panel) handleSettings(w http.ResponseWriter, r *http.Request) {
+	var view settingsView
+	if cfg := p.currentConfig(); cfg != nil {
+		view = settingsFromConfig(cfg)
+	}
+	p.renderSettings(w, r, http.StatusOK, notice(r), view)
+}
+
+// renderSettings renders the page with the given form state.
+func (p *Panel) renderSettings(w http.ResponseWriter, r *http.Request, status int, n manageNotice, view settingsView) {
+	view.manageNotice = n
+	view.Domain = p.pageDomain()
+	view.CSRF = p.manageCSRF(r)
+	view.Nav = "settings"
+	p.render(w, status, "settings", view)
+}
+
+// handleSettingsApply rewrites the editable configuration fields and
+// hands the full config to UpdateConfig.
+func (p *Panel) handleSettingsApply(w http.ResponseWriter, r *http.Request) {
+	// A structural change rebuilds listeners and can take seconds; the
+	// 10 s listener write timeout would cut the response after the
+	// daemon already applied the config. Accept a client-side timeout
+	// instead of a truncated server answer.
+	clearWriteDeadline(w)
+
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderSettings(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, settingsFromForm(r))
+		return
+	}
+
+	view := settingsFromForm(r)
+	next := cloneConfig(cfg)
+	if err := applySettingsForm(next, r); err != nil {
+		p.renderSettings(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()}, view)
+		return
+	}
+	p.finishApply(w, r, next, settingsPath+"?ok=settings", func(status int, n manageNotice) {
+		p.renderSettings(w, r, status, n, view)
+	})
+}
+
+// applySettingsForm parses the settings form onto next. Parsing failures
+// (a non-numeric port) are reported here; everything semantic — port
+// ranges, known strategy, TTL order — is left to config.Validate, which
+// UpdateConfig runs, so the page and the daemon cannot disagree.
+func applySettingsForm(next *config.Config, r *http.Request) error {
+	domain := strings.TrimSpace(r.PostFormValue("domain"))
+	if domain == "" {
+		return errors.New("домен не может быть пустым")
+	}
+	next.Domain = domain
+
+	for _, f := range protocolFields {
+		port, err := formInt(r, f.field+".port")
+		if err != nil {
+			return fmt.Errorf("порт %s: %w", f.label, err)
+		}
+		setProtocol(next, f.field, r.PostFormValue(f.field+".enabled") != "", port)
+	}
+
+	next.Strategy = strings.TrimSpace(r.PostFormValue("strategy"))
+
+	size, err := formInt(r, "cache.size")
+	if err != nil {
+		return fmt.Errorf("размер кеша: %w", err)
+	}
+	next.Cache.Size = size
+
+	minTTL, err := formUint32(r, "cache.min_ttl")
+	if err != nil {
+		return fmt.Errorf("кеш: min TTL: %w", err)
+	}
+	maxTTL, err := formUint32(r, "cache.max_ttl")
+	if err != nil {
+		return fmt.Errorf("кеш: max TTL: %w", err)
+	}
+	next.Cache.MinTTL, next.Cache.MaxTTL = minTTL, maxTTL
+
+	rps, err := formInt(r, "limits.plain_rps_per_ip")
+	if err != nil {
+		return fmt.Errorf("лимит запросов на IP: %w", err)
+	}
+	next.Limits.PlainRPSPerIP = rps
+
+	next.Filter.Enabled = r.PostFormValue("filter.enabled") != ""
+	interval, err := formInt(r, "filter.update_interval_hours")
+	if err != nil {
+		return fmt.Errorf("интервал обновления списков: %w", err)
+	}
+	next.Filter.UpdateIntervalHours = interval
+	return nil
+}
+
+// setProtocol writes one protocol row.
+func setProtocol(cfg *config.Config, field string, enabled bool, port int) {
+	p := config.Protocol{Enabled: enabled, Port: port}
+	switch field {
+	case "plain":
+		cfg.Protocols.Plain = p
+	case "doh":
+		cfg.Protocols.DoH = p
+	case "dot":
+		cfg.Protocols.DoT = p
+	case "doq":
+		cfg.Protocols.DoQ = p
+	}
+}
+
+// formInt parses a required integer form field.
+func formInt(r *http.Request, field string) (int, error) {
+	raw := strings.TrimSpace(r.PostFormValue(field))
+	if raw == "" {
+		return 0, errors.New("ожидается число")
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New("ожидается число")
+	}
+	return n, nil
+}
+
+// formUint32 parses a required unsigned form field.
+func formUint32(r *http.Request, field string) (uint32, error) {
+	raw := strings.TrimSpace(r.PostFormValue(field))
+	if raw == "" {
+		return 0, errors.New("ожидается целое число")
+	}
+	n, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil {
+		return 0, errors.New("ожидается целое число не меньше нуля")
+	}
+	return uint32(n), nil
+}
+
+// handlePasswordChange hashes the new panel password and stores only the
+// hash. The live sessions are deliberately left alone (Options.Auth
+// documents that), so the admin stays signed in in the tab they used.
+func (p *Panel) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderSettings(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, settingsView{})
+		return
+	}
+
+	view := settingsFromConfig(cfg)
+	fail := func(msg string) {
+		p.renderSettings(w, r, http.StatusBadRequest, manageNotice{Error: msg}, view)
+	}
+
+	password := r.PostFormValue("password")
+	if err := auth.ValidatePassword(password); err != nil {
+		// Same shared rule and wording as the setup wizard: at least
+		// auth.MinPasswordLen runes and no leading/trailing whitespace.
+		switch {
+		case errors.Is(err, auth.ErrPasswordWhitespace):
+			fail("пароль не должен начинаться или заканчиваться пробелом")
+		case errors.Is(err, auth.ErrPasswordTooShort):
+			fail(fmt.Sprintf("пароль должен быть не короче %d символов", auth.MinPasswordLen))
+		default:
+			fail(err.Error())
+		}
+		return
+	}
+	if password != r.PostFormValue("password2") {
+		fail("пароли не совпадают")
+		return
+	}
+
+	hash, err := auth.HashPassword(password)
+	if err != nil {
+		p.logger.Error("panel: hashing the new password", "error", err)
+		fail("не удалось захешировать пароль")
+		return
+	}
+
+	next := cloneConfig(cfg)
+	next.Panel.PasswordHash = hash
+	p.finishApply(w, r, next, settingsPath+"?ok=password", func(status int, n manageNotice) {
+		p.renderSettings(w, r, status, n, view)
+	})
+}
+
+// ---- certificate --------------------------------------------------
+
+// certPageView is the read-only certificate page: the live state from the
+// daemon plus the TLS mode the config selects.
+type certPageView struct {
+	manageNotice
+	Domain string
+	CSRF   string
+	Nav    string
+
+	Show       bool
+	StateClass string
+	StateText  string
+	Issuer     string
+	NotAfter   string
+	LastCheck  string
+	Error      string
+
+	TLSMode       string
+	CertFile      string
+	KeyFile       string
+	ACMEProvider  string
+	ACMEEmail     string
+	ACMEDirectory string
+}
+
+// handleCert renders the certificate page.
+func (p *Panel) handleCert(w http.ResponseWriter, r *http.Request) {
+	view := certPageView{
+		manageNotice: notice(r),
+		Domain:       p.pageDomain(),
+		CSRF:         p.manageCSRF(r),
+		Nav:          "cert",
+	}
+
+	if cfg := p.currentConfig(); cfg != nil {
+		view.TLSMode = cfg.TLS.Mode
+		view.CertFile = cfg.TLS.CertFile
+		view.KeyFile = cfg.TLS.KeyFile
+		view.ACMEProvider = cfg.TLS.ACME.Provider
+		view.ACMEEmail = cfg.TLS.ACME.Email
+		if dir, err := cfg.TLS.ACMEDirectoryURL(); err == nil {
+			view.ACMEDirectory = dir
+		}
+	}
+
+	fillCertView(&view, p.statusSnapshot(r).Cert)
+	p.render(w, http.StatusOK, "cert", view)
+}
+
+// fillCertView copies the certificate snapshot into the page. It shares
+// certStateLabel with the status page, so both name a state the same way.
+func fillCertView(view *certPageView, c tlscert.Status) {
+	if c.Mode == "" {
+		view.StateText = "нет данных"
+		return
+	}
+
+	view.Show = true
+	view.Issuer = c.Issuer
+	view.Error = c.Error
+	class, label, known := certStateLabel(c.State)
+	if !known {
+		view.StateClass, view.StateText = c.State, c.Mode
+	} else {
+		view.StateClass, view.StateText = class, label
+	}
+	if !c.NotAfter.IsZero() {
+		view.NotAfter = c.NotAfter.Format("02.01.2006")
+	}
+	if !c.LastCheck.IsZero() {
+		view.LastCheck = c.LastCheck.Format("02.01.2006 15:04:05")
+	}
+}
+
+// ---- maintenance --------------------------------------------------
+
+// maintenanceView is the maintenance page.
+type maintenanceView struct {
+	manageNotice
+	Domain  string
+	CSRF    string
+	Nav     string
+	Version string
+	Uptime  string
+	Started string
+}
+
+// handleMaintenance renders the maintenance screen.
+func (p *Panel) handleMaintenance(w http.ResponseWriter, r *http.Request) {
+	p.renderMaintenance(w, r, http.StatusOK, notice(r))
+}
+
+// renderMaintenance renders the page.
+func (p *Panel) renderMaintenance(w http.ResponseWriter, r *http.Request, status int, n manageNotice) {
+	view := maintenanceView{
+		manageNotice: n,
+		Domain:       p.pageDomain(),
+		CSRF:         p.manageCSRF(r),
+		Nav:          "maintenance",
+		Version:      p.version,
+	}
+	if p.ctrl != nil {
+		if started := p.ctrl.Started(); !started.IsZero() {
+			view.Started = started.Format("02.01.2006 15:04:05")
+			view.Uptime = formatUptime(time.Since(started))
+		}
+	}
+	p.render(w, status, "maintenance", view)
+}
+
+// handleConfigDownload streams the live configuration as a pretty JSON
+// attachment. The file carries the panel password hash and the ACME EAB
+// HMAC — the page says so, and the response is no-store.
+func (p *Panel) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		http.Error(w, errNoDaemon.Error(), http.StatusServiceUnavailable)
+		return
+	}
+
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		p.logger.Error("panel: serializing the config", "error", err)
+		http.Error(w, "не удалось сериализовать конфигурацию", http.StatusInternalServerError)
+		return
+	}
+	data = append(data, '\n')
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="mdns-config.json"`)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(data); err != nil {
+		p.logger.Warn("panel: writing the config download", "error", err)
+	}
+}
+
+// handleReapply pushes the current configuration back through
+// UpdateConfig: a soft reapply, the web twin of the TUI's "apply again".
+func (p *Panel) handleReapply(w http.ResponseWriter, r *http.Request) {
+	// Same reason as handleSettingsApply: a reapply may rebuild the
+	// daemon's listeners, which outlives the listener's write timeout.
+	clearWriteDeadline(w)
+
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	p.finishApply(w, r, next, maintenancePath+"?ok=reapply", func(status int, n manageNotice) {
+		p.renderMaintenance(w, r, status, n)
+	})
+}
+
+// formatUptime renders a duration the mockup's way: "3 дня 4 ч", falling
+// back to hours and minutes for a young process.
+func formatUptime(d time.Duration) string {
+	if d < time.Minute {
+		return "меньше минуты"
+	}
+	days := int(d / (24 * time.Hour))
+	hours := int(d/time.Hour) % 24
+	minutes := int(d/time.Minute) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%d %s %d ч", days, pluralDays(days), hours)
+	case hours > 0:
+		return fmt.Sprintf("%d ч %d мин", hours, minutes)
+	default:
+		return fmt.Sprintf("%d мин", minutes)
+	}
+}
+
+// pluralDays is the Russian plural of "день".
+func pluralDays(n int) string {
+	switch {
+	case n%10 == 1 && n%100 != 11:
+		return "день"
+	case n%10 >= 2 && n%10 <= 4 && (n%100 < 10 || n%100 >= 20):
+		return "дня"
+	default:
+		return "дней"
+	}
+}

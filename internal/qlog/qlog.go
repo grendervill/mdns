@@ -9,10 +9,14 @@ package qlog
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// maxQueryLimit caps one page of Query results.
+const maxQueryLimit = 500
 
 // Entry is one resolved query. Blocked and BlockSource are filled by
 // the filtering engine; other components leave them zero.
@@ -28,6 +32,16 @@ type Entry struct {
 	CacheHit    bool      `json:"cache_hit"`
 	Blocked     bool      `json:"blocked,omitempty"`
 	BlockSource string    `json:"block_source,omitempty"`
+}
+
+// Query filters the ring and returns one page of matches, newest
+// entries first. A zero value matches everything.
+type Query struct {
+	Search   string // case-insensitive substring of qname, upstream ID or client IP
+	Outcome  string // "" | cached | blocked | upstream | error
+	Proto    string // "" | udp | tcp | doh | dot | doq
+	Client   string // exact client IP or ""
+	Upstream string // exact upstream ID or ""
 }
 
 // Log is safe for concurrent use.
@@ -132,6 +146,114 @@ func (l *Log) Recent(n int) []Entry {
 		out = append(out, l.buf[idx])
 	}
 	return out
+}
+
+// Query filters the ring (newest entries first) and returns one page
+// of matches along with the total number of entries that matched the
+// filter. The live ring is snapshotted under the mutex; filtering and
+// paging then run on that copy after the lock is released, so a UI
+// page fetch never holds up Add (which keeps the mutex across its disk
+// write). The returned page is a slice of the copy and never aliases
+// the ring.
+//
+// The filters are:
+//
+//   - Search is a case-insensitive substring match against the query
+//     name, the upstream ID and the client IP.
+//   - Outcome, when set, is one of "cached", "blocked", "upstream" or
+//     "error" (see outcome).
+//   - Proto, Client and Upstream, when set, must match exactly.
+//
+// limit is clamped to [1, 500]; a negative offset is treated as zero.
+// An offset at or past the total returns an empty page together with
+// the untouched total.
+func (l *Log) Query(q Query, offset, limit int) (entries []Entry, total int) {
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > maxQueryLimit {
+		limit = maxQueryLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	// Snapshot the live ring, newest first, under the lock. Copying is
+	// O(live); the filter below is not, so it runs unlocked.
+	l.mu.Lock()
+	count := l.next
+	if l.filled {
+		count = len(l.buf)
+	}
+	snapshot := make([]Entry, count)
+	for i := 0; i < count; i++ {
+		snapshot[i] = l.buf[(l.next-1-i+len(l.buf))%len(l.buf)]
+	}
+	l.mu.Unlock()
+
+	// Filter in place over the private snapshot.
+	search := strings.ToLower(q.Search)
+	matched := snapshot[:0]
+	for _, e := range snapshot {
+		if matches(e, q, search) {
+			matched = append(matched, e)
+		}
+	}
+
+	total = len(matched)
+	if offset >= total {
+		return nil, total
+	}
+
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return matched[offset:end], total
+}
+
+// matches reports whether e satisfies q; search is the already
+// lower-cased Search term.
+func matches(e Entry, q Query, search string) bool {
+	if q.Outcome != "" && outcome(e) != q.Outcome {
+		return false
+	}
+	if q.Proto != "" && e.Proto != q.Proto {
+		return false
+	}
+	if q.Client != "" && e.ClientIP != q.Client {
+		return false
+	}
+	if q.Upstream != "" && e.Upstream != q.Upstream {
+		return false
+	}
+	if search != "" {
+		return strings.Contains(strings.ToLower(e.QName), search) ||
+			strings.Contains(strings.ToLower(e.Upstream), search) ||
+			strings.Contains(strings.ToLower(e.ClientIP), search)
+	}
+	return true
+}
+
+// outcome classifies one entry by how its answer was produced. The
+// order matters: a blocked request stays blocked even when a cached
+// answer was served, a cache hit outranks an upstream lookup, and an
+// entry with neither a cache nor an upstream source failed (for
+// example, every upstream was down and the answer was SERVFAIL).
+//
+// This mirrors the classification the stats package will need; R7
+// deliberately accepts that duplication.
+func outcome(e Entry) string {
+	switch {
+	case e.Blocked:
+		return "blocked"
+	case e.CacheHit:
+		return "cached"
+	case e.Upstream != "":
+		return "upstream"
+	default:
+		return "error"
+	}
 }
 
 // Close closes the file sink; it is safe to call more than once.

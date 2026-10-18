@@ -16,6 +16,7 @@ const (
 	inputNone inputMode = iota
 	inputRule
 	inputSettingsField
+	inputRequestsFilter
 )
 
 // nextBlockMode cycles the block mode.

@@ -37,6 +37,22 @@ type Filter interface {
 	Check(qname string) (blocked bool, source string)
 }
 
+// Observer receives every recorded query, after the entry has reached
+// the query log. It is the pipeline's counterpart of qlog's observer
+// hook: a component that outlives a runtime generation (the stats
+// collector) is fed here even when its generation is rebuilt. SetObserver
+// installs one; a nil observer disables the hook.
+type Observer interface {
+	Observe(qlog.Entry)
+}
+
+// observerSlot boxes the observer so it can live behind an atomic
+// pointer: SetObserver runs on a configuration change while Resolve
+// reads the hook on every request.
+type observerSlot struct {
+	observer Observer
+}
+
 // Core is safe for concurrent use.
 type Core struct {
 	resolver Resolver
@@ -44,6 +60,8 @@ type Core struct {
 	log      *qlog.Log
 	filter   Filter
 	logger   *slog.Logger
+
+	observer atomic.Pointer[observerSlot]
 
 	blockMode atomic.Value // string: zero | nxdomain | refused
 }
@@ -63,6 +81,16 @@ func New(r Resolver, c *cache.Cache, l *qlog.Log, f Filter, mode string, logger 
 // SetBlockMode replaces the answer mode for blocked names live.
 func (c *Core) SetBlockMode(mode string) {
 	c.blockMode.Store(mode)
+}
+
+// SetObserver installs the callback invoked after every recorded query;
+// nil removes it. It is safe to call while requests are in flight.
+func (c *Core) SetObserver(o Observer) {
+	if o == nil {
+		c.observer.Store(nil)
+		return
+	}
+	c.observer.Store(&observerSlot{observer: o})
 }
 
 // Resolve answers one request and always returns a message: internal
@@ -181,4 +209,10 @@ func (c *Core) record(req *dns.Msg, meta Meta, resp *dns.Msg, u *upstream.Upstre
 		e.Upstream = u.ID
 	}
 	c.log.Add(e)
+
+	// The observer runs after the entry reached the log, so a slow
+	// collector cannot hold a query out of the ring.
+	if s := c.observer.Load(); s != nil {
+		s.observer.Observe(e)
+	}
 }

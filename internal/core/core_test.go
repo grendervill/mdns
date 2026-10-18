@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 
@@ -15,6 +16,7 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/core"
 	"mydns/internal/qlog"
+	"mydns/internal/stats"
 	"mydns/internal/testutil/scripted"
 	"mydns/internal/upstream"
 )
@@ -400,5 +402,77 @@ func TestLogEntryFields(t *testing.T) {
 	}
 	if e.LatencyMS < 0 {
 		t.Errorf("LatencyMS = %v, want >= 0", e.LatencyMS)
+	}
+}
+
+// TestCoreObserves is the integration check of the observer hook: a
+// real run through the pipeline (filter, cache, upstream) feeds the
+// stats collector on the same path that appends to the query log.
+func TestCoreObserves(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return answer(req), testUpstream(t), nil
+	}}
+	adsOnly := &fakeFilter{fn: func(qname string) (bool, string) {
+		return strings.HasPrefix(qname, "ads."), "list-1"
+	}}
+	c, _, l := newTestCoreFilter(t, res, adsOnly, "zero")
+
+	collector := stats.NewCollector()
+	c.SetObserver(collector)
+
+	meta := core.Meta{Proto: "udp", ClientIP: netip.MustParseAddr("192.0.2.1")}
+	c.Resolve(context.Background(), query("ads.example.com"), meta) // blocked
+	c.Resolve(context.Background(), query("example.com"), meta)     // forwarded to u1
+	c.Resolve(context.Background(), query("example.com"), meta)     // served from the cache
+
+	if got := len(l.Recent(10)); got != 3 {
+		t.Fatalf("query log holds %d entries, want 3", got)
+	}
+
+	snap := collector.Snapshot()
+	if snap.Total != 3 {
+		t.Errorf("Total = %d, want 3", snap.Total)
+	}
+	want := map[string]uint64{"blocked": 1, "upstream": 1, "cached": 1, "error": 0}
+	if len(snap.Outcomes) != len(want) {
+		t.Errorf("Outcomes = %v, want %v", snap.Outcomes, want)
+	}
+	for k, w := range want {
+		if snap.Outcomes[k] != w {
+			t.Errorf("Outcomes[%q] = %d, want %d", k, snap.Outcomes[k], w)
+		}
+	}
+	if snap.Protos["udp"] != 3 {
+		t.Errorf("Protos = %v, want udp counted 3 times", snap.Protos)
+	}
+	if snap.Upstreams["u1"] != 1 {
+		t.Errorf("Upstreams = %v, want u1 counted once", snap.Upstreams)
+	}
+	if len(snap.Clients) != 1 || snap.Clients[0].IP != "192.0.2.1" || snap.Clients[0].Count != 3 {
+		t.Errorf("Clients = %+v, want one row 192.0.2.1 with 3", snap.Clients)
+	}
+}
+
+// TestCoreObserverOptional checks the nil cases: a core with no
+// observer resolves as usual, and SetObserver(nil) detaches one.
+func TestCoreObserverOptional(t *testing.T) {
+	res := &fakeResolver{fn: func(req *dns.Msg) (*dns.Msg, *upstream.Upstream, error) {
+		return answer(req), testUpstream(t), nil
+	}}
+	c, _, _ := newTestCore(t, res)
+
+	meta := core.Meta{Proto: "udp"}
+	// No observer installed yet: must not panic.
+	c.Resolve(context.Background(), query("before.example.com"), meta)
+
+	collector := stats.NewCollector()
+	c.SetObserver(collector)
+	c.Resolve(context.Background(), query("observed.example.com"), meta)
+
+	c.SetObserver(nil)
+	c.Resolve(context.Background(), query("after.example.com"), meta)
+
+	if got := collector.Snapshot().Total; got != 1 {
+		t.Errorf("observed queries = %d, want 1", got)
 	}
 }

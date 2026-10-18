@@ -169,6 +169,14 @@ type FilterConfig struct {
 	UserBlock           []string     `json:"user_block"`
 }
 
+// PanelConfig configures the web panel. PasswordHash is the admin
+// password stored as an argon2id PHC string and is required when the
+// panel is enabled.
+type PanelConfig struct {
+	Enabled      bool   `json:"enabled"`
+	PasswordHash string `json:"password_hash,omitempty"` // argon2id, PHC format
+}
+
 // Config is the versioned server configuration, stored as JSON with
 // 0600 permissions.
 type Config struct {
@@ -183,6 +191,7 @@ type Config struct {
 	Log       LogConfig        `json:"log"`
 	DataDir   string           `json:"data_dir"`
 	Filter    FilterConfig     `json:"filter"`
+	Panel     PanelConfig      `json:"panel,omitempty"`
 }
 
 // strategies is the set of routing strategy names.
@@ -213,9 +222,10 @@ var tlsTransports = map[string]bool{
 // their standard ports (53, 443, 853, 853), a self-signed certificate,
 // the fastest routing strategy, a 10000-entry cache with TTL clamp
 // 0..86400, 50 rps per IP on plain DNS, a 10000-entry in-memory query
-// log (JSONL file off, rotation at 10 MB), data under /var/lib/mdns and
-// the filter engine off (dnsserver-style zero answers once enabled).
-// The domain is a placeholder; the setup wizard sets the real one.
+// log (JSONL file off, rotation at 10 MB), data under /var/lib/mdns,
+// the filter engine off (dnsserver-style zero answers once enabled) and
+// the web panel off. The domain is a placeholder; the setup wizard sets
+// the real one.
 func Default() *Config {
 	return &Config{
 		Version: 1,
@@ -236,6 +246,7 @@ func Default() *Config {
 			Mode:                "zero",
 			UpdateIntervalHours: 24,
 		},
+		Panel: PanelConfig{Enabled: false},
 	}
 }
 
@@ -269,8 +280,9 @@ func (c *Config) applyDefaults() {
 
 // Validate checks the config for consistency: domain shape, port ranges,
 // known strategy and TLS mode (including the ACME settings when that
-// mode is selected), upstream fields, data directory and the filter
-// settings. Disabled upstreams are exempt from address validation.
+// mode is selected), upstream fields, data directory, the filter
+// settings and the panel password. Disabled upstreams are exempt from
+// address validation, as is the panel password when the panel is off.
 func (c *Config) Validate() error {
 	if c.Domain == "" {
 		return errors.New("domain must not be empty")
@@ -359,6 +371,17 @@ func (c *Config) Validate() error {
 			if !dnsname.Valid(dnsname.Normalize(r)) {
 				return fmt.Errorf("filter rule %q must be a domain with at least two labels", r)
 			}
+		}
+	}
+
+	// The panel password is only meaningful when the panel runs; the
+	// full hash verification happens later, at login.
+	if c.Panel.Enabled {
+		if c.Panel.PasswordHash == "" {
+			return errors.New("panel: password_hash must not be empty when the panel is enabled")
+		}
+		if !strings.HasPrefix(c.Panel.PasswordHash, "$argon2id$") {
+			return errors.New("panel: password_hash must be an argon2id PHC hash")
 		}
 	}
 

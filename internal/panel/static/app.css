@@ -1,0 +1,571 @@
+/* mdns web panel — base styles.
+ *
+ * The tokens and core layout follow the approved mockup
+ * (.superpowers/mockups/web-panel.html, v2): an ink-blue background,
+ * a copper accent, status colours reserved for states, system fonts
+ * only, and no shadows. Later tasks build the status, history and
+ * management screens on top of this file, so the shell (rail + main),
+ * buttons and tags live here once.
+ */
+
+:root {
+  --ink: #101720;
+  --ink-2: #151E2A;
+  --ink-3: #1B2635;
+  --line: #28364a;
+  --line-soft: #1f2b3c;
+  --text: #E9EEF6;
+  --muted: #8FA0B5;
+  --copper: #C97B4A;
+  --copper-2: #E09159;
+  --ok: #5FBE8C;
+  --warn: #DEAE62;
+  --err: #D9716A;
+  --serif: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --r: 8px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ink);
+  color: var(--text);
+  font: 15px/1.5 var(--sans);
+}
+
+a { color: var(--copper-2); }
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--copper-2);
+  outline-offset: 2px;
+}
+
+/* ---- shell ------------------------------------------------------ */
+
+.shell {
+  display: grid;
+  grid-template-columns: 216px 1fr;
+  min-height: 100vh;
+}
+.rail {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--line);
+  padding: 20px 14px;
+  background: var(--ink-2);
+}
+.brand {
+  font: 600 20px/1 var(--serif);
+  padding: 6px 10px 18px;
+  border-bottom: 1px solid var(--line-soft);
+  margin-bottom: 12px;
+}
+.brand small {
+  display: block;
+  font: 400 12px/1.4 var(--sans);
+  color: var(--muted);
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+.nav { display: flex; flex-direction: column; }
+.nav a {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border-radius: var(--r);
+  color: var(--text);
+  text-decoration: none;
+  margin: 2px 0;
+}
+.nav a:hover { background: var(--ink-3); }
+.nav a.on {
+  background: var(--ink-3);
+  box-shadow: inset 2px 0 0 var(--copper);
+}
+.rail-foot { margin-top: auto; padding-top: 16px; }
+
+.main { padding: 26px 30px; min-width: 0; }
+.topline {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 20px;
+  margin-bottom: 18px;
+}
+.topline h2 { font: 600 24px/1.2 var(--serif); margin: 0; }
+.state { color: var(--muted); font-size: 13px; }
+.state b { color: var(--text); font-weight: 600; }
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  margin-right: 7px;
+  vertical-align: 1px;
+}
+
+h3 { font: 600 13px/1 var(--sans); color: var(--muted); margin: 26px 0 10px; }
+
+/* ---- primitives ------------------------------------------------- */
+
+.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 0 0 18px; }
+.kv > div { border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; }
+.kv dt { color: var(--muted); font-size: 12px; }
+.kv dd { margin: 4px 0 0; font: 600 16px/1.3 var(--mono); overflow-wrap: anywhere; }
+.note { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.hint { color: var(--muted); font-size: 12.5px; }
+.muted { color: var(--muted); }
+
+.alert {
+  border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+  color: var(--err);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  margin: 0 0 16px;
+  font-size: 13.5px;
+}
+
+.btn {
+  font: 500 13.5px var(--sans);
+  border: 1px solid var(--line);
+  background: var(--ink-3);
+  color: var(--text);
+  border-radius: var(--r);
+  padding: 8px 14px;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--copper); }
+.btn.primary { background: var(--copper); border-color: var(--copper); color: #1a1207; }
+.btn.primary:hover { background: var(--copper-2); }
+.btn.small { padding: 5px 10px; font-size: 12.5px; }
+
+.tag {
+  font-size: 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 2px 9px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.tag.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+
+/* ---- login ------------------------------------------------------ */
+
+.login-body {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.login-card {
+  width: 100%;
+  max-width: 360px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--ink-2);
+  padding: 26px 24px;
+}
+.brand-lg { font: 600 26px/1 var(--serif); margin-bottom: 20px; }
+.brand-lg small {
+  display: block;
+  font: 400 12.5px/1.4 var(--sans);
+  color: var(--muted);
+  margin-top: 7px;
+}
+.login-form { display: grid; gap: 14px; margin: 0 0 16px; }
+.field { display: grid; gap: 6px; }
+.field > span { color: var(--muted); font-size: 12.5px; }
+.field input {
+  width: 100%;
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  color: var(--text);
+  font: 14px var(--sans);
+  padding: 10px 12px;
+}
+.field input:hover { border-color: var(--copper); }
+
+/* ---- status: gauges, diagrams, live feed, addresses, certificate -- */
+
+.gauges {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.g { padding: 14px 16px; border-right: 1px solid var(--line-soft); }
+.g:last-child { border-right: 0; }
+.g .k { color: var(--muted); font-size: 12px; }
+.g .v { font: 600 20px/1.3 var(--mono); margin-top: 4px; }
+.g .v small { font: 400 12px var(--sans); color: var(--muted); margin-left: 6px; }
+
+h3 .sub { font-weight: 400; }
+
+/* Diagrams. The ring palette is fixed by slot, so one slice colour
+   means one thing across all four charts. */
+.piefold { display: grid; grid-template-columns: 1.1fr 1fr 1fr 1fr; gap: 14px; }
+.pie {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 12px 14px 10px;
+  min-width: 0;
+}
+.pie .t { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.pie svg { display: block; width: 118px; height: 118px; margin: 0 auto; }
+.pie .track { fill: none; stroke: var(--ink-3); stroke-width: 14; }
+.pie .ring {
+  fill: none;
+  stroke-width: 14;
+  cursor: pointer;
+  transition: stroke-width .12s ease, opacity .12s ease;
+}
+.pie .ring:hover,
+.pie .ring:focus-visible { stroke-width: 18; }
+.pie a.seg:focus-visible { outline: 2px solid var(--copper-2); outline-offset: 2px; }
+.pie .legend { display: grid; gap: 4px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.pie .legend span b { color: var(--text); font-weight: 600; font-family: var(--mono); }
+.pie .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+
+.pie .c-0 { stroke: var(--copper); }
+.pie .c-1 { stroke: var(--ok); }
+.pie .c-2 { stroke: var(--warn); }
+.pie .c-3 { stroke: var(--muted); }
+.pie .c-4 { stroke: var(--copper-2); }
+.pie .c-5 { stroke: var(--err); }
+.sw-0 { background: var(--copper); }
+.sw-1 { background: var(--ok); }
+.sw-2 { background: var(--warn); }
+.sw-3 { background: var(--muted); }
+.sw-4 { background: var(--copper-2); }
+.sw-5 { background: var(--err); }
+
+/* Tooltip for the ring segments. Its position is set from app.js via
+   the CSSOM (a style attribute in the HTML would break the CSP). */
+.tooltip {
+  position: fixed;
+  z-index: 9;
+  background: #0b1119;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 12.5px;
+  color: var(--text);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .1s;
+}
+.tooltip b { color: var(--copper-2); }
+
+/* Live feed. */
+.wire { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.wire .head {
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+.wire .feedctl { display: flex; gap: 8px; align-items: center; }
+.wire .feedstate { color: var(--err); font-size: 12px; }
+.wire .q {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) 64px 110px 170px;
+  gap: 14px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13.5px;
+  align-items: center;
+}
+.wire .q:last-child { border-bottom: 0; }
+.wire .q .t { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.wire .q .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wire .q .proto,
+.wire .q .ms { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.wire .q.empty { display: block; color: var(--muted); font-size: 13px; }
+
+.tag.block { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.tag.cache { color: var(--copper); border-color: color-mix(in srgb, var(--copper) 45%, transparent); }
+
+.links { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 26px; }
+.link {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  align-items: center;
+}
+.link .p { color: var(--muted); font-size: 12.5px; }
+.link .u {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--copper-2);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cert {
+  display: flex;
+  gap: 26px;
+  align-items: baseline;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 16px;
+}
+.cert .big { font: 600 22px var(--serif); }
+.cert .m { color: var(--muted); font-size: 13px; }
+.cert.ok .big { color: var(--ok); }
+.cert.waiting .big { color: var(--warn); }
+.cert.error .big { color: var(--err); }
+
+/* ---- management pages: tables, forms, user rules ---------------- */
+
+.tablewrap { overflow-x: auto; }
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  margin: 0 0 2px;
+}
+.tbl th,
+.tbl td {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13.5px;
+  vertical-align: middle;
+}
+.tbl th { color: var(--muted); font-weight: 500; font-size: 12px; white-space: nowrap; }
+.tbl tr:last-child td { border-bottom: 0; }
+.tbl td.num { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+.tbl td.addr { max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tbl tr.empty td { color: var(--muted); font-size: 13px; }
+
+/* Form controls. They are scoped to .main and classed .ctl so the login
+   and history screens keep their own field styling. */
+.main input.ctl,
+.main select.ctl {
+  background: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  color: var(--text);
+  font: 13.5px var(--sans);
+  padding: 7px 10px;
+  min-width: 0;
+}
+.main input.ctl:hover,
+.main select.ctl:hover { border-color: var(--copper); }
+input.num-input { width: 78px; text-align: center; font-family: var(--mono); }
+.grow { flex: 1; min-width: 0; }
+
+.formgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 14px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 16px;
+}
+.formgrid .field { display: grid; gap: 6px; }
+.formgrid .field > span { color: var(--muted); font-size: 12.5px; }
+.protocol { display: flex; gap: 12px; align-items: center; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13.5px; padding-top: 4px; }
+.check input { width: 16px; height: 16px; accent-color: var(--copper); }
+.row-actions { display: flex; gap: 12px; align-items: center; margin: 14px 0 0; flex-wrap: wrap; }
+.inline-form { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.radio { display: inline-flex; gap: 7px; align-items: center; font-size: 13.5px; }
+.radio input { accent-color: var(--copper); }
+
+.flash {
+  border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent);
+  color: var(--ok);
+  border-radius: var(--r);
+  padding: 10px 12px;
+  margin: 0 0 16px;
+  font-size: 13.5px;
+}
+
+.rules { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.rule-col { border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; }
+.rule-col h4 { margin: 0 0 10px; font: 600 12px var(--sans); color: var(--muted); }
+.rule-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; }
+.rule {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 3px 4px 3px 12px;
+  font-size: 12.5px;
+  font-family: var(--mono);
+}
+.rule .x {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 50%;
+}
+.rule .x:hover { color: var(--err); }
+
+.cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.card { border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; }
+.card .k { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+.card .row-actions { margin-top: 12px; }
+
+.main code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--ink-3);
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* ---- history: search row, filter chips, pager ------------------- */
+
+.searchrow {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+.search {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 9px 12px;
+  color: var(--muted);
+}
+.search:focus-within { border-color: var(--copper-2); }
+.search input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: 14px var(--sans);
+}
+
+.chip {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+  color: var(--err);
+  border-radius: 20px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.chip b { font-weight: 500; }
+.chip .x { cursor: pointer; color: var(--muted); text-decoration: none; }
+.chip .x:hover { color: var(--err); }
+
+.pager {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-top: 10px;
+}
+.pager .pg { display: flex; gap: 6px; }
+.pager b { color: var(--text); font-family: var(--mono); }
+.btn.off {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--line-soft);
+  cursor: default;
+}
+.btn.off:hover { border-color: var(--line-soft); }
+.hist .q { cursor: default; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
+
+@media (max-width: 1080px) {
+  .piefold { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 720px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail { flex-direction: row; align-items: center; gap: 12px; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { border-bottom: 0; margin: 0; padding: 0; }
+  .nav { flex-direction: row; flex-wrap: wrap; }
+  .nav a { padding: 6px 8px; margin: 0; }
+  .nav a.on { box-shadow: inset 0 -2px 0 var(--copper); }
+  .rail-foot { margin: 0 0 0 auto; padding: 0; }
+  .main { padding: 20px 16px; }
+  .gauges { grid-template-columns: 1fr 1fr; }
+  .g { border-bottom: 1px solid var(--line-soft); }
+  .g:nth-child(2n) { border-right: 0; }
+  .g:nth-child(n + 3) { border-bottom: 0; }
+  .piefold { grid-template-columns: 1fr; }
+  .links { grid-template-columns: 1fr; }
+  .cert { flex-direction: column; gap: 6px; }
+  .wire .head { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .wire .q { grid-template-columns: 60px minmax(0, 1fr) auto auto; gap: 10px; }
+  .wire .q .proto { display: none; }
+  .searchrow { flex-wrap: wrap; }
+  .search { flex-basis: 100%; }
+  .pager { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .formgrid { grid-template-columns: 1fr; }
+  .rules { grid-template-columns: 1fr; }
+  .cards { grid-template-columns: 1fr; }
+  .inline-form { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .tbl th, .tbl td { padding: 8px 10px; }
+}
+
+/* Phone widths: the five fixed columns leave the domain with almost no
+   room, because the latency/source cell ("0 мс · adguard-dns-filter")
+   and the result tag are sized to their content. Move the latency and
+   source onto a second line under the name and keep the tag on the
+   right, so the name keeps the widest cell and nothing overflows. The
+   status feed and the history page share this row markup. */
+@media (max-width: 480px) {
+  .wire .q {
+    grid-template-columns: 60px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "time name tag"
+      "time source tag";
+    align-items: start;
+    gap: 2px 10px;
+    padding: 8px 12px;
+  }
+  .wire .q .t { grid-area: time; }
+  .wire .q .name { grid-area: name; }
+  .wire .q .proto { display: none; }
+  .wire .q .tag { grid-area: tag; align-self: center; }
+  .wire .q .ms {
+    grid-area: source;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}

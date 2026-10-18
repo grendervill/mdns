@@ -57,6 +57,7 @@
 #   scripts/e2e-install.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/e2e-lib.sh
 
 IMAGE=ubuntu:24.04
 NAME=mdns-e2e-install
@@ -75,20 +76,12 @@ RE_DOMAIN=mdns2.test
 
 # Flags of every successful install below; phase C deliberately breaks
 # the domain.
-INSTALL_FLAGS="--non-interactive --domain $DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT"
-RECONFIG_FLAGS="--non-interactive --reconfigure --domain $RE_DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT"
+INSTALL_FLAGS="--non-interactive --domain $DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT --panel --password 'test-panel-pass'"
+RECONFIG_FLAGS="--non-interactive --reconfigure --domain $RE_DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT --panel --password 'test-panel-pass'"
 
-# The container bootstrap installs systemd (the image has none), the
-# client tools the phases need, disables the resolved stub listener and
-# only then execs init, so systemd is PID 1.
-BOOTSTRAP='
-set -e
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd systemd-sysv dbus curl dnsutils iproute2 >/dev/null
-mkdir -p /etc/systemd/resolved.conf.d
-printf "[Resolve]\nDNSStubListener=no\n" > /etc/systemd/resolved.conf.d/99-mdns.conf
-exec /sbin/init
-'
+# The container bootstrap (systemd, client tools, resolved stub off),
+# the release staging and the readiness poll live in scripts/e2e-lib.sh,
+# shared with e2e-panel.sh; this script owns its phases and assertions.
 
 # --- assertion bookkeeping ------------------------------------------------
 # Every assertion prints its own line; the run never stops at the first
@@ -192,104 +185,32 @@ cleanup() {
     fi
   fi
   echo "--- teardown ---"
-  if [ -n "$http_pid" ]; then kill "$http_pid" 2>/dev/null || true; fi
+  if [ -n "$http_pid" ]; then
+    kill "$http_pid" 2>/dev/null || true
+    wait "$http_pid" 2>/dev/null || true
+  fi
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   if [ -n "$stage" ]; then rm -rf "$stage"; fi
   exit "$status"
 }
 trap cleanup EXIT
 
-# sha256 prints the SHA256 of a file, with the tool the host has.
-sha256() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
-}
-
 # --- 1. build and stage the release tree ----------------------------------
 echo "--- build the release binaries (make dist-linux) ---"
 make dist-linux
 
-case "$(docker info --format '{{.Architecture}}')" in
-  aarch64 | arm64) GOARCH=arm64 ;;
-  x86_64 | amd64) GOARCH=amd64 ;;
-  *)
-    echo "unsupported docker architecture" >&2
-    exit 1
-    ;;
-esac
+GOARCH=$(e2e_goarch) || exit 1
 echo "docker architecture: $GOARCH"
 
 echo "--- stage the release tree in the GitHub layout ---"
 stage=$(mktemp -d)
-mkdir -p "$stage/latest/download"
-cp "dist/mdns-linux-$GOARCH" dist/SHA256SUMS "$stage/latest/download/"
-cp install.sh "$stage/"
-
-echo "--- serve $stage on 127.0.0.1 ---"
-(cd "$stage" && exec python3 -m http.server 8931 --bind 127.0.0.1) \
-  >"$stage/http.log" 2>&1 &
-http_pid=$!
+e2e_stage_release "$stage" "$GOARCH" 8931
+http_pid=$E2E_HTTP_PID
 BASE_URL="http://$HOST:8931"
-
-# The served tree must be this tree: a leftover server from an earlier run
-# would answer on 8931 with whatever it was started on. (The host reaches
-# the server on 127.0.0.1; only the container uses host.docker.internal.)
-served_ok=0
-for _ in $(seq 1 20); do
-  curl -fsS -o "$stage/served-install.sh" "http://127.0.0.1:8931/install.sh" 2>/dev/null || true
-  curl -fsS -o "$stage/served-binary" \
-    "http://127.0.0.1:8931/latest/download/mdns-linux-$GOARCH" 2>/dev/null || true
-  if [ -f "$stage/served-install.sh" ] && [ -f "$stage/served-binary" ] &&
-    [ "$(sha256 "$stage/served-install.sh")" = "$(sha256 install.sh)" ] &&
-    [ "$(sha256 "$stage/served-binary")" = "$(sha256 "dist/mdns-linux-$GOARCH")" ]; then
-    served_ok=1
-    break
-  fi
-  sleep 0.5
-done
-rm -f "$stage/served-install.sh" "$stage/served-binary"
-if [ "$served_ok" -ne 1 ]; then
-  echo "the file server on 8931 does not serve this tree;" >&2
-  echo "another process may hold the port: stop it and re-run" >&2
-  exit 1
-fi
 echo "serving $BASE_URL (install.sh, latest/download/mdns-linux-$GOARCH, latest/download/SHA256SUMS)"
 
 # --- 2. the systemd container ---------------------------------------------
-echo "--- start the systemd container ($IMAGE) ---"
-docker rm -f "$NAME" >/dev/null 2>&1 || true
-docker run -d --name "$NAME" \
-  --privileged --cgroupns=host \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-  --add-host="$HOST:host-gateway" \
-  --hostname mdns-e2e-install \
-  "$IMAGE" bash -c "$BOOTSTRAP" >/dev/null
-
-echo "--- wait for systemd ---"
-systemd_state=starting
-for _ in $(seq 1 120); do
-  if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then
-    echo "the container exited during setup:" >&2
-    docker logs "$NAME" >&2 || true
-    exit 1
-  fi
-  systemd_state=$(docker exec "$NAME" systemctl is-system-running 2>/dev/null || true)
-  case "$systemd_state" in
-    running | degraded) break ;;
-  esac
-  sleep 1
-done
-case "$systemd_state" in
-  running | degraded) echo "systemd is $systemd_state" ;;
-  *)
-    echo "systemd did not come up (state: ${systemd_state:-none})" >&2
-    docker logs "$NAME" >&2 || true
-    exit 1
-    ;;
-esac
+e2e_start_systemd "$NAME" "$IMAGE" mdns-e2e-install
 
 # The installer's port preflight binds 0.0.0.0:53; make sure the container
 # really freed it (the stub drop-in above).
@@ -342,6 +263,33 @@ if [ "$diag_status" -eq 0 ] && ! printf '%s\n' "$diag_out" | grep -q '✗'; then
 else
   fail "A11 mdns diag reports no failed check (only ! items are accepted)" "$diag_out"
 fi
+
+# The panel (Task 10/12) is installed by the same one-liner; these three
+# checks pin the non-interactive contract the panel e2e builds on: the
+# summary announces it, the browser-facing GET redirects an anonymous
+# visitor to the login form, and an anonymous mutation is 401 (not a 404
+# and not a redirect) because there is no form to send it back to.
+if printf '%s\n' "$LAST_OUT" | grep -q "Панель: https://$DOMAIN/"; then
+  pass "A12 the install summary announces the web panel"
+else
+  fail "A12 the install summary announces the web panel" "$LAST_OUT"
+fi
+panel_get=$(docker exec "$NAME" bash -c \
+  "curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' https://127.0.0.1/panel/" 2>&1 || true)
+if printf '%s' "$panel_get" | grep -qE '^303 .*/login$'; then
+  pass "A13 an anonymous GET /panel/ redirects to /login"
+else
+  fail "A13 an anonymous GET /panel/ redirects to /login" "$panel_get"
+fi
+panel_post=$(docker exec "$NAME" bash -c \
+  "curl -sk -o /dev/null -w '%{http_code}' -X POST --data 'id=cloudflare' https://127.0.0.1/panel/upstreams/toggle" 2>&1 || true)
+if [ "$panel_post" = 401 ]; then
+  pass "A14 an anonymous panel mutation is 401"
+else
+  fail "A14 an anonymous panel mutation is 401" "status: $panel_post"
+fi
+cassert "A15 the panel password is stored only as an argon2id hash" \
+  "grep -q argon2id /etc/mdns/config.json && ! grep -q test-panel-pass /etc/mdns/config.json"
 
 # --- phase B: idempotence and the live reconfigure ------------------------
 echo

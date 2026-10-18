@@ -96,7 +96,7 @@ func (m *Model) wizardView() string {
 		b.WriteString("\n\n")
 	}
 	b.WriteString("Мастер настройки проведёт по шагам: домен, сертификат, протоколы,\n")
-	b.WriteString("DNS-провайдеры (с замерами задержек), стратегия, фильтры.\n\n")
+	b.WriteString("DNS-провайдеры (с замерами задержек), стратегия, фильтры, веб-панель.\n\n")
 	b.WriteString(dimStyle.Render("Нажмите 2 или «w» на экране настроек, чтобы открыть мастер."))
 	b.WriteString("\n")
 	return b.String()

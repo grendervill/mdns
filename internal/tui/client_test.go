@@ -17,6 +17,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/stats"
 	"mydns/internal/tlscert"
 	"mydns/internal/tui"
 )
@@ -39,7 +40,12 @@ func (s *stubController) Providers() []providers.Provider { return providers.Lis
 func (s *stubController) Probe(context.Context, []providers.Endpoint) []probe.Result {
 	return nil
 }
-func (s *stubController) Requests(int) []qlog.Entry         { return nil }
+func (s *stubController) Requests(int) []qlog.Entry { return nil }
+func (s *stubController) Stats() stats.Snapshot     { return stats.Snapshot{} }
+func (s *stubController) Started() time.Time        { return time.Time{} }
+func (s *stubController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) {
+	return nil, 0
+}
 func (s *stubController) FilterStatus() []filter.ListStatus { return nil }
 func (s *stubController) FilterUpdate(_ context.Context, id string) error {
 	s.filters = append(s.filters, id)

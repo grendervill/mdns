@@ -20,6 +20,7 @@ import (
 	"mydns/internal/app"
 	"mydns/internal/config"
 	"mydns/internal/filter"
+	"mydns/internal/qlog"
 )
 
 // unixClient returns an HTTP client talking to the unix socket.
@@ -227,6 +228,92 @@ func TestAppFilterUpdateViaAPI(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Errorf("unknown list status code = %d, want 500", resp.StatusCode)
+	}
+}
+
+// TestAppStatsAndPagedRequests checks the stats and history endpoints
+// end to end over the daemon socket: real queries feed the cumulative
+// counters, and the filtered history view pages over them.
+func TestAppStatsAndPagedRequests(t *testing.T) {
+	fake := newFakeUpstream(t)
+	port := freePort(t)
+	cfg := testConfig(t, fake, port)
+	cfg.Filter = config.FilterConfig{
+		Enabled:   true,
+		Mode:      "zero",
+		UserBlock: []string{"blocked.example.com"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate() = %v, want nil", err)
+	}
+	_, sock := startAppAPI(t, cfg)
+
+	ask := func(name string) {
+		t.Helper()
+		cl := &dns.Client{Net: "udp", Timeout: time.Second}
+		if _, _, err := cl.Exchange(query(name), loopback(port)); err != nil {
+			t.Fatalf("Exchange(%s) = %v, want nil", name, err)
+		}
+	}
+	ask("one.example.com") // forwarded upstream
+	ask("one.example.com") // ...then served from the cache
+	for i := 0; i < 5; i++ {
+		ask("blocked.example.com") // filtered, never cached
+	}
+
+	cl := unixClient(sock)
+
+	var st api.StatsResponse
+	getJSONUnix(t, cl, "/api/v1/stats", &st)
+	if st.Total != 7 {
+		t.Errorf("stats total = %d, want 7", st.Total)
+	}
+	if st.Outcomes["blocked"] != 5 || st.Outcomes["cached"] != 1 || st.Outcomes["upstream"] != 1 {
+		t.Errorf("stats outcomes = %v, want blocked=5 cached=1 upstream=1", st.Outcomes)
+	}
+	if st.Upstreams["fake"] != 1 {
+		t.Errorf("stats upstreams = %v, want fake=1", st.Upstreams)
+	}
+	if st.Since.IsZero() || st.Since.After(time.Now()) {
+		t.Errorf("stats since = %v, want a real past start time", st.Since)
+	}
+
+	var page api.RequestsPage
+	getJSONUnix(t, cl, "/api/v1/requests?outcome=blocked&per=2&page=2", &page)
+	if page.Total != 5 || page.Pages != 3 || page.Page != 2 || page.Per != 2 {
+		t.Errorf("page shape = total %d pages %d page %d per %d, want 5/3/2/2",
+			page.Total, page.Pages, page.Page, page.Per)
+	}
+	if len(page.Entries) != 2 {
+		t.Fatalf("page entries = %d, want 2", len(page.Entries))
+	}
+	for _, e := range page.Entries {
+		if !e.Blocked || e.QName != "blocked.example.com." {
+			t.Errorf("entry = %+v, want a blocked.example.com. block", e)
+		}
+	}
+
+	var legacy []qlog.Entry
+	getJSONUnix(t, cl, "/api/v1/requests?n=3", &legacy)
+	if len(legacy) != 3 {
+		t.Errorf("legacy entries = %d, want 3", len(legacy))
+	}
+}
+
+// getJSONUnix fetches path over the unix-socket client and decodes the
+// JSON body, failing the test on a non-200 response.
+func getJSONUnix(t *testing.T, cl *http.Client, path string, v any) {
+	t.Helper()
+	resp, err := cl.Get("http://unix" + path)
+	if err != nil {
+		t.Fatalf("GET %s = %v, want nil", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s status = %d, want 200", path, resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
 	}
 }
 

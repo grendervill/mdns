@@ -20,6 +20,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/stats"
 	"mydns/internal/tlscert"
 )
 
@@ -57,6 +58,25 @@ type FilterSnapshot struct {
 	Lists        []filter.ListStat
 }
 
+// StatsResponse is the /stats body: the cumulative snapshot plus the
+// daemon start time. The snapshot is embedded, so the JSON is one flat
+// object (total, outcomes, protos, upstreams, clients and since).
+type StatsResponse struct {
+	stats.Snapshot
+	Since time.Time `json:"since"`
+}
+
+// RequestsPage is the paged /requests body returned whenever a filter
+// or pagination parameter is present. Pages is ceil(total/per), at
+// least 1.
+type RequestsPage struct {
+	Entries []qlog.Entry `json:"entries"`
+	Total   int          `json:"total"`
+	Page    int          `json:"page"`
+	Pages   int          `json:"pages"`
+	Per     int          `json:"per"`
+}
+
 // Controller is everything the daemon exposes over the API; *app.App
 // implements it.
 type Controller interface {
@@ -66,6 +86,13 @@ type Controller interface {
 	Providers() []providers.Provider
 	Probe(ctx context.Context, eps []providers.Endpoint) []probe.Result
 	Requests(n int) []qlog.Entry
+	// Stats returns the cumulative query statistics since start.
+	Stats() stats.Snapshot
+	// Started is when the daemon was constructed.
+	Started() time.Time
+	// RequestsQuery returns one page (1-based page, per entries) of
+	// filtered history, newest first, along with the total match count.
+	RequestsQuery(q qlog.Query, page, per int) ([]qlog.Entry, int)
 	FilterStatus() []filter.ListStatus
 	FilterUpdate(ctx context.Context, id string) error
 }
@@ -105,6 +132,7 @@ func New(ctl Controller, bus *Bus, logger *slog.Logger, opts ServerOptions) *Ser
 	mux.HandleFunc("GET /api/v1/providers", s.handleProviders)
 	mux.HandleFunc("POST /api/v1/probe", s.handleProbe)
 	mux.HandleFunc("GET /api/v1/requests", s.handleRequests)
+	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
 	mux.HandleFunc("GET /api/v1/filter/status", s.handleFilterStatus)
 	mux.HandleFunc("POST /api/v1/filter/update", s.handleFilterUpdate)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)

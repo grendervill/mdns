@@ -37,6 +37,8 @@ type Spec struct {
 	DoTPort       int      // 0 → 853
 	DoQPort       int      // 0 → 853
 	FilterPreset  string   // off | basic | strict (default off)
+	PanelPassword string   // web panel admin password; empty → panel off
+	PanelEnabled  *bool    // nil → on iff PanelPassword is set
 }
 
 // InstallOptions is one installation run. It embeds the preflight
@@ -544,6 +546,12 @@ func printSummary(out io.Writer, cfg *config.Config, binaryPath, unitPath string
 		fmt.Fprintf(out, "  Фильтрация: включена, списков %d\n", len(cfg.Filter.Lists))
 	} else {
 		fmt.Fprintln(out, "  Фильтрация: выключена")
+	}
+	if cfg.Panel.Enabled {
+		fmt.Fprintf(out, "  Панель: https://%s/ · логин admin\n", cfg.Domain)
+		fmt.Fprintln(out, "    пароль задан при установке; сменить — в панели")
+	} else {
+		fmt.Fprintln(out, "  Веб-панель выключена (--panel --password, чтобы включить)")
 	}
 
 	if dryRun {

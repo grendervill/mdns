@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"mydns/internal/config"
@@ -616,5 +617,111 @@ func TestSaveAtomic(t *testing.T) {
 			names[i] = e.Name()
 		}
 		t.Errorf("directory after Save contains %v, want only [config.json]", names)
+	}
+}
+
+func TestPanelDefaults(t *testing.T) {
+	c := config.Default()
+
+	if c.Panel.Enabled {
+		t.Errorf("panel enabled = true, want false by default")
+	}
+	if c.Panel.PasswordHash != "" {
+		t.Errorf("panel password_hash = %q, want empty by default", c.Panel.PasswordHash)
+	}
+}
+
+func TestPanelValidation(t *testing.T) {
+	validHash := "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$mZ1kYXRh"
+
+	tests := []struct {
+		name    string
+		mutate  func(*config.Config)
+		wantErr bool
+	}{
+		{
+			name:    "disabled panel without hash",
+			mutate:  func(c *config.Config) {},
+			wantErr: false,
+		},
+		{
+			name: "enabled panel with valid argon2id hash",
+			mutate: func(c *config.Config) {
+				c.Panel.Enabled = true
+				c.Panel.PasswordHash = validHash
+			},
+			wantErr: false,
+		},
+		{
+			name:    "enabled panel with empty hash",
+			mutate:  func(c *config.Config) { c.Panel.Enabled = true },
+			wantErr: true,
+		},
+		{
+			name: "enabled panel with non-argon2id hash",
+			mutate: func(c *config.Config) {
+				c.Panel.Enabled = true
+				c.Panel.PasswordHash = "$2y$10$N9qo8uLOickgx2ZMRZoMye"
+			},
+			wantErr: true,
+		},
+		{
+			name: "enabled panel with garbage in hash field",
+			mutate: func(c *config.Config) {
+				c.Panel.Enabled = true
+				c.Panel.PasswordHash = "not-a-hash"
+			},
+			wantErr: true,
+		},
+		{
+			name: "disabled panel ignores garbage in hash field",
+			mutate: func(c *config.Config) {
+				c.Panel.PasswordHash = "not-a-hash"
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := validConfig()
+			tt.mutate(c)
+			err := c.Validate()
+			switch {
+			case tt.wantErr && err == nil:
+				t.Errorf("Validate() = nil, want error")
+			case !tt.wantErr && err != nil:
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestPanelRoundTrip(t *testing.T) {
+	c := validConfig()
+	c.Panel = config.PanelConfig{
+		Enabled:      true,
+		PasswordHash: "$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$mZ1kYXRh",
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save(%q) = %v, want nil", path, err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"panel"`) {
+		t.Errorf("saved JSON has no panel section:\n%s", data)
+	}
+
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load(%q) = %v, want nil", path, err)
+	}
+	if !reflect.DeepEqual(loaded.Panel, c.Panel) {
+		t.Errorf("panel after round-trip = %+v, want %+v", loaded.Panel, c.Panel)
 	}
 }

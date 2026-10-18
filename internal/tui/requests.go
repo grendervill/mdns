@@ -27,25 +27,40 @@ func loadRequests(c Client) tea.Cmd {
 func (m *Model) requestsView() string {
 	var b strings.Builder
 
+	shown := m.filteredRequests()
+
 	if m.requestsPaused {
-		b.WriteString(warnStyle.Render("Лента на паузе (пробел — продолжить)") + "\n\n")
+		b.WriteString(warnStyle.Render("Лента на паузе (пробел — продолжить)") + "\n")
+	}
+	if m.requestsFilter != "" {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("Фильтр: «%s» · найдено %d из %d · f — изменить · esc — сбросить", m.requestsFilter, len(shown), len(m.requests))))
+		b.WriteString("\n")
+	}
+	if m.requestsPaused || m.requestsFilter != "" {
+		b.WriteString("\n")
 	}
 
 	if len(m.requests) == 0 {
 		b.WriteString(dimStyle.Render("Запросов пока нет.") + "\n")
+		m.writeRequestsInput(&b)
+		return b.String()
+	}
+	if len(shown) == 0 {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("Нет запросов по фильтру «%s» (esc — сбросить).", m.requestsFilter)) + "\n")
+		m.writeRequestsInput(&b)
 		return b.String()
 	}
 
-	b.WriteString(dimStyle.Render("время     прото  домен                              тип   результат        источник             мс"))
+	b.WriteString(dimStyle.Render(requestsHeader()))
 	b.WriteString("\n")
 
 	// Show the last lines that fit; scroll counts lines up from the
 	// newest entry.
-	limit := len(m.requests)
+	limit := len(shown)
 	if m.height > 4 && limit > m.height-4 {
 		limit = m.height - 4
 	}
-	end := len(m.requests) - m.requestsScroll
+	end := len(shown) - m.requestsScroll
 	if end < 0 {
 		end = 0
 	}
@@ -54,7 +69,7 @@ func (m *Model) requestsView() string {
 		start = 0
 	}
 
-	for _, e := range m.requests[start:end] {
+	for _, e := range shown[start:end] {
 		b.WriteString(m.requestLine(e))
 		b.WriteString("\n")
 	}
@@ -63,7 +78,68 @@ func (m *Model) requestsView() string {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("… прокрутка вверх на %d строк (↓ — вниз)", m.requestsScroll)))
 		b.WriteString("\n")
 	}
+
+	m.writeRequestsInput(&b)
 	return b.String()
+}
+
+// writeRequestsInput appends the feed filter prompt while it is open.
+// It runs on every render path, so the line stays visible even when
+// the active filter matches nothing.
+func (m *Model) writeRequestsInput(b *strings.Builder) {
+	if !m.inputActive || m.inputMode != inputRequestsFilter {
+		return
+	}
+	b.WriteString("\n")
+	b.WriteString(titleStyle.Render("Фильтр ленты (домен/клиент/upstream/прото): ") + m.input + "▏")
+	b.WriteString("\n")
+}
+
+// Column widths of the journal table: time, protocol, client, domain,
+// type, result, source and latency. The total stays inside a
+// 120-column terminal.
+const (
+	colProto  = 5
+	colClient = 18
+	colDomain = 24
+	colType   = 5
+	colResult = 17
+	colOrigin = 20
+	colMS     = 6
+)
+
+// requestsHeader renders the column captions.
+func requestsHeader() string {
+	return fmt.Sprintf("%-8s  %-*s  %-*s  %-*s %-*s %-*s %-*s %*s",
+		"время", colProto, "прото", colClient, "клиент", colDomain, "домен",
+		colType, "тип", colResult, "результат", colOrigin, "источник", colMS, "мс")
+}
+
+// filteredRequests returns the entries matching the feed filter.
+func (m *Model) filteredRequests() []qlog.Entry {
+	if m.requestsFilter == "" {
+		return m.requests
+	}
+	needle := strings.ToLower(m.requestsFilter)
+	out := make([]qlog.Entry, 0, len(m.requests))
+	for _, e := range m.requests {
+		if entryMatches(e, needle) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// entryMatches reports whether an entry matches the filter: a
+// case-insensitive substring of the domain, client IP, upstream ID or
+// protocol.
+func entryMatches(e qlog.Entry, needle string) bool {
+	for _, field := range []string{e.QName, e.ClientIP, e.Upstream, e.Proto} {
+		if strings.Contains(strings.ToLower(field), needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // requestLine formats one journal entry.
@@ -91,14 +167,20 @@ func (m *Model) requestLine(e qlog.Entry) string {
 		}
 	}
 
-	return fmt.Sprintf("%s  %-5s  %-34s %-5s %-17s %-20s %6.1f",
+	client := e.ClientIP
+	if client == "" {
+		client = "—"
+	}
+
+	return fmt.Sprintf("%s  %-*s  %-*s  %-*s %-*s %-*s %-*s %*.1f",
 		e.Time.Format(time.TimeOnly),
-		e.Proto,
-		truncate(e.QName, 34),
-		qtype,
-		result,
-		truncate(origin, 20),
-		e.LatencyMS,
+		colProto, e.Proto,
+		colClient, truncate(client, colClient),
+		colDomain, truncate(e.QName, colDomain),
+		colType, qtype,
+		colResult, result,
+		colOrigin, truncate(origin, colOrigin),
+		colMS, e.LatencyMS,
 	)
 }
 

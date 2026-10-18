@@ -31,11 +31,18 @@ type stubClient struct {
 	events      chan api.Event
 
 	cfg       *config.Config
+	configErr error
 	filters   []string
 	updateErr error
 	updates   []*config.Config
 
 	requestEntries []qlog.Entry
+
+	filterLists []filter.ListStatus
+	filterErr   error
+
+	probeResults []probe.Result
+	probeFn      func(context.Context, []providers.Endpoint) ([]probe.Result, error)
 }
 
 func (s *stubClient) Status(context.Context) (api.Status, error) {
@@ -43,6 +50,9 @@ func (s *stubClient) Status(context.Context) (api.Status, error) {
 	return s.status, s.statusErr
 }
 func (s *stubClient) Config(context.Context) (*config.Config, error) {
+	if s.configErr != nil {
+		return nil, s.configErr
+	}
 	if s.cfg != nil {
 		return s.cfg, nil
 	}
@@ -58,14 +68,27 @@ func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
 func (s *stubClient) Providers(context.Context) ([]providers.Provider, error) {
 	return nil, nil
 }
-func (s *stubClient) Probe(context.Context, []providers.Endpoint) ([]probe.Result, error) {
-	return nil, nil
+func (s *stubClient) Probe(ctx context.Context, eps []providers.Endpoint) ([]probe.Result, error) {
+	if s.probeFn != nil {
+		return s.probeFn(ctx, eps)
+	}
+	if s.probeResults != nil {
+		return s.probeResults, nil
+	}
+	// Default: every endpoint answers quickly, so the wizard and the
+	// diagnostics screen show a healthy picture unless a test says
+	// otherwise.
+	out := make([]probe.Result, len(eps))
+	for i, ep := range eps {
+		out[i] = probe.Result{Endpoint: ep, Latency: 10 * time.Millisecond}
+	}
+	return out, nil
 }
 func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) {
 	return s.requestEntries, nil
 }
 func (s *stubClient) FilterStatus(context.Context) ([]filter.ListStatus, error) {
-	return nil, nil
+	return s.filterLists, s.filterErr
 }
 func (s *stubClient) FilterUpdate(_ context.Context, id string) error {
 	s.filters = append(s.filters, id)
@@ -115,9 +138,20 @@ func TestStatusViewRenders(t *testing.T) {
 	}
 }
 
-// TestNavigation checks that number keys switch screens.
+// TestNavigation checks that number keys switch screens and that the
+// tab bar lists the seven screens with Диагностика as the seventh.
 func TestNavigation(t *testing.T) {
 	m := New(&stubClient{}, Options{})
+
+	wantTabs := []string{"Статус", "Визард", "Запросы", "Upstream'ы", "Фильтры", "Настройки", "Диагностика"}
+	if len(screenTabs) != len(wantTabs) {
+		t.Fatalf("screenTabs has %d tabs, want %d", len(screenTabs), len(wantTabs))
+	}
+	for i, name := range wantTabs {
+		if screenTabs[i].name != name {
+			t.Errorf("tab %d = %q, want %q", i+1, screenTabs[i].name, name)
+		}
+	}
 
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
 	m = updated.(Model)
@@ -129,6 +163,12 @@ func TestNavigation(t *testing.T) {
 	m = updated.(Model)
 	if m.screen != screenStatus {
 		t.Errorf("screen = %v, want status", m.screen)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}})
+	m = updated.(Model)
+	if m.screen != screenDiag {
+		t.Errorf("screen = %v, want diag", m.screen)
 	}
 }
 

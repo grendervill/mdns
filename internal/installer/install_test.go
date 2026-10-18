@@ -2,6 +2,7 @@ package installer
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"mydns/internal/auth"
 	"mydns/internal/config"
 	"mydns/internal/filter"
 )
@@ -328,6 +330,148 @@ func TestBuildConfigFileMode(t *testing.T) {
 	if cfg.TLS.Mode != "files" || cfg.TLS.CertFile != "/etc/mdns/fullchain.pem" || cfg.TLS.KeyFile != "/etc/mdns/privkey.pem" {
 		t.Errorf("TLS = %+v, want files with the given paths", cfg.TLS)
 	}
+}
+
+// TestBuildConfigPanelHash checks the panel password: it is hashed, the
+// hash verifies against the plaintext and the serialized config never
+// carries the plaintext.
+func TestBuildConfigPanelHash(t *testing.T) {
+	const pw = "hunter2hunter2"
+
+	cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: pw})
+	if err != nil {
+		t.Fatalf("buildConfig() error = %v, want nil", err)
+	}
+	if !cfg.Panel.Enabled {
+		t.Fatalf("Panel.Enabled = false, want true")
+	}
+	if !strings.HasPrefix(cfg.Panel.PasswordHash, "$argon2id$") {
+		t.Errorf("PasswordHash = %q, want an argon2id PHC hash", cfg.Panel.PasswordHash)
+	}
+	if !auth.Verify(cfg.Panel.PasswordHash, pw) {
+		t.Errorf("the stored hash does not verify %q", pw)
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if strings.Contains(string(data), pw) {
+		t.Errorf("the serialized config leaks the plaintext password:\n%s", data)
+	}
+}
+
+// TestBuildConfigPanelFlagBehavior pins the panel tristate: an explicit
+// --panel needs a password, a password turns the panel on by itself, and
+// neither leaves it off.
+func TestBuildConfigPanelFlagBehavior(t *testing.T) {
+	on := true
+	off := false
+
+	t.Run("panel without a password", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelEnabled: &on})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "password") {
+			t.Errorf("error = %q, want it to name the missing password", err)
+		}
+	})
+
+	t.Run("password turns the panel on", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "longenough"})
+		if err != nil {
+			t.Fatalf("buildConfig() error = %v, want nil", err)
+		}
+		if !cfg.Panel.Enabled {
+			t.Errorf("Panel.Enabled = false, want true when a password is set")
+		}
+	})
+
+	t.Run("neither leaves the panel off", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com"})
+		if err != nil {
+			t.Fatalf("buildConfig() error = %v, want nil", err)
+		}
+		if cfg.Panel.Enabled || cfg.Panel.PasswordHash != "" {
+			t.Errorf("Panel = %+v, want it off by default", cfg.Panel)
+		}
+	})
+
+	t.Run("no-panel wins over a password", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelEnabled: &off, PanelPassword: "longenough"})
+		if err != nil {
+			t.Fatalf("buildConfig() error = %v, want nil", err)
+		}
+		if cfg.Panel.Enabled {
+			t.Errorf("Panel.Enabled = true, want --no-panel to win")
+		}
+	})
+
+	t.Run("password too short", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "short"})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "8") {
+			t.Errorf("error = %q, want it to name the minimum length", err)
+		}
+	})
+
+	t.Run("whitespace-only password is rejected", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "        "})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("error = %q, want it to name the whitespace", err)
+		}
+	})
+
+	t.Run("surrounding whitespace is rejected", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "longenough "})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("error = %q, want it to name the whitespace", err)
+		}
+	})
+}
+
+// TestInstallSummaryPanelLine checks the summary's panel line in both
+// states.
+func TestInstallSummaryPanelLine(t *testing.T) {
+	t.Run("enabled", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "longenough"})
+		if err != nil {
+			t.Fatalf("buildConfig() error = %v, want nil", err)
+		}
+		var out bytes.Buffer
+		printSummary(&out, cfg, "/usr/local/bin/mdns", "/etc/systemd/system/mdns.service", false)
+		text := out.String()
+		for _, want := range []string{
+			"Панель: https://dns.example.com/ · логин admin",
+			"пароль задан при установке",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("summary misses %q:\n%s", want, text)
+			}
+		}
+		if strings.Contains(text, "Веб-панель выключена") {
+			t.Errorf("summary claims the panel is off while it is on:\n%s", text)
+		}
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.Domain = "dns.example.com"
+		var out bytes.Buffer
+		printSummary(&out, cfg, "/usr/local/bin/mdns", "/etc/systemd/system/mdns.service", true)
+		if !strings.Contains(out.String(), "Веб-панель выключена (--panel --password, чтобы включить)") {
+			t.Errorf("summary misses the disabled-panel note:\n%s", out.String())
+		}
+	})
 }
 
 // TestBuildConfigInvalid rejects specs that cannot produce a valid

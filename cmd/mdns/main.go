@@ -227,6 +227,9 @@ type installFlags struct {
 	DoTPort       int
 	DoQPort       int
 	FilterPreset  string
+	Panel         bool
+	NoPanel       bool
+	Password      string
 }
 
 // installFlagSet registers the install flags on fs, filling f on Parse,
@@ -255,6 +258,9 @@ func installFlagSet(fs *flag.FlagSet, f *installFlags) *installFlags {
 	fs.IntVar(&f.DoTPort, "dot-port", 0, "DoT port (default 853)")
 	fs.IntVar(&f.DoQPort, "doq-port", 0, "DoQ port (default 853)")
 	fs.StringVar(&f.FilterPreset, "filter", "", "filter preset: off, basic or strict")
+	fs.BoolVar(&f.Panel, "panel", false, "enable the web panel (default: on when --password is set)")
+	fs.BoolVar(&f.NoPanel, "no-panel", false, "keep the web panel disabled")
+	fs.StringVar(&f.Password, "password", "", "web panel admin password (at least 8 characters)")
 	return f
 }
 
@@ -281,6 +287,17 @@ func installSpecFromFlags(f installFlags) (*installer.Spec, error) {
 	if domain == "" {
 		return nil, errors.New("--non-interactive требует --domain (домен сервиса)")
 	}
+	// The panel is a tri-state: --no-panel forces it off, --panel forces
+	// it on, and otherwise it follows --password.
+	var panelEnabled *bool
+	switch {
+	case f.NoPanel:
+		v := false
+		panelEnabled = &v
+	case f.Panel:
+		v := true
+		panelEnabled = &v
+	}
 	return &installer.Spec{
 		Domain:        domain,
 		TLSMode:       f.TLSMode,
@@ -299,6 +316,8 @@ func installSpecFromFlags(f installFlags) (*installer.Spec, error) {
 		DoTPort:       f.DoTPort,
 		DoQPort:       f.DoQPort,
 		FilterPreset:  f.FilterPreset,
+		PanelPassword: f.Password,
+		PanelEnabled:  panelEnabled,
 	}, nil
 }
 

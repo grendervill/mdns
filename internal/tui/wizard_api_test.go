@@ -50,7 +50,8 @@ func TestAPIWizardSave(t *testing.T) {
 	w = wizardStep(t, w, key('n'))   // -> strategy
 	w = wizardStep(t, w, enterKey()) // fastest
 	w = wizardStep(t, w, key('n'))   // -> filters
-	w = wizardStep(t, w, key('n'))   // -> summary
+	w = wizardStep(t, w, key('n'))   // -> panel (opens the question)
+	w = answerPanelDisabled(t, w)    // answer «н» and move on to the summary
 	w = wizardStep(t, w, enterKey()) // save
 
 	if !w.saved {
@@ -93,6 +94,7 @@ func TestAPIWizardSaveEmbedded(t *testing.T) {
 	w = wizardStep(t, w, enterKey())
 	w = wizardStep(t, w, key('n'))
 	w = wizardStep(t, w, key('n'))
+	w = answerPanelDisabled(t, w)
 
 	u, cmd := w.Update(enterKey())
 	w = u.(WizardModel)
@@ -140,7 +142,7 @@ func TestTUIWizardEntry(t *testing.T) {
 	if got := m.wizard.input; got != "x" {
 		t.Errorf("wizard input = %q, want the typed x", got)
 	}
-	if view := m.View(); !strings.Contains(view, "шаг 1/7") {
+	if view := m.View(); !strings.Contains(view, "шаг 1/8") {
 		t.Errorf("View() does not render the wizard:\n%s", view)
 	}
 

@@ -32,6 +32,13 @@ const (
 	dohMaxHeaderBytes    = 16 << 10
 )
 
+// Panel is the optional admin web UI mounted on the DoH listener next
+// to /dns-query. *panel.Panel implements it; the interface keeps the
+// dns package free of a dependency on the panel's own imports.
+type Panel interface {
+	Mount(mux *http.ServeMux)
+}
+
 // buildDoHServers builds the HTTPS (HTTP/1.1 + HTTP/2) and HTTP/3
 // servers sharing one handler. certs may be nil in tests; when set,
 // its GetCertificate signs every handshake. An ACME source makes the
@@ -78,8 +85,7 @@ func buildDoHServers(mux http.Handler, certs tlscert.Source, addr string) (*http
 func (s *Server) startDoH() error {
 	port := s.cfg.Protocols.DoH.Port
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", s.handleDoH)
+	mux := s.dohMux()
 
 	httpSrv, h3Srv := buildDoHServers(mux, s.certs, fmt.Sprintf(":%d", port))
 
@@ -104,6 +110,19 @@ func (s *Server) startDoH() error {
 
 	s.logger.Info("DoH listening", "port", port)
 	return nil
+}
+
+// dohMux builds the handler the HTTPS and HTTP/3 listeners share: the
+// RFC 8484 endpoint plus the optional admin panel. The patterns never
+// collide — the panel registers "/", "/login", "/logout" and
+// "/panel/..." and leaves "/dns-query" to this package.
+func (s *Server) dohMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", s.handleDoH)
+	if s.panel != nil {
+		s.panel.Mount(mux)
+	}
+	return mux
 }
 
 // handleDoH implements the RFC 8484 endpoint: POST with the wire
