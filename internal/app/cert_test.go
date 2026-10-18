@@ -241,6 +241,16 @@ func TestTLSSwitchInvalidACMERejected(t *testing.T) {
 // the tls-alpn-01 challenge is served), and does not bind :80. A bogus
 // directory makes the manager fail fast against a closed local port.
 func TestCertStatusACMEMode(t *testing.T) {
+	// ACME mode serves the tls-alpn-01 challenge on the privileged port
+	// 443. GitHub's ubuntu runners are not root and cannot bind it, so
+	// skip there rather than fail; everywhere the port binds, every
+	// assertion below still runs.
+	probe, err := net.Listen("tcp", ":443")
+	if err != nil {
+		t.Skip("requires binding :443 (privileged ports unavailable)")
+	}
+	_ = probe.Close()
+
 	fake := newFakeUpstream(t)
 	plainPort := freePort(t)
 	cfg := testConfig(t, fake, plainPort)

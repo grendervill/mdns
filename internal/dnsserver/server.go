@@ -414,11 +414,28 @@ func (s *Server) trackTLS(srv *dns.Server) {
 	s.tlsSrv = append(s.tlsSrv, srv)
 }
 
-// serve runs one listener loop and logs failures that are not part of
-// a requested shutdown.
+// serve runs one listener loop. It returns only once the loop is
+// actually serving: miekg/dns sets its started flag inside
+// ActivateAndServe, so a Shutdown racing the goroutine would otherwise
+// see "server not started" and leak the listener, leaving the port
+// bound. NotifyStartedFunc fires after that flag is set, so waiting on
+// it closes the race.
 func (s *Server) serve(srv *dns.Server, proto string, port int) {
-	if err := srv.ActivateAndServe(); err != nil {
-		s.logger.Warn("listener stopped", "proto", proto, "port", port, "error", err)
+	started := make(chan struct{})
+	srv.NotifyStartedFunc = func() { close(started) }
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if err := srv.ActivateAndServe(); err != nil {
+			s.logger.Warn("listener stopped", "proto", proto, "port", port, "error", err)
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-done:
+		// ActivateAndServe returned before signalling: bad listeners.
 	}
 }
 

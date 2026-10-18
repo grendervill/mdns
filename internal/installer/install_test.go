@@ -763,16 +763,23 @@ func TestIdempotentKeepsConfig(t *testing.T) {
 }
 
 // TestRunAbortsOnPreflightFailure checks the real preflight gate: an
-// empty Root fails the systemd check and nothing is written.
+// empty Root fails the systemd check and nothing is written. The
+// resolve seams are stubbed so the A/AAAA check does not touch the
+// network (the fixed domain would otherwise reach a live lookup).
 func TestRunAbortsOnPreflightFailure(t *testing.T) {
 	root := t.TempDir()
 	runner := newFakeRunner()
 	var out bytes.Buffer
 
 	err := Run(InstallOptions{
-		Options: Options{Root: root, Runner: runner.run},
-		Spec:    &Spec{Domain: "dns.example.com"},
-		Output:  &out,
+		Options: Options{
+			Root:         root,
+			Runner:       runner.run,
+			ResolveFn:    func(string) ([]string, error) { return []string{"198.51.100.9"}, nil },
+			LocalAddrsFn: func() []string { return []string{"198.51.100.9"} },
+		},
+		Spec:   &Spec{Domain: "dns.example.com"},
+		Output: &out,
 	})
 	if err == nil {
 		t.Fatalf("Run() with an empty Root = nil, want a preflight error")

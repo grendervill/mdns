@@ -87,15 +87,31 @@ type runtime struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	// wg tracks the background loops start launches, so stop can wait
+	// for them: the ACME manager and the filter updater write under the
+	// data directory.
+	wg sync.WaitGroup
+}
+
+// goRun starts a tracked background loop. stop waits for every loop
+// this way, so a caller that removes the data directory right after
+// Stop cannot race the ACME manager or the filter updater writing into
+// it.
+func (rt *runtime) goRun(fn func()) {
+	rt.wg.Add(1)
+	go func() {
+		defer rt.wg.Done()
+		fn()
+	}()
 }
 
 // start binds the listeners and starts the background loops.
 func (rt *runtime) start(parent context.Context) error {
 	rt.ctx, rt.cancel = context.WithCancel(parent)
 
-	go rt.monitor.Run(rt.ctx)
+	rt.goRun(func() { rt.monitor.Run(rt.ctx) })
 	if rt.updater != nil {
-		go rt.updater.Run(rt.ctx, rt.filterInterval)
+		rt.goRun(func() { rt.updater.Run(rt.ctx, rt.filterInterval) })
 	}
 
 	if err := rt.server.Start(rt.ctx); err != nil {
@@ -123,9 +139,9 @@ func (rt *runtime) startCert() error {
 				return fmt.Errorf("app: acme challenge listener: %w", err)
 			}
 		}
-		go rt.acmeMgr.Run(rt.ctx, nil)
+		rt.goRun(func() { rt.acmeMgr.Run(rt.ctx, nil) })
 	}
-	go rt.certLoop(rt.ctx)
+	rt.goRun(func() { rt.certLoop(rt.ctx) })
 	return nil
 }
 
@@ -185,7 +201,22 @@ func (rt *runtime) stop(ctx context.Context) error {
 		rt.cancel()
 		rt.cancel = nil
 	}
-	return rt.server.Shutdown(ctx)
+	err := rt.server.Shutdown(ctx)
+
+	// Wait for the background loops. The ACME manager and the filter
+	// updater write into the data directory, so a caller that removes
+	// it right after Stop (as the tests do) must not race those writes.
+	// The wait honours ctx so a stuck loop cannot hang shutdown forever.
+	done := make(chan struct{})
+	go func() {
+		rt.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	return err
 }
 
 // closeResources releases what outlives one generation: the query log

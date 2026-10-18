@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,24 +31,89 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// freePort returns a port currently free for both TCP and UDP on the
-// loopback interface.
+// appPortMin and appPortMax bound the app tests' port pool. The range
+// sits below the OS ephemeral pool (Linux starts at 32768, macOS at
+// 49152), so the kernel never hands one of these ports to an outbound
+// socket — which is what used to steal a port between freePort and the
+// server's bind. The range is disjoint from the dnsserver tests' pool
+// so the two packages can run side by side under `go test ./...`.
+const (
+	appPortMin = 20000
+	appPortMax = 25999
+)
+
+// portCursor spreads successive allocations across the pool.
+var portCursor atomic.Int64
+
+// appPorts records the ports handed out so far: a test that takes
+// several ports before binding any server still gets distinct ones.
+var appPorts = struct {
+	sync.Mutex
+	taken map[int]bool
+}{taken: make(map[int]bool)}
+
+// freePort returns a port free for both TCP and UDP on the wildcard
+// address and not yet handed out in this process. Each candidate is
+// probed several times in a row, and a port the kernel would hand to an
+// outbound socket is never a candidate, so the bind the test performs
+// right after does not race.
 func freePort(t *testing.T) int {
 	t.Helper()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen(tcp) = %v, want nil", err)
+	const rounds = 4
+	span := int64(appPortMax - appPortMin + 1)
+
+	start := appPortMin + int(portCursor.Add(1)*7919%span)
+	for i := 0; i < int(span); i++ {
+		port := appPortMin + (start-appPortMin+i)%int(span)
+		if !takeAppPort(port) {
+			continue
+		}
+		if portFree(port, rounds) {
+			return port
+		}
+		releaseAppPort(port)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	pc, err := net.ListenPacket("udp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if err != nil {
+	t.Fatalf("freePort: no free port in %d..%d", appPortMin, appPortMax)
+	return 0
+}
+
+// takeAppPort reserves port, reporting false when it is already taken.
+func takeAppPort(port int) bool {
+	appPorts.Lock()
+	defer appPorts.Unlock()
+	if appPorts.taken[port] {
+		return false
+	}
+	appPorts.taken[port] = true
+	return true
+}
+
+// releaseAppPort gives a reserved port back after a failed probe.
+func releaseAppPort(port int) {
+	appPorts.Lock()
+	defer appPorts.Unlock()
+	delete(appPorts.taken, port)
+}
+
+// portFree reports whether port binds for both TCP and UDP on the
+// wildcard address, rounds times in a row.
+func portFree(port, rounds int) bool {
+	addr := ":" + strconv.Itoa(port)
+	for i := 0; i < rounds; i++ {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return false
+		}
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			_ = ln.Close()
+			return false
+		}
+		_ = pc.Close()
 		_ = ln.Close()
-		t.Fatalf("ListenPacket(udp :%d) = %v, want nil", port, err)
 	}
-	_ = pc.Close()
-	_ = ln.Close()
-	return port
+	return true
 }
 
 // loopback builds the loopback address for port.
