@@ -266,9 +266,10 @@ func (s *Sessions) purgeLocked(now time.Time) {
 	}
 }
 
-// maxIPs bounds the number of addresses a Throttle tracks. The map is
-// capped so a spoofed-source flood cannot exhaust memory; see Allow for
-// what happens at the cap.
+// maxIPs bounds the number of addresses a Throttle tracks. The cap
+// exists only to bound memory against a spoofed-source flood; the
+// throttle's actual protection is the per-address failure counter, so
+// reaching the cap must not deny anyone (see evictOldestLocked).
 const maxIPs = 4096
 
 // Throttle counts failed logins per client address and blocks a client
@@ -280,14 +281,17 @@ const maxIPs = 4096
 // start: each Fail refreshes the entry's timestamp, so a client that
 // keeps failing stays blocked, while a client that stops is released
 // one window after its last failure.
+//
+// At most maxIPs addresses are tracked at once; the table is a bounded
+// cache, not a gate — see evictOldestLocked for why the cap never
+// refuses an attempt.
 type Throttle struct {
 	limit  int
 	window time.Duration
 	now    func() time.Time
 
-	mu        sync.Mutex
-	entries   map[string]*throttleEntry
-	lastSweep time.Time
+	mu      sync.Mutex
+	entries map[string]*throttleEntry
 }
 
 // throttleEntry is one address's failure count and the time of its last
@@ -314,12 +318,10 @@ func NewThrottle(limit int, window time.Duration) *Throttle {
 // Allow reports whether a login attempt from ip may proceed: true while
 // fewer than limit failures are on record for it, false once the limit
 // is reached or while ip's entry is still inside the window. Failures
-// older than the window are forgotten first.
-//
-// When the table is full (maxIPs tracked addresses) an unknown ip is
-// denied: fail closed, because every entry is a client that has been
-// failing, while admitting new ones is exactly what the bound exists to
-// prevent. Entries expire, so the table empties again on its own.
+// older than the window are forgotten first. An address with no entry
+// — including one the table has evicted, and any address arriving while
+// the table is full — is always allowed: only its own failures can
+// block it.
 func (t *Throttle) Allow(ip string) bool {
 	if t.disabled() {
 		return true
@@ -331,12 +333,6 @@ func (t *Throttle) Allow(ip string) bool {
 
 	entry := t.entries[ip]
 	if entry == nil {
-		if len(t.entries) >= maxIPs {
-			t.sweepLocked(now)
-			if len(t.entries) >= maxIPs {
-				return false
-			}
-		}
 		return true
 	}
 
@@ -348,8 +344,8 @@ func (t *Throttle) Allow(ip string) bool {
 }
 
 // Fail records a failed login from ip, extending the address's window.
-// At a full table an unknown ip is not recorded — Allow already refuses
-// it — so memory stays bounded.
+// At a full table the least recently failing address is evicted to make
+// room, so memory stays bounded without ever refusing an attempt.
 func (t *Throttle) Fail(ip string) {
 	if t.disabled() {
 		return
@@ -362,10 +358,7 @@ func (t *Throttle) Fail(ip string) {
 	entry := t.entries[ip]
 	if entry == nil {
 		if len(t.entries) >= maxIPs {
-			t.sweepLocked(now)
-			if len(t.entries) >= maxIPs {
-				return
-			}
+			t.evictOldestLocked()
 		}
 		t.entries[ip] = &throttleEntry{count: 1, last: now}
 		return
@@ -397,18 +390,30 @@ func (t *Throttle) disabled() bool {
 	return t.limit <= 0 || t.window <= 0
 }
 
-// sweepLocked drops entries whose last failure is older than the
-// window. It runs at most once per window, so a flood against a full
-// table cannot turn every request into a full scan. The caller must
-// hold t.mu.
-func (t *Throttle) sweepLocked(now time.Time) {
-	if now.Sub(t.lastSweep) < t.window {
-		return
-	}
-	t.lastSweep = now
+// evictOldestLocked makes room for one new entry by dropping the entry
+// with the oldest last failure. The table is a bounded cache whose only
+// purpose is to bound memory; it is deliberately not a gate, so a flood
+// from many sources cannot lock a client out of the panel — at worst an
+// attacker's own entries rotate through the table, and the legitimate
+// admin's next attempt is always allowed (their entry either survives
+// or is the one evicted, in which case they start with a clean count).
+//
+// Since an expired entry is older than every entry still inside the
+// window (now-last >= window versus < window), evicting the oldest also
+// prefers dropping stale entries, which is why no periodic sweep is
+// needed. The caller must hold t.mu.
+func (t *Throttle) evictOldestLocked() {
+	var (
+		oldestIP string
+		oldest   time.Time
+		found    bool
+	)
 	for ip, entry := range t.entries {
-		if now.Sub(entry.last) >= t.window {
-			delete(t.entries, ip)
+		if !found || entry.last.Before(oldest) {
+			oldestIP, oldest, found = ip, entry.last, true
 		}
+	}
+	if found {
+		delete(t.entries, oldestIP)
 	}
 }

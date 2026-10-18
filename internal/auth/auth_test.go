@@ -493,38 +493,80 @@ func TestThrottle(t *testing.T) {
 		}
 	})
 
-	t.Run("table stays bounded", func(t *testing.T) {
-		th, clk := newThrottle(t, 1, time.Minute)
+	t.Run("table stays bounded by evicting the oldest entry", func(t *testing.T) {
+		th, clk := newThrottle(t, 2, time.Minute)
 
-		const total = 5000
-		for i := 0; i < total; i++ {
+		// blockedAtLimit burns its whole allowance and then ages, so it
+		// is strictly the oldest entry when the flood starts.
+		const blockedAtLimit = "192.0.2.1"
+		th.Fail(blockedAtLimit)
+		th.Fail(blockedAtLimit)
+		if th.Allow(blockedAtLimit) {
+			t.Fatalf("Allow() after 2 failures = true, want false (limit 2)")
+		}
+
+		clk.advance(time.Second)
+
+		// Flood the table with 5000 distinct addresses, all younger than
+		// blockedAtLimit.
+		const flood = 5000
+		for i := 0; i < flood; i++ {
 			th.Fail(fmt.Sprintf("198.51.%d.%d", i/256, i%256))
 		}
 
 		size := auth.ThrottleSizeForTests(th)
+		if size > 4096 {
+			t.Fatalf("throttle tracks %d IPs, want at most 4096", size)
+		}
 		if size != 4096 {
-			t.Fatalf("throttle tracks %d IPs, want exactly 4096 (full table)", size)
+			t.Fatalf("throttle tracks %d IPs, want the table filled to 4096", size)
 		}
 
-		// A fresh IP arriving at a full table is denied rather than
-		// tracked, and the table does not grow.
-		const fresh = "203.0.113.7"
-		if th.Allow(fresh) {
-			t.Errorf("Allow(fresh IP) with a full table = true, want false")
+		// The oldest entry was evicted, so that address starts fresh
+		// instead of staying blocked forever by a table it no longer
+		// occupies.
+		if !th.Allow(blockedAtLimit) {
+			t.Errorf("Allow(evicted oldest IP) = false, want true (entry evicted, count starts over)")
 		}
-		th.Fail(fresh)
+
+		// The cap does not deny unknown addresses: the table is a memory
+		// bound, not a gate, and the admin must not be locked out by a
+		// flood from other sources.
+		const unseen = "203.0.113.7"
+		if !th.Allow(unseen) {
+			t.Errorf("Allow(untracked IP) with a full table = false, want true")
+		}
+
+		// Per-IP protection is unchanged: the last address inserted is
+		// still tracked with its single failure, so one more failure
+		// takes it over the limit.
+		lastFloodIP := fmt.Sprintf("198.51.%d.%d", (flood-1)/256, (flood-1)%256)
+		th.Fail(lastFloodIP)
+		if th.Allow(lastFloodIP) {
+			t.Errorf("Allow() after 2 failures on a tracked IP = true, want false (limit 2)")
+		}
+
+		// A new address is admitted and counted on its own.
+		th.Fail(unseen)
+		if !th.Allow(unseen) {
+			t.Errorf("Allow() after 1 failure = false, want true (limit 2)")
+		}
+		th.Fail(unseen)
+		if th.Allow(unseen) {
+			t.Errorf("Allow() after 2 failures = true, want false (limit 2)")
+		}
 		if size := auth.ThrottleSizeForTests(th); size != 4096 {
-			t.Errorf("Fail() on a full table grew it to %d, want 4096", size)
+			t.Errorf("throttle tracks %d IPs after insert-evictions, want 4096", size)
 		}
 
-		// Once the window passes, expired entries are swept and new IPs
-		// are admitted again.
+		// Stale entries are dropped when touched: past its window the
+		// tracked address is allowed again and its entry disappears.
 		clk.advance(time.Minute + time.Second)
-		if !th.Allow(fresh) {
-			t.Errorf("Allow(fresh IP) after the window = false, want true")
+		if !th.Allow(lastFloodIP) {
+			t.Errorf("Allow() past the window = false, want true")
 		}
-		if size := auth.ThrottleSizeForTests(th); size != 0 {
-			t.Errorf("expired entries not swept: %d left, want 0", size)
+		if size := auth.ThrottleSizeForTests(th); size != 4095 {
+			t.Errorf("throttle tracks %d IPs after touching an expired entry, want 4095", size)
 		}
 	})
 
