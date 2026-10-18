@@ -455,7 +455,8 @@ to `/dns-query`, on the same TLS endpoint:
 https://dns.example.com/
 ```
 
-The port is the DoH port (443 by default). The login is `admin` and the
+The port is the DoH port (443 by default): with a non-443 DoH port the
+panel lives at `https://<domain>:<port>/`. The login is `admin` and the
 password chosen at setup; change it later on the **Настройки** page. The
 panel is therefore reachable only while DoH is enabled, and it presents
 the DoH certificate.
@@ -537,8 +538,8 @@ archive beyond the ring.
 ### Security
 
 - The password is stored only as an argon2id PHC hash (64 MiB, 3
-  iterations, 2 lanes at the current cost) and verified in constant
-  time.
+  iterations, 2 parallel lanes at the current cost) and verified in
+  constant time.
 - The session cookie is `HttpOnly`, `Secure` and `SameSite=Lax`, lives
   30 days and is kept in memory, so a daemon restart logs everybody out.
   After five failed logins from one address, further attempts answer
@@ -546,10 +547,12 @@ archive beyond the ring.
 - Every mutation needs a CSRF token bound to the session; the login form
   has its own, bound to a pre-session cookie. A bad token is a `403` and
   leaves the session alive.
-- Pages go through `html/template`'s contextual escaping. Responses
-  carry `Content-Security-Policy: default-src 'self'; frame-ancestors
-  'none'`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`
-  and `Cache-Control: no-store`.
+- Pages go through `html/template`'s contextual escaping. Every HTML
+  page response carries `Content-Security-Policy: frame-ancestors 'none';
+  default-src 'self'`, `X-Frame-Options: DENY`,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; the
+  embedded static assets under `/panel/static/` are sent with
+  `Cache-Control: max-age=3600` instead.
 - CSS, JS and the vendored htmx are embedded in the binary: no CDN and
   no external font or asset request, so the panel works on an isolated
   network.
