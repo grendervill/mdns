@@ -552,3 +552,29 @@ input.num-input { width: 78px; text-align: center; font-family: var(--mono); }
   .tbl th, .tbl td { padding: 8px 10px; }
 }
 
+/* Phone widths: the five fixed columns leave the domain with almost no
+   room, because the latency/source cell ("0 мс · adguard-dns-filter")
+   and the result tag are sized to their content. Move the latency and
+   source onto a second line under the name and keep the tag on the
+   right, so the name keeps the widest cell and nothing overflows. The
+   status feed and the history page share this row markup. */
+@media (max-width: 480px) {
+  .wire .q {
+    grid-template-columns: 60px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "time name tag"
+      "time source tag";
+    align-items: start;
+    gap: 2px 10px;
+    padding: 8px 12px;
+  }
+  .wire .q .t { grid-area: time; }
+  .wire .q .name { grid-area: name; }
+  .wire .q .proto { display: none; }
+  .wire .q .tag { grid-area: tag; align-self: center; }
+  .wire .q .ms {
+    grid-area: source;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
