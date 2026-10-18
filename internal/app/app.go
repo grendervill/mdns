@@ -24,12 +24,14 @@ import (
 	"mydns/internal/core"
 	"mydns/internal/dnsserver"
 	"mydns/internal/filter"
+	"mydns/internal/panel"
 	"mydns/internal/qlog"
 	"mydns/internal/ratelimit"
 	"mydns/internal/routing"
 	"mydns/internal/stats"
 	"mydns/internal/tlscert"
 	"mydns/internal/upstream"
+	"mydns/internal/version"
 )
 
 // Options adjust the app for tests; zero values mean production
@@ -268,6 +270,12 @@ type App struct {
 	apiLn   net.Listener
 	apiDone chan struct{}
 
+	// panel is the admin web UI, mounted on the DoH listener. It lives
+	// for the whole app, not one runtime generation: its sessions and
+	// login throttle must survive a configuration rebuild, or applying
+	// a settings change would log everybody out.
+	panel *panel.Panel
+
 	appCtx context.Context
 	cancel context.CancelFunc
 }
@@ -299,7 +307,27 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		started:   time.Now(),
 	}
 	a.wireEvents(rt)
+
+	a.panel = panel.New(panel.Options{
+		Ctrl:    a,
+		Version: version.String(),
+		Logger:  logger,
+		Auth:    a.panelAuth,
+	})
+	rt.server.SetPanel(a.panel)
 	return a, nil
+}
+
+// panelAuth reports the panel's live enabled flag and password hash from
+// the current configuration. The panel asks on every request, so a
+// password change from the panel (Task 9) takes effect without a
+// restart. Changing the hash does not revoke the live sessions: a
+// browser that is already signed in keeps its cookie until it expires
+// or the admin logs out.
+func (a *App) panelAuth() (bool, string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Panel.Enabled, a.cfg.Panel.PasswordHash
 }
 
 // Start launches the background loops, binds the listeners and serves
@@ -414,6 +442,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	if err != nil {
 		return err
 	}
+	// The panel persists across generations; hand it to the freshly
+	// built DoH listener before that listener starts.
+	newRT.server.SetPanel(a.panel)
 
 	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

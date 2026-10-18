@@ -41,6 +41,11 @@ type Server struct {
 	limiter *ratelimit.Limiter
 	logger  *slog.Logger
 
+	// panel is the optional admin web UI served by the DoH listener. It
+	// is configured before Start with SetPanel and never changes while
+	// the server runs, so startDoH can read it under the lock.
+	panel Panel
+
 	// alpnPort is the TCP port ACME TLS-ALPN-01 validation uses; it is
 	// acmeALPNPort and only a test overrides it, so the eager-DoH path
 	// can be exercised on an unprivileged port.
@@ -67,6 +72,15 @@ func New(cfg *config.Config, c *core.Core, certs tlscert.Source, lim *ratelimit.
 		logger = slog.Default()
 	}
 	return &Server{cfg: cfg, core: c, certs: certs, limiter: lim, logger: logger, alpnPort: acmeALPNPort}
+}
+
+// SetPanel installs the optional admin web UI on the DoH listener. It
+// must be called before Start; a nil panel (the default) leaves the
+// listener with /dns-query only.
+func (s *Server) SetPanel(p Panel) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.panel = p
 }
 
 // needsEagerDoH reports whether the DoH listener must start before the

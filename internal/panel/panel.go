@@ -1,0 +1,253 @@
+// Package panel serves the mdns admin web UI. It is mounted on the DoH
+// listener next to /dns-query: a small server-rendered HTML surface
+// with session login and CSRF-protected forms. Later tasks add the
+// status, history and management pages on top of this skeleton.
+package panel
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"mydns/internal/api"
+	"mydns/internal/auth"
+	"mydns/internal/config"
+)
+
+const (
+	// SessionTTL is how long a login lasts. Sessions live in memory,
+	// so a restart logs everybody out.
+	SessionTTL = 30 * 24 * time.Hour
+
+	// LoginFailLimit and LoginFailWindow bound failed logins per client
+	// address. They are positive on purpose: a zero limit or window
+	// would switch the auth.Throttle off silently, and the panel must
+	// never do that.
+	LoginFailLimit  = 5
+	LoginFailWindow = 15 * time.Minute
+
+	// sessionCookie is the name of the login cookie. It never appears
+	// in a URL: the SSE stream and every page read it from the header.
+	sessionCookie = "mdns_session"
+
+	// defaultPingInterval paces the /panel/events keep-alives until the
+	// status page replaces the placeholder stream.
+	defaultPingInterval = 15 * time.Second
+)
+
+// Controller is the slice of the daemon the panel consumes. It mirrors
+// api.Controller; *app.App implements both. Later pages widen this
+// interface as they need more of the API.
+type Controller interface {
+	// Config returns the current configuration.
+	Config() *config.Config
+	// Status returns the read-only daemon snapshot.
+	Status(ctx context.Context) (api.Status, error)
+}
+
+// Options configure a Panel. Zero values are safe: Sessions and
+// Throttle are built with the production defaults when omitted.
+type Options struct {
+	// Enabled and PasswordHash are a static answer used when Auth is
+	// nil (tests and embedders). A nil Auth means the panel never sees
+	// a password change.
+	Enabled      bool
+	PasswordHash string
+
+	// Auth, when set, is the live source of the enabled flag and the
+	// password hash. It is consulted on every request and nothing is
+	// cached, so a password change from the panel applies without a
+	// restart. Changing the hash does not revoke the sessions that are
+	// already open; that is deliberate, so an admin who rotates the
+	// password is not logged out of the tab they are using. It wins
+	// over Enabled and PasswordHash.
+	Auth func() (enabled bool, hash string)
+
+	// Sessions holds the live login tokens. Nil builds the default
+	// store with SessionTTL; pass one to share it with a caller that
+	// wants to revoke sessions itself.
+	Sessions *auth.Sessions
+	// Throttle bounds failed logins. Nil builds the default throttle
+	// with LoginFailLimit and LoginFailWindow.
+	Throttle *auth.Throttle
+
+	// Ctrl is the daemon behind the panel. It may be nil in tests that
+	// only exercise routing and auth.
+	Ctrl Controller
+	// Version is the daemon version shown in the shell.
+	Version string
+	// Logger receives warnings; nil falls back to slog.Default.
+	Logger *slog.Logger
+
+	// PingInterval paces /panel/events keep-alives; 0 → 15s.
+	PingInterval time.Duration
+}
+
+// Panel is the web UI. Build it with New and mount it with Mount; it is
+// safe for concurrent use.
+type Panel struct {
+	// authFn resolves the live enabled flag and password hash. It is
+	// either Options.Auth or a closure over the static Options fields.
+	authFn   func() (enabled bool, hash string)
+	version  string
+	ctrl     Controller
+	sessions *auth.Sessions
+	throttle *auth.Throttle
+	logger   *slog.Logger
+
+	// csrfKey is a per-process random secret: CSRF tokens are an HMAC
+	// of a request's session token under it, so a token is bound to one
+	// session and cannot be replayed across sessions. It lives only in
+	// memory, consistent with the in-memory sessions.
+	csrfKey []byte
+
+	pingInterval time.Duration
+}
+
+// New builds a Panel. A nil Sessions or Throttle is replaced with the
+// production default, so the panel never runs without its abuse
+// controls.
+func New(opts Options) *Panel {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	sessions := opts.Sessions
+	if sessions == nil {
+		sessions = auth.NewSessions(SessionTTL)
+	}
+	throttle := opts.Throttle
+	if throttle == nil {
+		throttle = auth.NewThrottle(LoginFailLimit, LoginFailWindow)
+	}
+	ping := opts.PingInterval
+	if ping <= 0 {
+		ping = defaultPingInterval
+	}
+
+	authFn := opts.Auth
+	if authFn == nil {
+		enabled, hash := opts.Enabled, opts.PasswordHash
+		authFn = func() (bool, string) { return enabled, hash }
+	}
+
+	return &Panel{
+		authFn:       authFn,
+		version:      opts.Version,
+		ctrl:         opts.Ctrl,
+		sessions:     sessions,
+		throttle:     throttle,
+		logger:       logger,
+		csrfKey:      mustRandom(32),
+		pingInterval: ping,
+	}
+}
+
+// auth reports the live enabled flag and stored password hash. When
+// Options.Auth is set it is the only source — the panel caches nothing,
+// so an update to the running configuration takes effect at once.
+func (p *Panel) auth() (enabled bool, hash string) {
+	return p.authFn()
+}
+
+// Mount registers every panel route on mux. The DoH listener shares one
+// mux with /dns-query, so the patterns here never collide with it. A
+// disabled panel still registers the routes but answers 404 on all of
+// them, so it does not reveal that it exists.
+func (p *Panel) Mount(mux *http.ServeMux) {
+	mux.HandleFunc("GET /{$}", p.handleRoot)
+
+	mux.HandleFunc("GET /login", p.handleLoginForm)
+	mux.HandleFunc("POST /login", p.handleLoginSubmit)
+
+	mux.Handle("POST /logout", p.requireSession(http.HandlerFunc(p.handleLogout)))
+
+	// Static assets are public: the login page itself needs them.
+	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
+	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
+	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleIndex)))
+
+	// Catch-alls for the wrong method or an unknown subpath. They gate
+	// on the session like the rest of /panel/, and answer 404 behind
+	// it, so no route leaks into an unauthenticated answer.
+	mux.Handle("/login", http.HandlerFunc(p.handleNotFound))
+	mux.Handle("/logout", http.HandlerFunc(p.handleNotFound))
+	mux.Handle("/panel/", p.requireSession(http.HandlerFunc(p.handleNotFound)))
+}
+
+// handleRoot is the convenience root: it points at the panel when the
+// panel is on, and 404s when it is off, before redirecting anywhere.
+func (p *Panel) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if enabled, _ := p.auth(); !enabled {
+		p.handleNotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/panel/", http.StatusFound)
+}
+
+// handleNotFound answers 404 without a body that hints at the panel.
+func (p *Panel) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	http.NotFound(w, r)
+}
+
+// requireSession gates a handler behind a valid session. Anonymous GETs
+// are sent to /login; anonymous mutations get a 401 (there is no form
+// to redirect back to). Mutations additionally need the session-bound
+// CSRF token; a bad token is a 403 and leaves the session intact.
+func (p *Panel) requireSession(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enabled, _ := p.auth()
+		if !enabled {
+			p.handleNotFound(w, r)
+			return
+		}
+
+		token := p.sessionToken(r)
+		if token == "" || !p.sessions.Valid(token) {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+			} else {
+				http.Error(w, "authentication required", http.StatusUnauthorized)
+			}
+			return
+		}
+
+		if isMutating(r.Method) && !p.csrfValid(w, r, sessionCSRFBinding(token)) {
+			http.Error(w, "invalid CSRF token", http.StatusForbidden)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isMutating reports whether a method changes state and therefore needs
+// a CSRF token.
+func isMutating(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// mustRandom returns n cryptographically random bytes, or panics. A
+// failure here means the process cannot get randomness, which no panel
+// can recover from.
+func mustRandom(n int) []byte {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		panic(fmt.Sprintf("panel: cannot read randomness: %v", err))
+	}
+	return buf
+}
+
+// randomToken returns a fresh URL-safe random token.
+func randomToken() string {
+	return base64.RawURLEncoding.EncodeToString(mustRandom(32))
+}

@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
 )
@@ -32,6 +33,53 @@ func TestDoHServersHardened(t *testing.T) {
 	}
 	if h3Srv.MaxHeaderBytes <= 0 {
 		t.Errorf("HTTP/3 MaxHeaderBytes = 0, want > 0")
+	}
+}
+
+// fakePanel records that it was mounted and adds one route, so the test
+// can see the panel's patterns land on the DoH mux.
+type fakePanel struct{ mounted bool }
+
+func (f *fakePanel) Mount(mux *http.ServeMux) {
+	f.mounted = true
+	mux.HandleFunc("GET /panel/probe", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+}
+
+// TestDoHMuxMountsPanel checks that a panel passed through SetPanel is
+// mounted next to /dns-query, and that the DoH endpoint keeps working.
+func TestDoHMuxMountsPanel(t *testing.T) {
+	var s Server
+	panel := &fakePanel{}
+	s.SetPanel(panel)
+
+	mux := s.dohMux()
+	if !panel.mounted {
+		t.Fatal("panel was not mounted on the DoH mux")
+	}
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dns-query", nil))
+	if rec.Code == http.StatusNotFound {
+		t.Error("/dns-query is not routed when a panel is mounted")
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/probe", nil))
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("panel route = %d, want 204", rec.Code)
+	}
+}
+
+// TestDoHMuxWithoutPanel checks the default: no panel, /dns-query only.
+func TestDoHMuxWithoutPanel(t *testing.T) {
+	var s Server
+
+	rec := httptest.NewRecorder()
+	s.dohMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET / without a panel = %d, want 404", rec.Code)
 	}
 }
 
