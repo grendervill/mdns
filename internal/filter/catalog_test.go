@@ -36,6 +36,53 @@ func TestCatalogShape(t *testing.T) {
 	}
 }
 
+// TestRegionalCatalog checks the regional block lists: at least 14
+// entries, all https with hosts, and every ID unique across the whole
+// catalog (the presets must not be disturbed by the addition).
+func TestRegionalCatalog(t *testing.T) {
+	entries := filter.Catalog()
+
+	regional := 0
+	regionalIDs := map[string]bool{}
+	for _, e := range entries {
+		if e.Category != "regional" {
+			continue
+		}
+		regional++
+		if regionalIDs[e.ID] {
+			t.Errorf("regional id %q is duplicated", e.ID)
+		}
+		regionalIDs[e.ID] = true
+
+		u, err := url.Parse(e.URL)
+		if err != nil {
+			t.Errorf("regional entry %q: url %q does not parse: %v", e.ID, e.URL, err)
+			continue
+		}
+		if u.Scheme != "https" || u.Host == "" {
+			t.Errorf("regional entry %q: url %q must be https with a host", e.ID, e.URL)
+		}
+	}
+	if regional < 14 {
+		t.Errorf("catalog has %d regional entries, want at least 14", regional)
+	}
+
+	for _, id := range []string{"ruadlist", "certpl-warning", "easylist-germany"} {
+		if !regionalIDs[id] {
+			t.Errorf("regional entry %q is missing", id)
+		}
+	}
+
+	// Unique across the whole catalog, not just within the category.
+	all := map[string]bool{}
+	for _, e := range entries {
+		if all[e.ID] {
+			t.Errorf("catalog id %q is duplicated across categories", e.ID)
+		}
+		all[e.ID] = true
+	}
+}
+
 // TestPresetRefsExist checks that presets only reference catalog IDs.
 func TestPresetRefsExist(t *testing.T) {
 	for _, name := range []string{"basic", "strict"} {

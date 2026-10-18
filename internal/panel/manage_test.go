@@ -1188,7 +1188,8 @@ func TestFiltersCatalogPage(t *testing.T) {
 	}
 	wants := []string{
 		"Готовые списки",
-		"реклама и трекеры", "комбинированные",
+		"реклама и трекеры", "комбинированные", "региональные",
+		"RU AdList", "CERT.PL Warning List",
 		`action="/panel/filters/lists/add"`,
 		`action="/panel/filters/lists/remove"`,
 		`value="adguard-dns-filter"`,

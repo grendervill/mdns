@@ -903,6 +903,8 @@ func listCategoryLabel(category string) string {
 		return "реклама и трекеры"
 	case "combined":
 		return "комбинированные"
+	case "regional":
+		return "региональные"
 	default:
 		return category
 	}
