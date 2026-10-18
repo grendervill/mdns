@@ -756,6 +756,47 @@ func TestRunAbortsOnPreflightFailure(t *testing.T) {
 	}
 }
 
+// TestRunPreflightUsesSpecDomain checks that the non-interactive run
+// passes the spec's domain to the checks: the A/AAAA check is skipped
+// with an empty domain, so a mismatch must surface as a warning for
+// that domain.
+func TestRunPreflightUsesSpecDomain(t *testing.T) {
+	root, source, runner := installFixture(t)
+
+	const domain = "dns.example.com"
+	var checkedDomain string
+	checks := func(o Options) []Check {
+		checkedDomain = o.Domain
+		return []Check{checkARecord(o)}
+	}
+
+	spec := Spec{Domain: domain}
+	var out bytes.Buffer
+	err := Run(InstallOptions{
+		Options: Options{
+			Root:      root,
+			Runner:    runner.run,
+			ResolveFn: func(string) ([]string, error) { return []string{"198.51.100.9"}, nil },
+			// Deliberate mismatch: the A record points elsewhere.
+			LocalAddrsFn: func() []string { return []string{"203.0.113.7"} },
+		},
+		preflight:    checks,
+		BinarySource: source,
+		Spec:         &spec,
+		Output:       &out,
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil (the mismatch is a warning)", err)
+	}
+	if checkedDomain != domain {
+		t.Errorf("preflight Options.Domain = %q, want %q", checkedDomain, domain)
+	}
+	text := out.String()
+	if !strings.Contains(text, domain) || !strings.Contains(text, "запись домена должна указывать на этот сервер") {
+		t.Errorf("output lacks the A/AAAA warning for %s:\n%s", domain, text)
+	}
+}
+
 // TestRunFailsOnFailingCheck checks the gate itself and that warnings
 // do not block the run.
 func TestRunFailsOnFailingCheck(t *testing.T) {

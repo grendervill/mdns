@@ -123,6 +123,13 @@ func Run(opts InstallOptions) error {
 	if len(o.BindPorts) == 0 {
 		o.BindPorts = enabledPorts(effective)
 	}
+	// The A/AAAA check needs the domain. A non-interactive run knows it
+	// from the spec (or from the existing config it keeps); in the
+	// interactive path the wizard has not asked for it yet, so the check
+	// stays skipped there.
+	if opts.Spec != nil && effective != nil {
+		o.Domain = effective.Domain
+	}
 
 	// 1. Preflight: warnings are printed, failures abort.
 	check := opts.preflight
