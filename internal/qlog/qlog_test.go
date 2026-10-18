@@ -113,6 +113,14 @@ func TestQueryPagination(t *testing.T) {
 			t.Fatalf("Query(0,2) = %v, want %v (newest first)", qnames(page), want)
 		}
 
+		// The page is a copy of the snapshot: mutating it must not
+		// reach the ring.
+		page[0].QName = "mutated.example.com"
+		again, _ := l.Query(qlog.Query{}, 0, 2)
+		if want := []string{"q5.example.com", "q4.example.com"}; !reflect.DeepEqual(qnames(again), want) {
+			t.Fatalf("after mutating a page, Query(0,2) = %v, want %v", qnames(again), want)
+		}
+
 		page, total = l.Query(qlog.Query{}, 2, 2)
 		if total != 5 {
 			t.Fatalf("Query(2,2) total = %d, want 5", total)

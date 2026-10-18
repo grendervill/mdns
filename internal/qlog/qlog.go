@@ -150,8 +150,11 @@ func (l *Log) Recent(n int) []Entry {
 
 // Query filters the ring (newest entries first) and returns one page
 // of matches along with the total number of entries that matched the
-// filter. The ring is read under the mutex and matching entries are
-// copied out, so the returned page never aliases the live buffer.
+// filter. The live ring is snapshotted under the mutex; filtering and
+// paging then run on that copy after the lock is released, so a UI
+// page fetch never holds up Add (which keeps the mutex across its disk
+// write). The returned page is a slice of the copy and never aliases
+// the ring.
 //
 // The filters are:
 //
@@ -175,22 +178,26 @@ func (l *Log) Query(q Query, offset, limit int) (entries []Entry, total int) {
 		offset = 0
 	}
 
+	// Snapshot the live ring, newest first, under the lock. Copying is
+	// O(live); the filter below is not, so it runs unlocked.
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	count := l.next
 	if l.filled {
 		count = len(l.buf)
 	}
-
-	search := strings.ToLower(q.Search)
-	matched := make([]Entry, 0, count)
+	snapshot := make([]Entry, count)
 	for i := 0; i < count; i++ {
-		e := l.buf[(l.next-1-i+len(l.buf))%len(l.buf)]
-		if !matches(e, q, search) {
-			continue
+		snapshot[i] = l.buf[(l.next-1-i+len(l.buf))%len(l.buf)]
+	}
+	l.mu.Unlock()
+
+	// Filter in place over the private snapshot.
+	search := strings.ToLower(q.Search)
+	matched := snapshot[:0]
+	for _, e := range snapshot {
+		if matches(e, q, search) {
+			matched = append(matched, e)
 		}
-		matched = append(matched, e)
 	}
 
 	total = len(matched)
