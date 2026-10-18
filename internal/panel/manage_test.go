@@ -1159,6 +1159,7 @@ func TestSettingsPage(t *testing.T) {
 		`name="doq.port" value="853"`,
 		`name="strategy"`,
 		`value="fastest" selected`,
+		`name="timezone" value=""`,
 		`name="cache.size" value="10000"`,
 		`name="cache.min_ttl" value="0"`,
 		`name="cache.max_ttl" value="86400"`,
@@ -1177,6 +1178,78 @@ func TestSettingsPage(t *testing.T) {
 		}
 	}
 	assertNoInlineAssets(t, body)
+}
+
+// TestSettingsTimezone checks the settings form's «Часовой пояс» field: a
+// valid IANA zone persists, the form shows the stored zone and its
+// datalist, and a bad zone re-renders with the error while the live
+// config stays unchanged.
+func TestSettingsTimezone(t *testing.T) {
+	t.Run("a valid zone is saved", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("timezone", "Europe/Moscow")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		wantRedirect(t, resp, "/panel/settings?ok=settings")
+
+		sent := ctrl.sent()
+		if len(sent) != 1 {
+			t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+		}
+		if sent[0].Timezone != "Europe/Moscow" {
+			t.Errorf("saved Timezone = %q, want Europe/Moscow", sent[0].Timezone)
+		}
+	})
+
+	t.Run("the form shows the stored zone and datalist", func(t *testing.T) {
+		cfg := manageConfig(t)
+		cfg.Timezone = "Asia/Almaty"
+		p, srv := managePanel(t, &manageCtrl{cfg: cfg})
+
+		code, body := authedGET(t, p, srv, "/panel/settings")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/settings = %d, want 200", code)
+		}
+		for _, want := range []string{
+			`name="timezone" value="Asia/Almaty"`,
+			`id="tz-zones"`,
+			`value="Europe/Moscow"`,
+			`value="UTC"`,
+			"IANA-зона, пусто — системная",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the settings page is missing %q", want)
+			}
+		}
+	})
+
+	t.Run("an unknown zone is rejected and changes nothing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("timezone", "Mars/Base")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "timezone") || !strings.Contains(body, "Mars/Base") {
+			t.Errorf("the re-rendered page does not report the bad zone:\n%s", body)
+		}
+		if !strings.Contains(body, `name="timezone" value="Mars/Base"`) {
+			t.Error("the form does not echo the rejected value")
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("UpdateConfig ran for a config Validate rejects")
+		}
+		if ctrl.cfg.Timezone != "" {
+			t.Errorf("live config timezone = %q, want it unchanged", ctrl.cfg.Timezone)
+		}
+	})
 }
 
 // TestSettingsApply sends the edited values in the full config.

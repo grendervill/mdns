@@ -16,6 +16,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Embeds the IANA time zone database so the panel's configurable
+	// timezone (config.Config.Timezone) resolves in the static Linux
+	// binary, which has no /usr/share/zoneinfo.
+	_ "time/tzdata"
 
 	"mydns/internal/app"
 	"mydns/internal/config"

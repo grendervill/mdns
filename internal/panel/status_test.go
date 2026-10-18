@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -289,6 +290,61 @@ func TestStatusRenders(t *testing.T) {
 	}
 	if strings.Contains(body, "<script>") {
 		t.Error("page carries an inline <script> element (forbidden by the CSP)")
+	}
+}
+
+// TestStatusFeedTimezone checks that the live feed renders a query's time
+// in the configured IANA zone (Europe/Moscow is UTC+3 all year, so no DST
+// edge is involved) and that the stored Entry.Time keeps its own zone.
+func TestStatusFeedTimezone(t *testing.T) {
+	// 2026-01-02 12:00:00 UTC is 15:00:00 in Moscow (UTC+3, no DST).
+	noon := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	stored := qlog.Entry{Time: noon, QName: "noon.example.", QType: 1, Proto: "udp", Upstream: "cloudflare", LatencyMS: 5}
+	feedTime := regexp.MustCompile(`<span class="t">\d{2}:\d{2}:\d{2}</span>`)
+
+	t.Run("Europe/Moscow shifts the feed to 15:00:00", func(t *testing.T) {
+		ctrl := &statusCtrl{
+			cfg:    &config.Config{Domain: "dns.example.test", Timezone: "Europe/Moscow"},
+			recent: []qlog.Entry{stored},
+		}
+		p, srv := statusPanel(t, ctrl)
+
+		code, body := authedGET(t, p, srv, "/panel/")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/ = %d, want 200\n%s", code, body)
+		}
+		if !strings.Contains(body, `<span class="t">15:00:00</span>`) {
+			t.Errorf("feed does not render 12:00 UTC as 15:00:00 in Europe/Moscow:\n%s", body)
+		}
+		if !stored.Time.Equal(noon) || stored.Time.Location() != time.UTC {
+			t.Error("the displayed zone changed the stored Entry.Time")
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		zone string
+	}{
+		{"an empty zone falls back to local", ""},
+		{"an unknown stored zone falls back to local", "Mars/Base"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctrl := &statusCtrl{
+				cfg:    &config.Config{Domain: "dns.example.test", Timezone: tt.zone},
+				recent: []qlog.Entry{stored},
+			}
+			p, srv := statusPanel(t, ctrl)
+
+			code, body := authedGET(t, p, srv, "/panel/")
+			if code != http.StatusOK {
+				t.Fatalf("GET /panel/ = %d, want 200 (must not panic)", code)
+			}
+			// The process zone is unknown here, so only the shape is
+			// asserted; the test never mutates time.Local.
+			if !feedTime.MatchString(body) {
+				t.Errorf("feed row time is not HH:MM:SS:\n%s", body)
+			}
+		})
 	}
 }
 

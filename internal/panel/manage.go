@@ -1209,8 +1209,9 @@ type settingsView struct {
 	CSRF   string
 	Nav    string
 
-	FormDomain string
-	Strategies []strategyOption
+	FormDomain   string
+	FormTimezone string
+	Strategies   []strategyOption
 
 	Protocols []protocolRow
 
@@ -1226,6 +1227,7 @@ type settingsView struct {
 func settingsFromConfig(cfg *config.Config) settingsView {
 	view := settingsView{
 		FormDomain:     cfg.Domain,
+		FormTimezone:   cfg.Timezone,
 		CacheSize:      strconv.Itoa(cfg.Cache.Size),
 		CacheMinTTL:    strconv.FormatUint(uint64(cfg.Cache.MinTTL), 10),
 		CacheMaxTTL:    strconv.FormatUint(uint64(cfg.Cache.MaxTTL), 10),
@@ -1254,6 +1256,7 @@ func settingsFromConfig(cfg *config.Config) settingsView {
 func settingsFromForm(r *http.Request) settingsView {
 	view := settingsView{
 		FormDomain:     r.PostFormValue("domain"),
+		FormTimezone:   strings.TrimSpace(r.PostFormValue("timezone")),
 		Strategies:     strategyOptions(strings.TrimSpace(r.PostFormValue("strategy"))),
 		CacheSize:      strings.TrimSpace(r.PostFormValue("cache.size")),
 		CacheMinTTL:    strings.TrimSpace(r.PostFormValue("cache.min_ttl")),
@@ -1327,6 +1330,11 @@ func applySettingsForm(next *config.Config, r *http.Request) error {
 		return errors.New("домен не может быть пустым")
 	}
 	next.Domain = domain
+
+	// The timezone is left unvalidated here: an unknown IANA zone is a
+	// semantic error config.Validate reports, so the page and the daemon
+	// cannot disagree.
+	next.Timezone = strings.TrimSpace(r.PostFormValue("timezone"))
 
 	for _, f := range protocolFields {
 		port, err := formInt(r, f.field+".port")

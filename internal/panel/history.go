@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 
@@ -237,14 +238,15 @@ func historySource(e qlog.Entry) string {
 	}
 }
 
-// historyCSVRecord renders one entry as a CSV row.
-func historyCSVRecord(e qlog.Entry) []string {
+// historyCSVRecord renders one entry as a CSV row. The time is exported
+// in the panel's configured zone; the stored Entry.Time is untouched.
+func historyCSVRecord(e qlog.Entry, loc *time.Location) []string {
 	qtype := dns.TypeToString[e.QType]
 	if qtype == "" {
 		qtype = "TYPE" + strconv.Itoa(int(e.QType))
 	}
 	return []string{
-		e.Time.Format("2006-01-02 15:04:05"),
+		e.Time.In(loc).Format("2006-01-02 15:04:05"),
 		e.Proto,
 		e.QName,
 		qtype,
@@ -327,7 +329,7 @@ func (p *Panel) handleHistory(w http.ResponseWriter, r *http.Request) {
 			entries, _ = p.ctrl.RequestsQuery(params.query(), params.Page, historyPerPage)
 		}
 
-		view.Rows = rowsFor(entries)
+		view.Rows = rowsFor(entries, p.location())
 		view.Page, view.Pages = params.Page, pages
 		if params.Page > 1 {
 			prev := params
@@ -377,11 +379,12 @@ func (p *Panel) handleHistoryCSV(w http.ResponseWriter, r *http.Request) {
 
 	if p.ctrl != nil {
 		q := params.query()
+		loc := p.location()
 		collected := 0
 		for page := 1; collected < csvMaxRows; page++ {
 			entries, total := p.ctrl.RequestsQuery(q, page, csvPageSize)
 			for _, e := range entries {
-				writeCSVRecord(bw, historyCSVRecord(e))
+				writeCSVRecord(bw, historyCSVRecord(e, loc))
 			}
 			collected += len(entries)
 			if len(entries) == 0 || collected >= total {

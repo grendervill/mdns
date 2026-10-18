@@ -357,10 +357,11 @@ type rowView struct {
 // the tag carries the outcome and the last cell the latency and the
 // source (upstream ID, block-list name, or nothing for a cache hit).
 // The history page renders the same row through this helper, so the
-// two screens can never drift apart.
-func rowViewFor(e qlog.Entry) rowView {
+// two screens can never drift apart. The time is shown in loc, which the
+// panel loads from its live config; the entry itself is untouched.
+func rowViewFor(e qlog.Entry, loc *time.Location) rowView {
 	rv := rowView{
-		Time:  e.Time.Format("15:04:05"),
+		Time:  e.Time.In(loc).Format("15:04:05"),
 		QName: e.QName,
 		Proto: e.Proto,
 		Title: queryTitle(e),
@@ -404,11 +405,11 @@ func queryTitle(e qlog.Entry) string {
 }
 
 // rowsFor renders entries through the shared feed row helper. Both the
-// live feed and the history table use it.
-func rowsFor(entries []qlog.Entry) []rowView {
+// live feed and the history table use it, in the panel's configured zone.
+func rowsFor(entries []qlog.Entry, loc *time.Location) []rowView {
 	rows := make([]rowView, len(entries))
 	for i, e := range entries {
-		rows[i] = rowViewFor(e)
+		rows[i] = rowViewFor(e, loc)
 	}
 	return rows
 }
@@ -588,7 +589,7 @@ func certStateLabel(state string) (class, label string, known bool) {
 
 // feedRows renders the buffer's rows, newest first.
 func (p *Panel) feedRows() []rowView {
-	return rowsFor(p.feed.snapshot())
+	return rowsFor(p.feed.snapshot(), p.location())
 }
 
 // handleEvents streams the live feed as Server-Sent Events, behind the
@@ -678,7 +679,7 @@ func (p *Panel) feedHTML() string {
 
 // rowHTML renders one query as a feed row.
 func (p *Panel) rowHTML(e qlog.Entry) string {
-	return p.renderRows([]rowView{rowViewFor(e)})
+	return p.renderRows([]rowView{rowViewFor(e, p.location())})
 }
 
 // renderRows executes the feed_row fragment for each row. A rendering

@@ -249,6 +249,22 @@
             {{range .Strategies}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
           </select>
         </label>
+        <label class="field"><span>Часовой пояс</span>
+          <input class="ctl" type="text" name="timezone" value="{{.FormTimezone}}" list="tz-zones" placeholder="Europe/Moscow" spellcheck="false" autocomplete="off">
+          <span class="hint">IANA-зона, пусто — системная</span>
+        </label>
+        <datalist id="tz-zones">
+          <option value="Europe/Moscow"></option>
+          <option value="Europe/London"></option>
+          <option value="Europe/Berlin"></option>
+          <option value="Europe/Kyiv"></option>
+          <option value="Asia/Almaty"></option>
+          <option value="Asia/Tbilisi"></option>
+          <option value="Asia/Yerevan"></option>
+          <option value="Asia/Dubai"></option>
+          <option value="America/New_York"></option>
+          <option value="UTC"></option>
+        </datalist>
         <label class="field"><span>Размер кеша, записей</span><input class="ctl" type="number" name="cache.size" value="{{.CacheSize}}" min="1"></label>
         <label class="field"><span>Кеш: min TTL, с</span><input class="ctl" type="number" name="cache.min_ttl" value="{{.CacheMinTTL}}" min="0"></label>
         <label class="field"><span>Кеш: max TTL, с</span><input class="ctl" type="number" name="cache.max_ttl" value="{{.CacheMaxTTL}}" min="0"></label>

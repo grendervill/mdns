@@ -226,6 +226,24 @@ func (p *Panel) auth() (enabled bool, hash string) {
 	return p.authFn()
 }
 
+// location is the zone the panel renders query times in: the configured
+// IANA zone, the daemon's local zone when none is set, and local again
+// for a value the time database cannot load (an invalid stored zone must
+// never panic a page). It reads the live config on every call, so a
+// timezone change applies without a restart; only the display changes,
+// the stored timestamps stay as they are.
+func (p *Panel) location() *time.Location {
+	cfg := p.currentConfig()
+	if cfg == nil || cfg.Timezone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // Mount registers every panel route on mux. The DoH listener shares one
 // mux with /dns-query, so the patterns here never collide with it. A
 // disabled panel still registers the routes but answers 404 on all of

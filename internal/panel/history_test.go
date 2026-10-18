@@ -387,6 +387,47 @@ func TestHistoryCSV(t *testing.T) {
 	}
 }
 
+// TestHistoryTimezone checks that the history table and the CSV export
+// render query times in the configured zone, and that the stored
+// timestamps keep the zone they were logged in.
+func TestHistoryTimezone(t *testing.T) {
+	// 2026-01-02 12:00:00 UTC is 15:00:00 in Moscow (UTC+3, no DST).
+	noon := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
+	entry := qlog.Entry{Time: noon, QName: "noon.example.", QType: 1, Proto: "udp", Rcode: 0,
+		ClientIP: "192.168.1.12", Upstream: "cloudflare", LatencyMS: 5}
+
+	ctrl := newHistoryCtrl(t, entry)
+	ctrl.cfg.Timezone = "Europe/Moscow"
+	p, srv := statusPanel(t, ctrl)
+
+	t.Run("the table shows Moscow time", func(t *testing.T) {
+		code, body := authedGET(t, p, srv, "/panel/history")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/history = %d, want 200\n%s", code, body)
+		}
+		if !strings.Contains(body, `<span class="t">15:00:00</span>`) {
+			t.Errorf("history row does not render 12:00 UTC as 15:00:00:\n%s", body)
+		}
+	})
+
+	t.Run("the CSV exports Moscow time", func(t *testing.T) {
+		resp := authedRequest(t, p, srv, "/panel/history.csv")
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading the CSV: %v", err)
+		}
+		want := "2026-01-02 15:00:00;udp;noon.example.;A;ответ upstream;cloudflare;192.168.1.12;5"
+		if !strings.Contains(strings.TrimPrefix(string(data), "\ufeff"), want) {
+			t.Errorf("the CSV does not export Moscow time:\nwant %q\n got %s", want, data)
+		}
+	})
+
+	if !entry.Time.Equal(noon) || entry.Time.Location() != time.UTC {
+		t.Error("the displayed zone changed the stored Entry.Time")
+	}
+}
+
 // TestHistoryChip checks that a chip's × removes exactly its own filter
 // and keeps the others and the search term.
 func TestHistoryChip(t *testing.T) {
