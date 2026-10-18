@@ -1,0 +1,47 @@
+{{define "history"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — история запросов</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>История запросов</h2>
+      <div class="state">{{if .MemoryEntries}}в памяти: <b>{{.MemoryEntries}}</b> · {{end}}автообновление выключено</div>
+    </div>
+
+    <form class="searchrow" method="get" action="/panel/history" role="search">
+      <label class="search">
+        <span aria-hidden="true">⌕</span>
+        <input type="search" name="q" value="{{.Query}}" placeholder="Поиск по домену, клиенту, upstream’у…" aria-label="Поиск по истории">
+      </label>
+      {{range .Chips}}<input type="hidden" name="{{.Param}}" value="{{.Value}}">{{end}}
+      {{range .Chips}}<span class="chip"><b>{{.Label}}</b><a class="x" href="{{.Remove}}" aria-label="Убрать фильтр «{{.Label}}»">×</a></span>{{end}}
+      <a class="btn" href="{{.CSVHref}}">Экспорт CSV</a>
+    </form>
+
+    <div class="wire hist" id="hist">
+      <div class="head">
+        <span>время · протокол · результат · задержка</span>
+        <span>{{if .FilterSummary}}фильтр: {{.FilterSummary}}{{else}}все запросы{{end}}</span>
+      </div>
+      {{if .Rows}}{{range .Rows}}{{template "feed_row" .}}{{end}}{{else}}<div class="q empty">Ничего не найдено</div>{{end}}
+    </div>
+
+    <div class="pager">
+      <span>Найдено <b>{{.Total}}</b> · страница <b>{{.Page}}</b> из <b>{{.Pages}}</b> · по {{.PerPage}} на страницу</span>
+      <span class="pg">
+        {{if .PrevHref}}<a class="btn small" href="{{.PrevHref}}">← назад</a>{{else}}<span class="btn small off" aria-disabled="true">← назад</span>{{end}}
+        {{if .NextHref}}<a class="btn small" href="{{.NextHref}}">вперёд →</a>{{else}}<span class="btn small off" aria-disabled="true">вперёд →</span>{{end}}
+      </span>
+    </div>
+  </main>
+</div>
+</body>
+</html>
+{{end}}

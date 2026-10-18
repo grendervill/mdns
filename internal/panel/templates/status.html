@@ -10,16 +10,7 @@
 </head>
 <body>
 <div class="shell">
-  <aside class="rail">
-    <div class="brand">mdns<small>{{.Domain}}</small></div>
-    <nav class="nav">
-      <a class="on" href="/panel/" aria-current="page">Статус</a>
-    </nav>
-    <form method="post" action="/logout" class="rail-foot">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <button class="btn small" type="submit">Выйти</button>
-    </form>
-  </aside>
+  {{template "rail" .}}
   <main class="main">
     <div class="topline">
       <h2>Статус</h2>
@@ -83,4 +74,3 @@
 </div>
 {{end}}
 {{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}
-{{define "feed_row"}}<div class="q"><span class="t">{{.Time}}</span><span class="name" title="{{.Title}}">{{.QName}}</span><span class="proto">{{.Proto}}</span><span class="tag {{.Tag}}">{{.TagText}}</span><span class="ms">{{.Detail}}</span></div>{{end}}

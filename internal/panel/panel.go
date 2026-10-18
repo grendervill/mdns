@@ -54,6 +54,10 @@ type Controller interface {
 	// Requests returns the newest n query records, oldest first. The
 	// status feed backfills its buffer with it.
 	Requests(n int) []qlog.Entry
+	// RequestsQuery returns one page (1-based page, per entries) of
+	// filtered history, newest first, with the total match count. The
+	// history page and its CSV export use it.
+	RequestsQuery(q qlog.Query, page, per int) ([]qlog.Entry, int)
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -221,6 +225,11 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
 	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
 	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleStatus)))
+
+	// Query history: the page and its CSV export share one filter
+	// parser. Both are read-only and non-live.
+	mux.Handle("GET /panel/history", p.requireSession(http.HandlerFunc(p.handleHistory)))
+	mux.Handle("GET /panel/history.csv", p.requireSession(http.HandlerFunc(p.handleHistoryCSV)))
 
 	// Catch-alls for the wrong method or an unknown subpath. They gate
 	// on the session like the rest of /panel/, and answer 404 behind

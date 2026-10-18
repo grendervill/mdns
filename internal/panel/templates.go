@@ -21,10 +21,18 @@ var templateFS embed.FS
 // templates holds the page templates by name. A page file defines one
 // root template (its page name) plus any {{template}} fragments it
 // renders, so the same set serves both a full page and an SSE frame
-// (see status.html's feed_row).
+// (see layout.html's feed_row). The shared shell (the rail) and the
+// feed row live in layout.html, which every page parses.
 var templates = map[string]*template.Template{
-	"login":  template.Must(template.New("login").Parse(loginPage)),
-	"status": template.Must(template.New("status").ParseFS(templateFS, "templates/status.html")),
+	"login":   template.Must(template.New("login").Parse(loginPage)),
+	"status":  pageTemplates("status", "templates/status.html"),
+	"history": pageTemplates("history", "templates/history.html"),
+}
+
+// pageTemplates parses one page file together with the shared fragments.
+func pageTemplates(name string, files ...string) *template.Template {
+	return template.Must(template.New(name).ParseFS(templateFS,
+		append([]string{"templates/layout.html"}, files...)...))
 }
 
 // render writes one page. Every header is set before the status so a

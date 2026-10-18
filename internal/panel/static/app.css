@@ -334,6 +334,69 @@ h3 .sub { font-weight: 400; }
 .cert.waiting .big { color: var(--warn); }
 .cert.error .big { color: var(--err); }
 
+/* ---- history: search row, filter chips, pager ------------------- */
+
+.searchrow {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 12px;
+}
+.search {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 9px 12px;
+  color: var(--muted);
+}
+.search:focus-within { border-color: var(--copper-2); }
+.search input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: 14px var(--sans);
+}
+
+.chip {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+  color: var(--err);
+  border-radius: 20px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.chip b { font-weight: 500; }
+.chip .x { cursor: pointer; color: var(--muted); text-decoration: none; }
+.chip .x:hover { color: var(--err); }
+
+.pager {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--muted);
+  font-size: 12.5px;
+  margin-top: 10px;
+}
+.pager .pg { display: flex; gap: 6px; }
+.pager b { color: var(--text); font-family: var(--mono); }
+.btn.off {
+  color: var(--muted);
+  background: transparent;
+  border-color: var(--line-soft);
+  cursor: default;
+}
+.btn.off:hover { border-color: var(--line-soft); }
+.hist .q { cursor: default; }
+
 /* htmx injects indicator styles by default; app.js turns that off (the
    CSP forbids the injected <style>), so the two rules live here. */
 .htmx-indicator { opacity: 0; visibility: hidden; }
@@ -369,5 +432,8 @@ h3 .sub { font-weight: 400; }
   .wire .head { flex-direction: column; align-items: flex-start; gap: 8px; }
   .wire .q { grid-template-columns: 60px minmax(0, 1fr) auto auto; gap: 10px; }
   .wire .q .proto { display: none; }
+  .searchrow { flex-wrap: wrap; }
+  .search { flex-basis: 100%; }
+  .pager { flex-direction: column; align-items: flex-start; gap: 8px; }
 }
 

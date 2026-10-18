@@ -49,6 +49,12 @@ func (c *statusCtrl) Requests(n int) []qlog.Entry {
 	return c.recent[len(c.recent)-n:]
 }
 
+// RequestsQuery is unused by the status tests; it exists to satisfy the
+// Controller interface.
+func (c *statusCtrl) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) {
+	return nil, 0
+}
+
 // quietLogger drops every log line.
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

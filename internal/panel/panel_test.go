@@ -45,6 +45,10 @@ func (f *fakeController) Stats() stats.Snapshot { return stats.Snapshot{} }
 
 func (f *fakeController) Requests(int) []qlog.Entry { return nil }
 
+func (f *fakeController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) {
+	return nil, 0
+}
+
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))

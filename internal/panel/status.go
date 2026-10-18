@@ -325,10 +325,10 @@ func sortedKeys(counts map[string]uint64) []string {
 	return keys
 }
 
-// historyHref builds a link into the history page (Task 8). The page
-// does not exist yet, so the link is honest but may 404 for now.
+// historyHref builds a link into the history page with one filter set.
+// The page parses the same parameter names qlog's Query uses (Task 8).
 func historyHref(param, value string) string {
-	return "/panel/history?" + url.Values{param: {value}}.Encode()
+	return historyPath + "?" + url.Values{param: {value}}.Encode()
 }
 
 // protoLabel spells out the transports the way the mockup's legend
@@ -356,12 +356,14 @@ type rowView struct {
 // rowViewFor renders one query record the way the mockup's feed does:
 // the tag carries the outcome and the last cell the latency and the
 // source (upstream ID, block-list name, or nothing for a cache hit).
+// The history page renders the same row through this helper, so the
+// two screens can never drift apart.
 func rowViewFor(e qlog.Entry) rowView {
 	rv := rowView{
 		Time:  e.Time.Format("15:04:05"),
 		QName: e.QName,
 		Proto: e.Proto,
-		Title: strings.TrimSpace(e.QName + " " + dns.TypeToString[e.QType]),
+		Title: queryTitle(e),
 	}
 
 	latency := "—"
@@ -387,6 +389,30 @@ func rowViewFor(e qlog.Entry) rowView {
 	return rv
 }
 
+// queryTitle is the hover title of one query row. The feed and the
+// history table have no column for the record type or the response
+// code, so both live here: the name, the type, then the rcode.
+func queryTitle(e qlog.Entry) string {
+	title := strings.TrimSpace(e.QName + " " + dns.TypeToString[e.QType])
+	if rc := dns.RcodeToString[e.Rcode]; rc != "" {
+		if title != "" {
+			title += " · "
+		}
+		title += rc
+	}
+	return title
+}
+
+// rowsFor renders entries through the shared feed row helper. Both the
+// live feed and the history table use it.
+func rowsFor(entries []qlog.Entry) []rowView {
+	rows := make([]rowView, len(entries))
+	for i, e := range entries {
+		rows[i] = rowViewFor(e)
+	}
+	return rows
+}
+
 // linkView is one device connection string. URI is a template.URL
 // because the daemon builds the addresses (tls://, quic://, a bare
 // host:port) — schemes html/template's default filter would reject —
@@ -410,6 +436,7 @@ type statusView struct {
 	Domain  string
 	Version string
 	CSRF    string
+	Nav     string // the rail entry to mark active ("status")
 
 	Total          string
 	CachePercent   string
@@ -430,6 +457,7 @@ func (p *Panel) handleStatus(w http.ResponseWriter, r *http.Request) {
 	view := statusView{
 		Version: p.version,
 		CSRF:    p.csrfToken(sessionCSRFBinding(p.sessionToken(r))),
+		Nav:     "status",
 	}
 
 	var (
@@ -541,14 +569,9 @@ func fillCert(view *statusView, st api.Status) {
 	}
 }
 
-// feedRows renders the buffer's rows.
+// feedRows renders the buffer's rows, newest first.
 func (p *Panel) feedRows() []rowView {
-	entries := p.feed.snapshot()
-	rows := make([]rowView, len(entries))
-	for i, e := range entries {
-		rows[i] = rowViewFor(e)
-	}
-	return rows
+	return rowsFor(p.feed.snapshot())
 }
 
 // handleEvents streams the live feed as Server-Sent Events, behind the
