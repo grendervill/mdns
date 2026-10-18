@@ -222,8 +222,28 @@ func checkSystemd(opts Options) Check {
 	return Check{Name: "systemd", OK: true, Detail: version}
 }
 
-// checkPorts verifies that every port the server needs is free, for TCP
-// and UDP alike.
+// ownServiceName is the process name our daemon reports to ss.
+const ownServiceName = "mdns"
+
+// isOwnService reports whether an ss holder belongs to our own daemon. A
+// re-run over a running service must not abort on the very ports that
+// service holds: it re-installs and restarts it. The holder is the
+// process-name field of ss's users:(("name",pid=…)) column, compared as
+// a whole field (or as the base of an absolute command path): "mdns" and
+// "/usr/local/bin/mdns" match, while a foreign process whose name merely
+// contains the string, like "mdns-helper", does not.
+func isOwnService(holder string) bool {
+	holder = strings.TrimSpace(holder)
+	if holder == "" {
+		return false
+	}
+	return holder == ownServiceName || filepath.Base(holder) == ownServiceName
+}
+
+// checkPorts verifies that every port the server needs is ready to be
+// (re)taken: a busy port held by our own running daemon is fine, since
+// the re-run restarts it, while a port held by anything else must be
+// freed first.
 func checkPorts(opts Options) Check {
 	var busy []int
 	for _, port := range opts.BindPorts {
@@ -237,19 +257,31 @@ func checkPorts(opts Options) Check {
 	if len(busy) == 0 {
 		return Check{Name: "ports", OK: true, Detail: fmt.Sprintf("порты свободны: %s", portList(opts.BindPorts))}
 	}
+
 	holders := ssHolders(opts)
-	parts := make([]string, 0, len(busy))
+	var (
+		mine  []string // busy ports of the running mdns itself
+		parts []string // busy ports that block the installation
+	)
 	for _, port := range busy {
-		if h := holders[port]; h != "" {
+		h := holders[port]
+		switch {
+		case isOwnService(h):
+			mine = append(mine, fmt.Sprintf("%d занят текущим mdns (ок, перезапустится)", port))
+		case h != "":
 			parts = append(parts, fmt.Sprintf("%d (занят: %s)", port, h))
-			continue
+		default:
+			parts = append(parts, fmt.Sprintf("%d (занят)", port))
 		}
-		parts = append(parts, fmt.Sprintf("%d (занят)", port))
 	}
-	return Check{
-		Name:   "ports",
-		Detail: fmt.Sprintf("заняты порты: %s; остановите держащие их службы", strings.Join(parts, ", ")),
+	if len(parts) == 0 {
+		return Check{Name: "ports", OK: true, Detail: strings.Join(mine, ", ")}
 	}
+	detail := fmt.Sprintf("заняты порты: %s; остановите держащие их службы", strings.Join(parts, ", "))
+	if len(mine) > 0 {
+		detail += "; " + strings.Join(mine, ", ")
+	}
+	return Check{Name: "ports", Detail: detail}
 }
 
 // portBusy reports whether 0.0.0.0:port cannot be bound on TCP or UDP.

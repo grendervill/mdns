@@ -66,6 +66,17 @@ func (f *fakeRunner) ufwAllows() []string {
 	return out
 }
 
+// serviceRestarts counts the recorded "systemctl restart mdns" calls.
+func (f *fakeRunner) serviceRestarts() int {
+	n := 0
+	for _, c := range f.calls {
+		if c.name == "systemctl" && slices.Equal(c.args, []string{"restart", "mdns"}) {
+			n++
+		}
+	}
+	return n
+}
+
 // noChecks is the preflight seam of the action tests: the real checks
 // inspect the process euid and the host system, which a temporary Root
 // cannot satisfy.
@@ -460,7 +471,7 @@ func TestInstallDryRun(t *testing.T) {
 		"скопировать бинарник",
 		"конфигурация",
 		"записать юнит",
-		"systemctl enable --now mdns",
+		"systemctl daemon-reload; systemctl enable mdns; systemctl restart mdns",
 		"ufw",
 		"A/AAAA не указывает на этот сервер",
 		"dns.example.com",
@@ -531,8 +542,16 @@ func TestInstallWritesAndStarts(t *testing.T) {
 	assertMode(t, unitPath, 0o644)
 
 	cmds := runner.commands()
-	if len(cmds) < 3 || cmds[0] != "systemctl daemon-reload" || cmds[1] != "systemctl enable --now mdns" || cmds[2] != "ufw status" {
-		t.Errorf("commands = %v, want daemon-reload, enable --now and the ufw probe first", cmds)
+	wantCmds := []string{"systemctl daemon-reload", "systemctl enable mdns", "systemctl restart mdns", "ufw status"}
+	if len(cmds) < len(wantCmds) || !slices.Equal(cmds[:len(wantCmds)], wantCmds) {
+		t.Errorf("commands = %v, want %v first", cmds, wantCmds)
+	}
+	// --now is a no-op on an active unit: the service state must be
+	// applied with an explicit restart instead.
+	for _, c := range cmds {
+		if strings.Contains(c, "--now") {
+			t.Errorf("command %q uses --now, want enable + restart", c)
+		}
 	}
 	wantRules := []string{"53/tcp", "53/udp", "443/tcp", "443/udp", "853/tcp", "853/udp"}
 	if got := runner.ufwAllows(); !slices.Equal(got, wantRules) {
@@ -711,8 +730,14 @@ func TestIdempotentKeepsConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "etc/systemd/system/mdns.service")); err != nil {
 		t.Errorf("unit not installed next to the kept config: %v", err)
 	}
+	// A re-run over the running service restarts it, so the refreshed
+	// binary (and the unit) actually take effect.
+	if got := runner.serviceRestarts(); got != 1 {
+		t.Errorf("restart calls after the re-run = %d, want 1: %v", got, runner.commands())
+	}
 
 	// --reconfigure overwrites it.
+	restarts := runner.serviceRestarts()
 	var reconfigure bytes.Buffer
 	if err := Run(InstallOptions{
 		Options:      Options{Root: root, Runner: runner.run},
@@ -723,6 +748,10 @@ func TestIdempotentKeepsConfig(t *testing.T) {
 		Output:       &reconfigure,
 	}); err != nil {
 		t.Fatalf("Run(--reconfigure) error = %v, want nil", err)
+	}
+	// The rewritten config reaches the daemon through the restart.
+	if got := runner.serviceRestarts(); got != restarts+1 {
+		t.Errorf("restart calls after --reconfigure = %d, want %d", got, restarts+1)
 	}
 	loaded, err := config.Load(configPath)
 	if err != nil {

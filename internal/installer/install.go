@@ -233,8 +233,15 @@ func Run(opts InstallOptions) error {
 	if _, err := o.Runner("systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
-	if _, err := o.Runner("systemctl", "enable", "--now", "mdns"); err != nil {
-		return fmt.Errorf("systemctl enable --now mdns: %w", err)
+	// enable (without --now) then restart: --now is a no-op on an
+	// already-active unit, so a re-run that rewrote the config or
+	// replaced the binary would leave the old daemon running. restart
+	// also starts an inactive unit, so a fresh install still comes up.
+	if _, err := o.Runner("systemctl", "enable", "mdns"); err != nil {
+		return fmt.Errorf("systemctl enable mdns: %w", err)
+	}
+	if _, err := o.Runner("systemctl", "restart", "mdns"); err != nil {
+		return fmt.Errorf("systemctl restart mdns: %w", err)
 	}
 
 	// 7. Firewall.
@@ -413,7 +420,7 @@ func printPlan(out io.Writer, p plan) {
 	fmt.Fprintf(out, "  скопировать бинарник %s → %s (0755)\n", p.binarySource, p.binaryPath)
 	fmt.Fprintf(out, "  конфигурация: %s → %s\n", p.configAction, p.configPath)
 	fmt.Fprintf(out, "  записать юнит %s (0644)\n", p.unitPath)
-	fmt.Fprintln(out, "  systemctl daemon-reload; systemctl enable --now mdns")
+	fmt.Fprintln(out, "  systemctl daemon-reload; systemctl enable mdns; systemctl restart mdns")
 	if len(p.ufwRules) > 0 {
 		fmt.Fprintf(out, "  ufw (если активен): allow %s\n", strings.Join(p.ufwRules, ", "))
 	} else {

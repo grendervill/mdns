@@ -251,6 +251,79 @@ func TestPortChecks(t *testing.T) {
 	})
 }
 
+// TestOurServicePortsAreNotBlocking checks that a re-run over a running
+// mdns service is not aborted by its own ports, while ports held by
+// anything else still fail. The holder comes from the ss output, so the
+// test fakes ss and occupies real ports to make them look busy.
+func TestOurServicePortsAreNotBlocking(t *testing.T) {
+	mdnsPort := occupyPort(t, "tcp")
+	nginxPort := occupyPort(t, "tcp")
+	lookalikePort := occupyPort(t, "tcp")
+
+	ss := func(port int, name string) string {
+		return fmt.Sprintf("tcp   LISTEN 0      4096       0.0.0.0:%d      0.0.0.0:*         users:((\"%s\",pid=4242,fd=4))\n", port, name)
+	}
+	ssOut := "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n" +
+		ss(mdnsPort, "mdns") +
+		ss(nginxPort, "nginx") +
+		ss(lookalikePort, "mdns-helper")
+	runner := runnerFor(t, map[string][]byte{"ss -ltnup": []byte(ssOut)})
+
+	t.Run("our own mdns is fine", func(t *testing.T) {
+		chk := checkByName(t, Preflight(Options{Root: t.TempDir(), BindPorts: []int{mdnsPort}, Runner: runner}), "ports")
+		if !chk.OK {
+			t.Fatalf("ports check = %+v, want OK for our own mdns on %d", chk, mdnsPort)
+		}
+		want := fmt.Sprintf("%d занят текущим mdns (ок, перезапустится)", mdnsPort)
+		if !strings.Contains(chk.Detail, want) {
+			t.Errorf("ports detail %q does not contain %q", chk.Detail, want)
+		}
+	})
+
+	t.Run("a foreign holder still fails", func(t *testing.T) {
+		chk := checkByName(t, Preflight(Options{Root: t.TempDir(), BindPorts: []int{nginxPort}, Runner: runner}), "ports")
+		if chk.OK {
+			t.Fatalf("ports check = %+v, want failure for nginx on %d", chk, nginxPort)
+		}
+		if !strings.Contains(chk.Detail, "nginx") {
+			t.Errorf("ports detail %q does not name nginx", chk.Detail)
+		}
+	})
+
+	t.Run("a name that merely contains mdns still fails", func(t *testing.T) {
+		chk := checkByName(t, Preflight(Options{Root: t.TempDir(), BindPorts: []int{lookalikePort}, Runner: runner}), "ports")
+		if chk.OK {
+			t.Fatalf("ports check = %+v, want failure for mdns-helper on %d", chk, lookalikePort)
+		}
+		if !strings.Contains(chk.Detail, "mdns-helper") {
+			t.Errorf("ports detail %q does not name mdns-helper", chk.Detail)
+		}
+	})
+
+	t.Run("no holder info still fails", func(t *testing.T) {
+		failingRunner := func(string, ...string) ([]byte, error) {
+			return nil, errors.New("ss: not found")
+		}
+		chk := checkByName(t, Preflight(Options{Root: t.TempDir(), BindPorts: []int{mdnsPort}, Runner: failingRunner}), "ports")
+		if chk.OK {
+			t.Errorf("ports check = %+v, want failure when the holder is unknown", chk)
+		}
+	})
+
+	t.Run("mixed own and foreign fails on the foreign one, noting ours", func(t *testing.T) {
+		chk := checkByName(t, Preflight(Options{Root: t.TempDir(), BindPorts: []int{mdnsPort, nginxPort}, Runner: runner}), "ports")
+		if chk.OK {
+			t.Fatalf("ports check = %+v, want failure with nginx holding %d", chk, nginxPort)
+		}
+		if !strings.Contains(chk.Detail, "nginx") {
+			t.Errorf("ports detail %q does not name nginx", chk.Detail)
+		}
+		if !strings.Contains(chk.Detail, "занят текущим mdns") {
+			t.Errorf("ports detail %q does not note the mdns-held port", chk.Detail)
+		}
+	})
+}
+
 // TestResolvedWarning checks that a local systemd-resolved stub listener
 // is reported as a warning with the DNSStubListener=no instruction.
 func TestResolvedWarning(t *testing.T) {
