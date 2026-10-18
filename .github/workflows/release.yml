@@ -1,0 +1,88 @@
+name: Release
+
+# Tag pushes cut a release; workflow_dispatch runs the same build and uploads
+# the binaries as artifacts, but never touches the releases (inspect the run
+# there when changing anything in this file).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # On a tag the version is the tag (v0.1.0); on a dispatch run it is the
+      # commit SHA, so a hand-built binary still says where it came from.
+      - name: Build linux/${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} \
+            go build \
+            -ldflags "-X mydns/internal/version.Version=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}" \
+            -o dist/mdns-linux-${{ matrix.arch }} ./cmd/mdns
+
+      # The artifact must be a Linux binary for this arch and must carry the
+      # version we injected.
+      - name: Sanity-check the binary
+        run: |
+          file dist/mdns-linux-${{ matrix.arch }}
+          go version -m dist/mdns-linux-${{ matrix.arch }} | head
+          go version -m dist/mdns-linux-${{ matrix.arch }} |
+            grep -F -- "-X mydns/internal/version.Version=${{ github.ref_type == 'tag' && github.ref_name || github.sha }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mdns-linux-${{ matrix.arch }}
+          path: dist/mdns-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 30
+
+  # Only a tag push publishes: a dispatch run stops at the artifacts above.
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # merge-multiple puts both per-arch artifacts flat into dist/, so the
+      # release assets keep the names install.sh expects
+      # (<base>/<tag>/download/mdns-linux-<arch>).
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble the release directory
+        run: |
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum mdns-linux-amd64 mdns-linux-arm64 > SHA256SUMS
+          cat SHA256SUMS
+          ls -l
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          # v0.x: still a pre-1.0 milestone.
+          prerelease: true
+          generate_release_notes: true
+          files: |
+            dist/mdns-linux-amd64
+            dist/mdns-linux-arm64
+            dist/SHA256SUMS
+            dist/install.sh
