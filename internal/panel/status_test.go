@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,12 +26,20 @@ import (
 
 // statusCtrl is a scripted daemon: it returns one fixed status and one
 // fixed statistics snapshot, and it serves a small recent-query list
-// for the feed's backfill.
+// for the feed's backfill. The cumulative Snapshot and the range
+// snapshot are separate fields so a test can tell which one a page
+// used; the range call is remembered for the period tests.
 type statusCtrl struct {
-	cfg    *config.Config
-	st     api.Status
-	sn     stats.Snapshot
-	recent []qlog.Entry
+	cfg     *config.Config
+	st      api.Status
+	sn      stats.Snapshot
+	rangeSn stats.Snapshot
+	recent  []qlog.Entry
+
+	mu       sync.Mutex
+	lastFrom time.Time
+	lastTo   time.Time
+	rangeN   int
 }
 
 func (c *statusCtrl) Config() *config.Config { return c.cfg }
@@ -41,6 +50,21 @@ func (c *statusCtrl) UpdateConfig(context.Context, *config.Config) error { retur
 func (c *statusCtrl) Status(context.Context) (api.Status, error) { return c.st, nil }
 
 func (c *statusCtrl) Stats() stats.Snapshot { return c.sn }
+
+func (c *statusCtrl) StatsRange(from, to time.Time) stats.Snapshot {
+	c.mu.Lock()
+	c.lastFrom, c.lastTo = from, to
+	c.rangeN++
+	c.mu.Unlock()
+	return c.rangeSn
+}
+
+// lastRange is the from/to of the most recent StatsRange call.
+func (c *statusCtrl) lastRange() (time.Time, time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastFrom, c.lastTo
+}
 
 func (c *statusCtrl) Started() time.Time { return time.Time{} }
 
@@ -140,9 +164,10 @@ func authedRequest(t *testing.T, p *Panel, srv *httptest.Server, path string) *h
 // mockupStatus is the scripted daemon behind TestStatusRenders. The
 // statistics deliberately repeat the approved mockup's 74 / 19 / 6.7 /
 // 0.3 split (740 + 190 + 67 + 3 = 1000), so the page can be compared
-// against the mockup's figure.
+// against the mockup's figure. The range snapshot repeats it too, so
+// the default 30-day period draws the same figure the mockup does.
 func mockupStatus() *statusCtrl {
-	return &statusCtrl{
+	ctrl := &statusCtrl{
 		cfg: &config.Config{Domain: "dns.example.test"},
 		st: api.Status{
 			Version: "v9",
@@ -181,6 +206,8 @@ func mockupStatus() *statusCtrl {
 			{QName: "cdn.jsdelivr.net.", QType: 1, Proto: "doh", CacheHit: true},
 		},
 	}
+	ctrl.rangeSn = ctrl.sn
+	return ctrl
 }
 
 // TestStatusRenders checks the whole status screen: every section of the
@@ -629,4 +656,180 @@ func TestGaugeFormats(t *testing.T) {
 			t.Error("status page does not render the client overflow bucket")
 		}
 	})
+}
+
+// periodCtrl is a daemon whose cumulative and range snapshots differ, so
+// a test can tell which one a page used: the cumulative total is 1000
+// with a 74/19/6.7/0.3 outcome split, the range total is 40 with a 75 %
+// cached share.
+func periodCtrl() *statusCtrl {
+	return &statusCtrl{
+		cfg: &config.Config{Domain: "dns.example.test"},
+		sn: stats.Snapshot{
+			Total:     1000,
+			Outcomes:  map[string]uint64{"cached": 740, "upstream": 190, "blocked": 67, "error": 3},
+			Protos:    map[string]uint64{"udp": 1000},
+			Upstreams: map[string]uint64{"u": 1000},
+		},
+		rangeSn: stats.Snapshot{
+			Total:     40,
+			Outcomes:  map[string]uint64{"cached": 30, "upstream": 5, "blocked": 4, "error": 1},
+			Protos:    map[string]uint64{"udp": 40},
+			Upstreams: map[string]uint64{"u": 40},
+		},
+	}
+}
+
+// TestStatusPeriodDefault checks the default period: the four gauges
+// keep the cumulative counters while the donuts and the period line
+// follow the range snapshot.
+func TestStatusPeriodDefault(t *testing.T) {
+	p, srv := statusPanel(t, periodCtrl())
+
+	code, body := authedGET(t, p, srv, "/panel/")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/ = %d, want 200", code)
+	}
+
+	if !strings.Contains(body, `<option value="30" selected>Месяц</option>`) {
+		t.Error("the default period is not the selected month")
+	}
+	if !strings.Contains(body, "За период (Месяц): всего 40 · кеш 30 · блок 4 · ошибки 1") {
+		t.Errorf("the period line does not use the range snapshot:\n%s", body)
+	}
+	if !strings.Contains(body, "1 000") {
+		t.Error("the gauges must keep the cumulative total")
+	}
+	if !strings.Contains(body, `data-value="75 % · 30"`) {
+		t.Errorf("the donuts do not use the range snapshot:\n%s", body)
+	}
+	if strings.Contains(body, `data-value="74 % · 740"`) {
+		t.Error("the donuts leaked the cumulative snapshot")
+	}
+}
+
+// TestStatusPeriodFixed checks a fixed choice: its label, its data and
+// the range window the page asked the controller for.
+func TestStatusPeriodFixed(t *testing.T) {
+	ctrl := periodCtrl()
+	p, srv := statusPanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/?period=365")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/?period=365 = %d, want 200", code)
+	}
+	if !strings.Contains(body, `<option value="365" selected>12 месяцев</option>`) {
+		t.Error("the 12-month option is not selected")
+	}
+	if !strings.Contains(body, "период: 12 месяцев") {
+		t.Error("the heading does not carry the period label")
+	}
+	if !strings.Contains(body, `data-value="75 % · 30"`) {
+		t.Errorf("the donuts do not use the range snapshot:\n%s", body)
+	}
+	// The gauges stay all-time regardless of the period.
+	if !strings.Contains(body, "1 000") {
+		t.Error("the gauges changed with the period")
+	}
+
+	from, to := ctrl.lastRange()
+	if from.IsZero() || to.IsZero() || !to.After(from) {
+		t.Fatalf("StatsRange(%v, %v): want an ordered, non-zero window", from, to)
+	}
+	if span := to.Sub(from); span < 350*24*time.Hour || span > 370*24*time.Hour {
+		t.Errorf("12-month window span = %v, want about a year", span)
+	}
+}
+
+// TestStatusPeriodCustomForwardsDates checks that a custom range parses
+// both dates and forwards them to StatsRange.
+func TestStatusPeriodCustomForwardsDates(t *testing.T) {
+	ctrl := periodCtrl()
+	p, srv := statusPanel(t, ctrl)
+
+	now := time.Now().UTC()
+	fromDate := now.AddDate(0, 0, -10)
+	toDate := now.AddDate(0, 0, -1)
+	fromText := fromDate.Format("2006-01-02")
+	toText := toDate.Format("2006-01-02")
+
+	code, body := authedGET(t, p, srv, "/panel/?period=custom&from="+fromText+"&to="+toText)
+	if code != http.StatusOK {
+		t.Fatalf("custom GET = %d, want 200", code)
+	}
+	if !strings.Contains(body, `<option value="custom" selected>Своё</option>`) {
+		t.Error("the custom option is not selected")
+	}
+	if !strings.Contains(body, `name="from" value="`+fromText+`"`) ||
+		!strings.Contains(body, `name="to" value="`+toText+`"`) {
+		t.Error("the date inputs do not echo the request")
+	}
+
+	gotFrom, gotTo := ctrl.lastRange()
+	wantFrom := time.Date(fromDate.Year(), fromDate.Month(), fromDate.Day(), 0, 0, 0, 0, time.UTC)
+	wantTo := time.Date(toDate.Year(), toDate.Month(), toDate.Day(), 0, 0, 0, 0, time.UTC)
+	if !gotFrom.Equal(wantFrom) || !gotTo.Equal(wantTo) {
+		t.Errorf("StatsRange got (%v, %v), want (%v, %v)", gotFrom, gotTo, wantFrom, wantTo)
+	}
+}
+
+// TestStatusPeriodReversedFallsBack checks that a reversed custom range
+// is refused: the page shows the month with a notice.
+func TestStatusPeriodReversedFallsBack(t *testing.T) {
+	ctrl := periodCtrl()
+	p, srv := statusPanel(t, ctrl)
+
+	now := time.Now().UTC()
+	fromText := now.Format("2006-01-02")
+	toText := now.AddDate(0, 0, -5).Format("2006-01-02")
+
+	code, body := authedGET(t, p, srv, "/panel/?period=custom&from="+fromText+"&to="+toText)
+	if code != http.StatusOK {
+		t.Fatalf("reversed GET = %d, want 200", code)
+	}
+	if !strings.Contains(body, `<option value="30" selected>Месяц</option>`) {
+		t.Error("a reversed range did not fall back to the month")
+	}
+	if !strings.Contains(body, "Начало периода позже конца") {
+		t.Errorf("the page does not carry the fallback notice:\n%s", body)
+	}
+}
+
+// TestStatusPeriodEmptyHistory checks that a daemon with no history
+// still renders the period line with zeros and does not error.
+func TestStatusPeriodEmptyHistory(t *testing.T) {
+	p, srv := statusPanel(t, &statusCtrl{cfg: &config.Config{Domain: "dns.example.test"}})
+
+	code, body := authedGET(t, p, srv, "/panel/")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/ with no history = %d, want 200", code)
+	}
+	if !strings.Contains(body, "За период (Месяц): всего 0 · кеш 0 · блок 0 · ошибки 0") {
+		t.Errorf("the empty period line is missing:\n%s", body)
+	}
+}
+
+// TestStatusPeriodForm checks the selector markup: the five choices and
+// the two date inputs, in one GET form.
+func TestStatusPeriodForm(t *testing.T) {
+	p, srv := statusPanel(t, mockupStatus())
+
+	_, body := authedGET(t, p, srv, "/panel/")
+	for _, want := range []string{
+		`action="/panel/"`,
+		`name="period"`,
+		`name="from"`,
+		`name="to"`,
+		`type="date"`,
+		`>Месяц</option>`,
+		`>3 месяца</option>`,
+		`>6 месяцев</option>`,
+		`>12 месяцев</option>`,
+		`>Своё</option>`,
+		`Показать`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the period form is missing %q", want)
+		}
+	}
 }

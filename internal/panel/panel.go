@@ -56,6 +56,10 @@ type Controller interface {
 	Status(ctx context.Context) (api.Status, error)
 	// Stats returns the cumulative query statistics since start.
 	Stats() stats.Snapshot
+	// StatsRange returns the query statistics summed over the whole UTC
+	// days in [from, to] inclusive; a zero bound is open. The status
+	// page builds the period diagrams from it.
+	StatsRange(from, to time.Time) stats.Snapshot
 	// Started is when the daemon was constructed; the maintenance page
 	// renders its uptime.
 	Started() time.Time

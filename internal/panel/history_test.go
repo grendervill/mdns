@@ -60,6 +60,8 @@ func (c *historyCtrl) Status(context.Context) (api.Status, error) { return api.S
 
 func (c *historyCtrl) Stats() stats.Snapshot { return stats.Snapshot{} }
 
+func (c *historyCtrl) StatsRange(time.Time, time.Time) stats.Snapshot { return stats.Snapshot{} }
+
 func (c *historyCtrl) Started() time.Time { return time.Time{} }
 
 func (c *historyCtrl) FilterStatus() []filter.ListStatus { return nil }

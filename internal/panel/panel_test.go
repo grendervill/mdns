@@ -48,6 +48,10 @@ func (f *fakeController) Status(context.Context) (api.Status, error) {
 
 func (f *fakeController) Stats() stats.Snapshot { return stats.Snapshot{} }
 
+func (f *fakeController) StatsRange(time.Time, time.Time) stats.Snapshot {
+	return stats.Snapshot{}
+}
+
 func (f *fakeController) Started() time.Time { return time.Time{} }
 
 func (f *fakeController) Requests(int) []qlog.Entry { return nil }

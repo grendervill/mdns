@@ -23,7 +23,28 @@
       <div class="g"><div class="k">Лучший upstream</div><div class="v">{{.BestLatency}}{{if .BestName}}<small>{{.BestName}}</small>{{end}}</div></div>
     </div>
 
-    <h3>Куда идут запросы <span class="sub">— наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <h3>Куда идут запросы <span class="sub">— период: {{.PeriodLabel}}; наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <form class="periodrow" method="get" action="/panel/" role="search">
+      <label class="field">
+        <span>Период</span>
+        <select class="ctl" name="period">
+          {{range .PeriodOptions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </label>
+      <label class="field">
+        <span>С</span>
+        <input class="ctl" type="date" name="from" value="{{.PeriodFrom}}">
+      </label>
+      <label class="field">
+        <span>По</span>
+        <input class="ctl" type="date" name="to" value="{{.PeriodTo}}">
+      </label>
+      <div class="row-actions">
+        <button class="btn" type="submit">Показать</button>
+      </div>
+    </form>
+    {{if .PeriodNotice}}<p class="alert" role="alert">{{.PeriodNotice}}</p>{{end}}
+    <p class="note">За период ({{.PeriodLabel}}): {{.PeriodSummary}}</p>
     <div class="piefold">
       {{range .Donuts}}{{template "donut" .}}{{end}}
     </div>

@@ -106,6 +106,8 @@ func (c *manageCtrl) UpdateConfig(_ context.Context, next *config.Config) error 
 
 func (c *manageCtrl) Stats() stats.Snapshot { return stats.Snapshot{} }
 
+func (c *manageCtrl) StatsRange(time.Time, time.Time) stats.Snapshot { return stats.Snapshot{} }
+
 func (c *manageCtrl) Requests(int) []qlog.Entry { return nil }
 
 func (c *manageCtrl) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) { return nil, 0 }
