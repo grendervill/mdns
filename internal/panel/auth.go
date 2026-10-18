@@ -170,10 +170,11 @@ func (p *Panel) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The stored hash is always a valid argon2id PHC string when the
-	// panel is enabled (config.Validate enforces it), so Verify runs
-	// argon2 on every wrong attempt and the response time does not
-	// reveal whether the hash looked well-formed.
+	// Config validation only prefix-checks the stored hash for
+	// "$argon2id$"; it does not parse the PHC parameters. An
+	// unparseable hash therefore reaches Verify, which returns false
+	// without running argon2 — the login path treats it exactly like a
+	// wrong password.
 	if !auth.Verify(hash, r.PostFormValue("password")) {
 		p.throttle.Fail(ip)
 		p.logger.Warn("panel: failed login", "ip", ip)

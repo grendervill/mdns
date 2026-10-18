@@ -62,6 +62,12 @@ type manageCtrl struct {
 	refreshes  []string
 	refreshErr error
 
+	// refreshStarted receives the id of every FilterUpdate call before
+	// the call blocks on refreshGate, so a test can observe a background
+	// refresh while it is still in flight.
+	refreshStarted chan string
+	refreshGate    <-chan struct{}
+
 	started time.Time
 }
 
@@ -107,6 +113,13 @@ func (c *manageCtrl) FilterStatus() []filter.ListStatus {
 }
 
 func (c *manageCtrl) FilterUpdate(_ context.Context, id string) error {
+	if c.refreshStarted != nil {
+		c.refreshStarted <- id
+	}
+	if c.refreshGate != nil {
+		<-c.refreshGate
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.refreshErr != nil {
@@ -448,34 +461,87 @@ func TestFiltersPage(t *testing.T) {
 	})
 }
 
-// TestFiltersRefresh checks both the single-list and the all-lists
-// refresh post the right id.
+// TestFiltersRefresh checks the single-flight asynchronous refresh: the
+// POST returns at once, a second one while the update is in flight is
+// refused with a banner, and the background goroutine eventually
+// completes with the id the first POST asked for. The gate keeps the
+// goroutine blocked for as long as the assertions need; every wait is
+// bounded so a regression fails instead of hanging the suite.
 func TestFiltersRefresh(t *testing.T) {
 	cfg := manageConfig(t)
 	manageFilters(cfg)
-	ctrl := &manageCtrl{cfg: cfg}
+	started := make(chan string, 2)
+	gate := make(chan struct{})
+	ctrl := &manageCtrl{cfg: cfg, refreshStarted: started, refreshGate: gate}
 	p, srv := managePanel(t, ctrl)
 
-	resp, _ := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
+	begin := time.Now()
+	resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
+	if elapsed := time.Since(begin); elapsed > 2*time.Second {
+		t.Fatalf("the refresh POST took %s; it must return without waiting for the download", elapsed)
+	}
 	wantRedirect(t, resp, "/panel/filters?ok=lists")
 
-	resp, _ = managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
-	wantRedirect(t, resp, "/panel/filters?ok=lists")
-
-	if got := ctrl.refreshed(); len(got) != 2 || got[0] != "oisd" || got[1] != "" {
-		t.Errorf("FilterUpdate ids = %q, want [oisd ]", got)
+	select {
+	case id := <-started:
+		if id != "oisd" {
+			t.Errorf("FilterUpdate id = %q, want oisd", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the background FilterUpdate did not start")
 	}
 
-	t.Run("failure", func(t *testing.T) {
-		ctrl.refreshErr = errFakeApply
-		resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
-		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+	resp, body = managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("second refresh while one runs = %d, want 409\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "обновление уже идёт") {
+		t.Errorf("the second POST does not show «обновление уже идёт»:\n%s", body)
+	}
+
+	code, page := authedGET(t, p, srv, "/panel/filters?ok=lists")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters?ok=lists = %d, want 200", code)
+	}
+	if !strings.Contains(page, "обновление запущено") {
+		t.Errorf("the success banner «обновление запущено» is missing:\n%s", page)
+	}
+
+	close(gate)
+	waitFor(t, "the first refresh to complete", func() bool { return len(ctrl.refreshed()) == 1 })
+	if got := ctrl.refreshed(); got[0] != "oisd" {
+		t.Errorf("completed refresh = %q, want [oisd]", got)
+	}
+	waitFor(t, "the single-flight flag to clear", func() bool { return !p.refresh.isRunning() })
+
+	// The single-list path is the same path; a later POST (id "") must
+	// start a fresh background refresh once the first one finished.
+	resp, _ = managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
+	wantRedirect(t, resp, "/panel/filters?ok=lists")
+	waitFor(t, "the all-lists refresh to complete", func() bool { return len(ctrl.refreshed()) == 2 })
+	if got := ctrl.refreshed(); got[1] != "" {
+		t.Errorf("completed refresh = %q, want [oisd \"\"]", got)
+	}
+	select {
+	case id := <-started:
+		if id != "" {
+			t.Errorf("second FilterUpdate id = %q, want the empty all-lists id", id)
 		}
-		if !strings.Contains(body, errFakeApply.Error()) {
-			t.Errorf("the page does not show the failure %q", errFakeApply)
+	case <-time.After(2 * time.Second):
+		t.Error("the second background FilterUpdate did not start")
+	}
+}
+
+// waitFor polls cond until it reports true or a short deadline expires.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
 		}
-	})
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // TestFilterMode sends the whole config with a new block mode.
@@ -653,6 +719,7 @@ func TestSettingsPage(t *testing.T) {
 // TestSettingsApply sends the edited values in the full config.
 func TestSettingsApply(t *testing.T) {
 	cfg := manageConfig(t)
+	cfg.Limits.TrustedCIDRs = []string{"10.0.0.0/8"}
 	ctrl := &manageCtrl{cfg: cfg}
 	p, srv := managePanel(t, ctrl)
 
@@ -686,8 +753,9 @@ func TestSettingsApply(t *testing.T) {
 	if got.Panel.PasswordHash != manageHash {
 		t.Error("the apply dropped the panel password hash")
 	}
-	if len(got.Limits.TrustedCIDRs) != len(cfg.Limits.TrustedCIDRs) {
-		t.Error("the apply did not preserve the fields the form does not edit")
+	if len(got.Limits.TrustedCIDRs) != 1 || got.Limits.TrustedCIDRs[0] != "10.0.0.0/8" {
+		t.Errorf("trusted CIDRs = %q, want [10.0.0.0/8] (the apply must preserve fields the form does not edit)",
+			got.Limits.TrustedCIDRs)
 	}
 
 	t.Run("success banner", func(t *testing.T) {
@@ -822,6 +890,55 @@ func TestPasswordChange(t *testing.T) {
 		}
 		if len(ctrl.sent()) != 1 {
 			t.Error("a mismatched password was applied")
+		}
+	})
+
+	t.Run("four Cyrillic runes are too short", func(t *testing.T) {
+		// "тест" is four runes but eight bytes: a byte-length check
+		// would wrongly accept it, the shared rune-count validator
+		// rejects it.
+		resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+			"password": {"тест"}, "password2": {"тест"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (4 runes, 8 bytes)\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "не короче") {
+			t.Errorf("the minimum-length message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("a 4-rune Cyrillic password was applied")
+		}
+	})
+
+	t.Run("padded password is rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+			"password": {" pw "}, "password2": {" pw "},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "пробел") {
+			t.Errorf("the whitespace message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("a padded password was applied")
+		}
+	})
+
+	t.Run("eight-character password is accepted", func(t *testing.T) {
+		const eight = "12345678"
+		resp, body := managePOST(t, p, srv, "/panel/settings/password", url.Values{
+			"password": {eight}, "password2": {eight},
+		})
+		wantRedirect(t, resp, "/panel/settings?ok=password")
+
+		sent := ctrl.sent()
+		if len(sent) != 2 {
+			t.Fatalf("UpdateConfig called %d times, want 2\n%s", len(sent), body)
+		}
+		if hash := sent[1].Panel.PasswordHash; !authVerify(hash, eight) {
+			t.Errorf("stored hash %q does not verify the eight-character password", hash)
 		}
 	})
 }

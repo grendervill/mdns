@@ -9,12 +9,14 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mydns/internal/api"
@@ -32,12 +34,48 @@ const (
 	filtersPath     = "/panel/filters"
 	settingsPath    = "/panel/settings"
 	maintenancePath = "/panel/maintenance"
-
-	// minPanelPasswordLen is the shortest panel password the settings
-	// page accepts. auth has no minimum of its own (it hashes whatever
-	// it is given), so the floor lives here.
-	minPanelPasswordLen = 8
 )
+
+// filterRefresh is the single-flight state of the block-list update.
+// The DoH listener has a 10 s write timeout, while «обновить все» may
+// download dozens of lists for up to a minute each, so the POST only
+// starts the work and returns; a second POST while it runs is refused
+// rather than queued (two concurrent updaters would race on one list).
+type filterRefresh struct {
+	mu      sync.Mutex
+	running bool
+}
+
+// start launches fn in the background unless a refresh is already
+// running. It reports false when the caller found one in flight. The
+// background work uses context.Background(): it must not inherit the
+// request context, which the listener cancels after its write deadline.
+func (f *filterRefresh) start(fn func()) bool {
+	f.mu.Lock()
+	if f.running {
+		f.mu.Unlock()
+		return false
+	}
+	f.running = true
+	f.mu.Unlock()
+
+	go func() {
+		defer func() {
+			f.mu.Lock()
+			f.running = false
+			f.mu.Unlock()
+		}()
+		fn()
+	}()
+	return true
+}
+
+// isRunning reports whether a refresh is in flight (tests and pages).
+func (f *filterRefresh) isRunning() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.running
+}
 
 // errNoDaemon is what a management page reports when the panel is
 // mounted without a daemon behind it (a test that only exercises the
@@ -62,7 +100,7 @@ func okMessage(key string) string {
 	case "priority":
 		return "порядок сохранён"
 	case "lists":
-		return "списки обновлены"
+		return "обновление запущено"
 	case "mode":
 		return "режим применён"
 	case "rule":
@@ -465,8 +503,12 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 	return row
 }
 
-// handleFiltersRefresh reloads one block list, or every list when the
-// posted id is empty.
+// handleFiltersRefresh starts reloading one block list, or every list
+// when the posted id is empty. The work runs in the background: the DoH
+// listener's 10 s write timeout would otherwise truncate the response
+// and cancel the update mid-loop, leaving some lists refreshed and some
+// not. The POST redirects at once with «обновление запущено»; a second
+// POST while the update runs is refused with a banner.
 func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	if p.ctrl == nil {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
@@ -474,9 +516,16 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := strings.TrimSpace(r.PostFormValue("id"))
-	if err := p.ctrl.FilterUpdate(r.Context(), id); err != nil {
-		p.logger.Warn("panel: refreshing block lists", "error", err)
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()}, ruleForm{Kind: "block"})
+	started := p.refresh.start(func() {
+		if err := p.ctrl.FilterUpdate(context.Background(), id); err != nil {
+			p.logger.Warn("panel: refreshing block lists", "id", id, "error", err)
+			return
+		}
+		p.logger.Info("panel: block lists refreshed", "id", id)
+	})
+	if !started {
+		p.renderFilters(w, r, http.StatusConflict,
+			manageNotice{Error: "обновление уже идёт"}, ruleForm{Kind: "block"})
 		return
 	}
 	http.Redirect(w, r, filtersPath+"?ok=lists", http.StatusSeeOther)
@@ -581,11 +630,12 @@ func appendRule(rules []string, domain string) []string {
 	return append(rules, domain)
 }
 
-// deleteRule removes every occurrence of domain. It filters in place,
-// which is safe because the caller always works on a cloneConfig copy,
-// never on the daemon's own slice.
+// deleteRule removes every occurrence of domain. It builds a fresh
+// slice instead of filtering in place, so it never mutates the argument:
+// the caller's clone and the daemon's own slice stay untouched even if
+// this helper is reused beyond the current form flow.
 func deleteRule(rules []string, domain string) []string {
-	out := rules[:0]
+	out := make([]string, 0, len(rules))
 	for _, r := range rules {
 		if r != domain {
 			out = append(out, r)
@@ -746,6 +796,12 @@ func (p *Panel) renderSettings(w http.ResponseWriter, r *http.Request, status in
 // handleSettingsApply rewrites the editable configuration fields and
 // hands the full config to UpdateConfig.
 func (p *Panel) handleSettingsApply(w http.ResponseWriter, r *http.Request) {
+	// A structural change rebuilds listeners and can take seconds; the
+	// 10 s listener write timeout would cut the response after the
+	// daemon already applied the config. Accept a client-side timeout
+	// instead of a truncated server answer.
+	clearWriteDeadline(w)
+
 	cfg := p.currentConfig()
 	if cfg == nil {
 		p.renderSettings(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, settingsFromForm(r))
@@ -872,8 +928,17 @@ func (p *Panel) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	password := r.PostFormValue("password")
-	if len(password) < minPanelPasswordLen {
-		fail(fmt.Sprintf("пароль должен быть не короче %d символов", minPanelPasswordLen))
+	if err := auth.ValidatePassword(password); err != nil {
+		// Same shared rule and wording as the setup wizard: at least
+		// auth.MinPasswordLen runes and no leading/trailing whitespace.
+		switch {
+		case errors.Is(err, auth.ErrPasswordWhitespace):
+			fail("пароль не должен начинаться или заканчиваться пробелом")
+		case errors.Is(err, auth.ErrPasswordTooShort):
+			fail(fmt.Sprintf("пароль должен быть не короче %d символов", auth.MinPasswordLen))
+		default:
+			fail(err.Error())
+		}
 		return
 	}
 	if password != r.PostFormValue("password2") {
@@ -1037,6 +1102,10 @@ func (p *Panel) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
 // handleReapply pushes the current configuration back through
 // UpdateConfig: a soft reapply, the web twin of the TUI's "apply again".
 func (p *Panel) handleReapply(w http.ResponseWriter, r *http.Request) {
+	// Same reason as handleSettingsApply: a reapply may rebuild the
+	// daemon's listeners, which outlives the listener's write timeout.
+	clearWriteDeadline(w)
+
 	cfg := p.currentConfig()
 	if cfg == nil {
 		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})

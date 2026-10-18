@@ -226,7 +226,10 @@ func sessionCookie(resp *http.Response) *http.Cookie {
 func TestDisabledPanelIs404(t *testing.T) {
 	srv, client := newTestServer(t, false, "")
 
-	getPaths := []string{"/", "/login", "/panel/", "/panel/events", "/panel/static/app.css"}
+	getPaths := []string{
+		"/", "/login", "/panel", "/panel/", "/panel/events",
+		"/panel/static", "/panel/static/app.css",
+	}
 	for _, path := range getPaths {
 		resp, body := do(t, client, http.MethodGet, srv.URL+path, nil)
 		if resp.StatusCode != http.StatusNotFound {
@@ -242,6 +245,27 @@ func TestDisabledPanelIs404(t *testing.T) {
 			t.Errorf("POST %s = %d, want 404 (disabled panel must not reveal itself)\n%s",
 				path, resp.StatusCode, body)
 		}
+	}
+}
+
+// TestPanelNoSlashPaths pins the slash-less spellings: an enabled panel
+// redirects /panel to /panel/ on purpose, and /panel/static has no
+// index, so its slash-less form is a plain 404 (never a directory
+// listing).
+func TestPanelNoSlashPaths(t *testing.T) {
+	srv, client := newTestServer(t, true, hashPassword(t, testPassword))
+
+	resp, body := do(t, client, http.MethodGet, srv.URL+"/panel", nil)
+	if resp.StatusCode != http.StatusPermanentRedirect {
+		t.Errorf("GET /panel = %d, want 308\n%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Location"); got != "/panel/" {
+		t.Errorf("GET /panel Location = %q, want /panel/", got)
+	}
+
+	resp, body = do(t, client, http.MethodGet, srv.URL+"/panel/static", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /panel/static = %d, want 404\n%s", resp.StatusCode, body)
 	}
 }
 
@@ -397,9 +421,9 @@ func loginFormFromPanel(t *testing.T, srv *httptest.Server, client *http.Client)
 	return csrfToken(t, body)
 }
 
-// TestStaticServedWithoutAuth checks that the stylesheet, the app
-// script and the vendored htmx are readable before signing in, so the
-// login page itself can load them.
+// TestStaticServedWithoutAuth checks that the stylesheet and the app
+// script are readable before signing in, so the login page itself can
+// load them.
 func TestStaticServedWithoutAuth(t *testing.T) {
 	srv, _ := newTestServer(t, true, hashPassword(t, testPassword))
 	client := srv.Client() // deliberately no cookie jar
@@ -410,8 +434,7 @@ func TestStaticServedWithoutAuth(t *testing.T) {
 		content string
 	}{
 		{"/panel/static/app.css", "text/css", "--copper"},
-		{"/panel/static/app.js", "javascript", ""},
-		{"/panel/static/htmx.min.js", "javascript", "htmx"},
+		{"/panel/static/app.js", "javascript", "EventSource"},
 	}
 	for _, tc := range cases {
 		resp, body := do(t, client, http.MethodGet, srv.URL+tc.path, nil)

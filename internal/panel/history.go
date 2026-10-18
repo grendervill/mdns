@@ -357,6 +357,10 @@ func (p *Panel) handleHistory(w http.ResponseWriter, r *http.Request) {
 // leads the file and the fields are separated by ';', so Excel opens the
 // Russian text with the right encoding and columns.
 func (p *Panel) handleHistoryCSV(w http.ResponseWriter, r *http.Request) {
+	// An export can stream for longer than the listener's 10 s write
+	// timeout on a slow link; the response must not be cut halfway.
+	clearWriteDeadline(w)
+
 	params := parseHistory(r)
 
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")

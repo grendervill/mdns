@@ -610,7 +610,7 @@ func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// stream outlives it. Clear the per-connection write deadline for
 	// this request so the pings keep flowing; the request context still
 	// ends the loop when the client goes away.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	clearWriteDeadline(w)
 
 	w.WriteHeader(http.StatusOK)
 

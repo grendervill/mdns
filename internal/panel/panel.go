@@ -145,6 +145,11 @@ type Panel struct {
 	// bus is the live event source; nil when the panel is not wired to
 	// a daemon.
 	bus *api.Bus
+
+	// refresh is the single-flight state of the block-list update. The
+	// POST returns at once and the download runs in the background, so
+	// the DoH listener's write timeout cannot truncate it.
+	refresh filterRefresh
 }
 
 // New builds a Panel. A nil Sessions or Throttle is replaced with the
@@ -266,6 +271,15 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/maintenance/config.json", p.requireSession(http.HandlerFunc(p.handleConfigDownload)))
 	mux.Handle("POST /panel/maintenance/reapply", p.requireSession(http.HandlerFunc(p.handleReapply)))
 
+	// The slash-less spellings. Without an exact route ServeMux would
+	// answer its own 307 before the panel sees the request, which leaks
+	// the route's existence when the panel is off. Registering them
+	// makes the disabled panel answer 404 like every other path and lets
+	// the enabled one redirect deliberately. /panel/static has no index
+	// to fall back to, so its slash-less form is 404 in both modes.
+	mux.HandleFunc("GET /panel", p.handlePanelNoSlash)
+	mux.HandleFunc("GET /panel/static", p.handleNotFound)
+
 	// Catch-alls for the wrong method or an unknown subpath. They gate
 	// on the session like the rest of /panel/, and answer 404 behind
 	// it, so no route leaks into an unauthenticated answer.
@@ -282,6 +296,16 @@ func (p *Panel) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/panel/", http.StatusFound)
+}
+
+// handlePanelNoSlash is GET /panel: a disabled panel answers 404 like
+// every other route; an enabled one sends the visitor to /panel/.
+func (p *Panel) handlePanelNoSlash(w http.ResponseWriter, r *http.Request) {
+	if enabled, _ := p.auth(); !enabled {
+		p.handleNotFound(w, r)
+		return
+	}
+	http.Redirect(w, r, "/panel/", http.StatusPermanentRedirect)
 }
 
 // handleNotFound answers 404 without a body that hints at the panel.
@@ -345,4 +369,15 @@ func mustRandom(n int) []byte {
 // randomToken returns a fresh URL-safe random token.
 func randomToken() string {
 	return base64.RawURLEncoding.EncodeToString(mustRandom(32))
+}
+
+// clearWriteDeadline removes the per-connection write deadline the DoH
+// listener sets (dohWriteTimeout, 10 s) for one request. The event
+// stream, a CSV export and a transactional apply all legitimately
+// outlive it; without this the listener would cut the response (and,
+// for the apply, cancel an operation that is already underway) while
+// the work is still running. Clearing the deadline does not block: a
+// client that gives up simply sees its own timeout.
+func clearWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 }

@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-// staticFS holds the panel's stylesheet and scripts, including the
-// vendored htmx build. They are embedded so a release is one binary and
-// the panel never loads anything from a CDN.
+// staticFS holds the panel's stylesheet and script. They are embedded
+// so a release is one binary and the panel never loads anything from a
+// CDN.
 //
 //go:embed static
 var staticFS embed.FS

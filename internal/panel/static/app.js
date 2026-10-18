@@ -1,18 +1,10 @@
 /* mdns panel behaviour.
  *
- * Two small jobs, no framework: the tooltip for the chart segments and
- * the live feed. The page's CSP is "default-src 'self'", so nothing
- * here may create a <style> element or set a style attribute in HTML.
- *
- * htmx 2 injects a <style> for its request indicators at
- * DOMContentLoaded unless includeIndicatorStyles is false. This script
- * is deferred, so it runs before that injection; the two rules htmx
- * would add live in app.css instead.
+ * Two small jobs, vanilla JS: the tooltip for the chart segments and
+ * the live feed (EventSource). There is no framework, so nothing here
+ * injects a <style> element or sets a style attribute in HTML — the
+ * page's strict CSP ("default-src 'self'") holds.
  */
-if (window.htmx && window.htmx.config) {
-  window.htmx.config.includeIndicatorStyles = false;
-}
-
 (function () {
   'use strict';
 
@@ -75,6 +67,7 @@ if (window.htmx && window.htmx.config) {
   var paused = false;
   var pauseBtn = document.getElementById('feed-pause');
   var clearBtn = document.getElementById('feed-clear');
+  var feedState = document.getElementById('feed-state');
 
   var trim = function () {
     while (feed.children.length > FEED_MAX) {
@@ -108,10 +101,39 @@ if (window.htmx && window.htmx.config) {
     trim();
   };
 
+  // An empty snapshot means the server buffer has no queries. Replacing
+  // the rows with "" would wipe the placeholder and leave the box blank,
+  // so restore the same line the server renders into an empty feed.
+  var showPlaceholder = function () {
+    feed.textContent = '';
+    var row = document.createElement('div');
+    row.className = 'q empty';
+    row.textContent = 'Пока нет запросов';
+    feed.appendChild(row);
+  };
+
   var es = new EventSource('/panel/events');
+  es.addEventListener('open', function () {
+    if (feedState) {
+      feedState.hidden = true;
+      feedState.textContent = '';
+    }
+  });
+  es.addEventListener('error', function () {
+    // EventSource retries on its own; until it does, say so plainly.
+    // textContent keeps the CSP-safe promise (no innerHTML here).
+    if (feedState) {
+      feedState.textContent = 'соединение потеряно — обновите страницу';
+      feedState.hidden = false;
+    }
+  });
   es.addEventListener('snapshot', function (ev) {
     if (!paused) {
-      replaceRows(ev.data);
+      if (ev.data && ev.data.trim() !== '') {
+        replaceRows(ev.data);
+      } else {
+        showPlaceholder();
+      }
     }
   });
   es.addEventListener('row', function (ev) {

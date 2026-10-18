@@ -509,29 +509,6 @@ func TestStatusLiveRow(t *testing.T) {
 	}
 }
 
-// TestStaticAssetsForCSP pins the two static-asset promises behind the
-// strict CSP: app.js stops htmx from injecting its indicator <style>,
-// and app.css carries the rules htmx would have injected.
-func TestStaticAssetsForCSP(t *testing.T) {
-	js, err := staticFS.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatalf("reading app.js: %v", err)
-	}
-	if !strings.Contains(string(js), "includeIndicatorStyles = false") {
-		t.Error("app.js does not disable htmx's injected indicator styles")
-	}
-
-	css, err := staticFS.ReadFile("static/app.css")
-	if err != nil {
-		t.Fatalf("reading app.css: %v", err)
-	}
-	for _, want := range []string{".htmx-indicator", ".htmx-request"} {
-		if !strings.Contains(string(css), want) {
-			t.Errorf("app.css is missing the htmx indicator rule %q", want)
-		}
-	}
-}
-
 // TestGaugeFormats checks the derived gauge values: the best upstream is
 // the fastest healthy one, the cache share rounds the way the mockup
 // shows it, and the client overflow bucket survives into the diagram.
