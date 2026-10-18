@@ -18,6 +18,46 @@
     </div>
     {{template "notice" .}}
 
+    <h3>Стратегия</h3>
+    <form method="post" action="/panel/upstreams/strategy" class="inline-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <select class="ctl" name="strategy" aria-label="Стратегия">
+        {{range .StrategyOptions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+      <button class="btn" type="submit">Применить</button>
+      <span class="hint">failover идёт по приоритету: меньше число — раньше выбор.</span>
+    </form>
+
+    <h3>Добавить из каталога</h3>
+    <form method="post" action="/panel/upstreams/add" class="searchrow">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <select class="ctl grow" name="provider" aria-label="Провайдер и транспорт">
+        {{range .Endpoints}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+      </select>
+      <button class="btn primary" type="submit">Добавить</button>
+    </form>
+
+    <h3>Свой upstream</h3>
+    <form method="post" action="/panel/upstreams/custom">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>ID (необязательно)</span><input class="ctl" type="text" name="id" spellcheck="false"></label>
+        <label class="field"><span>Название</span><input class="ctl" type="text" name="name"></label>
+        <label class="field"><span>Транспорт</span>
+          <select class="ctl" name="transport">
+            <option value="plain">plain</option>
+            <option value="dot">dot</option>
+            <option value="doh">doh</option>
+            <option value="doq">doq</option>
+          </select>
+        </label>
+        <label class="field"><span>Адрес</span><input class="ctl" type="text" name="address" placeholder="1.1.1.1:53 или https://host/dns-query" spellcheck="false"></label>
+        <label class="field"><span>ServerName (для DoT/DoQ по IP)</span><input class="ctl" type="text" name="server_name" spellcheck="false"></label>
+        <label class="field"><span>Приоритет</span><input class="ctl num-input" type="number" name="priority" min="0" max="99" placeholder="авто"></label>
+      </div>
+      <p class="row-actions"><button class="btn primary" type="submit">Добавить upstream</button></p>
+    </form>
+
     {{if .Upstreams}}
     <form method="post" action="/panel/upstreams/priority">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -40,7 +80,10 @@
               <td class="num">{{.Answered}}</td>
               <td class="num">{{.Errors}}</td>
               <td><input class="ctl num-input" type="number" name="prio.{{.ID}}" value="{{.Priority}}" min="0" max="99" aria-label="Приоритет {{.Name}}"></td>
-              <td><button class="btn small" type="submit" formaction="/panel/upstreams/toggle" name="id" value="{{.ID}}">{{.Action}}</button></td>
+              <td>
+                <button class="btn small" type="submit" formaction="/panel/upstreams/toggle" name="id" value="{{.ID}}">{{.Action}}</button>
+                <button class="btn small" type="submit" formaction="/panel/upstreams/remove" name="id" value="{{.ID}}">Удалить</button>
+              </td>
             </tr>
             {{end}}
           </tbody>
@@ -233,7 +276,8 @@
       </p>
     </form>
 
-    <h3>Сменить пароль</h3>
+    <h3>Пароль веб-панели</h3>
+    <p class="hint">Пароль для входа в панель меняется здесь.</p>
     <form method="post" action="/panel/settings/password">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <div class="formgrid">

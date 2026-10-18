@@ -393,6 +393,242 @@ func TestUpstreamPriority(t *testing.T) {
 	}
 }
 
+// TestUpstreamStrategy saves each of the four strategies and rejects an
+// unknown one.
+func TestUpstreamStrategy(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	for i, strategy := range []string{"fastest", "failover", "round_robin", "random"} {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/strategy", url.Values{"strategy": {strategy}})
+		wantRedirect(t, resp, "/panel/upstreams?ok=strategy")
+		if got := ctrl.sent(); len(got) != i+1 {
+			t.Fatalf("UpdateConfig called %d times, want %d\n%s", len(got), i+1, body)
+		}
+	}
+	sent := ctrl.sent()
+	if sent[3].Strategy != "random" {
+		t.Errorf("strategy = %q, want random", sent[3].Strategy)
+	}
+	if len(sent[3].Upstreams) != 2 {
+		t.Error("the strategy save dropped the upstreams")
+	}
+
+	t.Run("unknown strategy", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/strategy", url.Values{"strategy": {"bogus"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "bogus") {
+			t.Error("the page does not name the rejected strategy")
+		}
+		if len(ctrl.sent()) != 4 {
+			t.Error("an unknown strategy reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamAddCatalog adds provider endpoints from the catalog,
+// picks a unique ID and rejects a duplicate address.
+func TestUpstreamAddCatalog(t *testing.T) {
+	cfg := manageConfig(t) // no upstreams yet
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|doh"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0].Upstreams
+	if len(got) != 1 {
+		t.Fatalf("upstreams = %d, want 1", len(got))
+	}
+	u := got[0]
+	if u.ID != "cloudflare" || u.Transport != "doh" || u.Address != "https://cloudflare-dns.com/dns-query" {
+		t.Errorf("added upstream = %+v, want Cloudflare DoH", u)
+	}
+	if !u.Enabled || u.Priority != 0 {
+		t.Errorf("added upstream enabled/priority = %v/%d, want true/0", u.Enabled, u.Priority)
+	}
+
+	// A second transport of the same provider gets a suffixed, unique ID.
+	resp, _ = managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|plain"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	sent = ctrl.sent()
+	if len(sent) != 2 || len(sent[1].Upstreams) != 2 {
+		t.Fatalf("second add: %d configs, %d upstreams", len(sent), len(sent[1].Upstreams))
+	}
+	if second := sent[1].Upstreams[1]; second.ID != "cloudflare-plain" || second.Priority != 1 {
+		t.Errorf("second upstream = %+v, want id cloudflare-plain with priority 1", second)
+	}
+
+	t.Run("duplicate endpoint", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|doh"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "уже добавлен") {
+			t.Errorf("the duplicate message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate endpoint reached UpdateConfig")
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"nope|doh"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an unknown provider reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamCustom stores a hand-written upstream and validates its
+// fields.
+func TestUpstreamCustom(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+		"id": {"my-dns"}, "name": {"My DNS"}, "transport": {"dot"},
+		"address": {"10.0.0.1:853"}, "server_name": {"dns.internal"}, "priority": {"5"},
+	})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 || len(sent[0].Upstreams) != 1 {
+		t.Fatalf("UpdateConfig calls/upstreams = %d/%v\n%s", len(sent), sent, body)
+	}
+	u := sent[0].Upstreams[0]
+	if u.ID != "my-dns" || u.Name != "My DNS" || u.Transport != "dot" || u.Address != "10.0.0.1:853" ||
+		u.ServerName != "dns.internal" || u.Priority != 5 || !u.Enabled {
+		t.Errorf("custom upstream = %+v", u)
+	}
+
+	t.Run("derived id and default priority", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"transport": {"plain"}, "address": {"1.1.1.1:53"},
+		})
+		wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+		got := ctrl.sent()
+		if len(got) != 2 || len(got[1].Upstreams) != 2 {
+			t.Fatalf("second custom: %d configs", len(got))
+		}
+		second := got[1].Upstreams[1]
+		if second.ID != "1-1-1-1" {
+			t.Errorf("derived id = %q, want 1-1-1-1", second.ID)
+		}
+		if second.Priority != 6 {
+			t.Errorf("default priority = %d, want max+1 = 6", second.Priority)
+		}
+		if second.Name != "1-1-1-1" {
+			t.Errorf("default name = %q, want the id", second.Name)
+		}
+	})
+
+	t.Run("empty address", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"x"}, "transport": {"plain"}, "address": {"  "},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "адрес") {
+			t.Error("the missing-address message is absent")
+		}
+	})
+
+	t.Run("unknown transport", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"x"}, "transport": {"bogus"}, "address": {"1.1.1.1:53"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("duplicate id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"my-dns"}, "transport": {"plain"}, "address": {"2.2.2.2:53"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate id reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamRemove refuses to remove the last enabled upstream and
+// removes any other.
+func TestUpstreamRemove(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg) // cloudflare enabled, quad9 disabled
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"cloudflare"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("removing the last enabled upstream = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "последн") {
+		t.Errorf("the last-upstream message is missing:\n%s", body)
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a refused removal reached UpdateConfig")
+	}
+
+	resp, _ = managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"quad9"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	sent := ctrl.sent()
+	if len(sent) != 1 || len(sent[0].Upstreams) != 1 || sent[0].Upstreams[0].ID != "cloudflare" {
+		t.Errorf("after removing quad9: %v", sent)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"nope"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+}
+
+// TestEndpointOptions checks the catalog picker: non-empty, unique
+// values, and a Cloudflare DoH entry.
+func TestEndpointOptions(t *testing.T) {
+	opts := endpointOptions()
+	if len(opts) == 0 {
+		t.Fatal("endpointOptions is empty")
+	}
+	seen := make(map[string]bool, len(opts))
+	foundCloudflare := false
+	for _, o := range opts {
+		if seen[o.Value] {
+			t.Errorf("duplicate endpoint option %q", o.Value)
+		}
+		seen[o.Value] = true
+		if o.Value == "cloudflare|doh" &&
+			strings.Contains(o.Label, "Cloudflare") &&
+			strings.Contains(o.Label, "DoH") &&
+			strings.Contains(o.Label, "https://cloudflare-dns.com/dns-query") {
+			foundCloudflare = true
+		}
+	}
+	if !foundCloudflare {
+		t.Error("the Cloudflare DoH entry is missing")
+	}
+}
+
 // ---- filters -----------------------------------------------------
 
 // manageFilterConfig is a config with the filter engine on. It carries

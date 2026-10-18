@@ -254,6 +254,10 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/upstreams", p.requireSession(http.HandlerFunc(p.handleUpstreams)))
 	mux.Handle("POST /panel/upstreams/toggle", p.requireSession(http.HandlerFunc(p.handleUpstreamToggle)))
 	mux.Handle("POST /panel/upstreams/priority", p.requireSession(http.HandlerFunc(p.handleUpstreamPriority)))
+	mux.Handle("POST /panel/upstreams/strategy", p.requireSession(http.HandlerFunc(p.handleUpstreamStrategy)))
+	mux.Handle("POST /panel/upstreams/add", p.requireSession(http.HandlerFunc(p.handleUpstreamAdd)))
+	mux.Handle("POST /panel/upstreams/custom", p.requireSession(http.HandlerFunc(p.handleUpstreamCustom)))
+	mux.Handle("POST /panel/upstreams/remove", p.requireSession(http.HandlerFunc(p.handleUpstreamRemove)))
 
 	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))
 	mux.Handle("POST /panel/filters/refresh", p.requireSession(http.HandlerFunc(p.handleFiltersRefresh)))

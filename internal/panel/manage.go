@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime/debug"
@@ -26,6 +27,7 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/dnsname"
 	"mydns/internal/filter"
+	"mydns/internal/providers"
 	"mydns/internal/tlscert"
 )
 
@@ -99,6 +101,8 @@ func okMessage(key string) string {
 	switch key {
 	case "upstream":
 		return "upstream переключён"
+	case "strategy":
+		return "стратегия сохранена"
 	case "priority":
 		return "порядок сохранён"
 	case "lists":
@@ -217,14 +221,24 @@ type upstreamRow struct {
 	Errors     string
 }
 
+// endpointOption is one reachable provider endpoint in the catalog
+// picker. Value is the "providerID|transport" pair the add form posts;
+// Label is the human-readable provider, transport and address.
+type endpointOption struct {
+	Value string
+	Label string
+}
+
 // upstreamsView is the whole upstreams page.
 type upstreamsView struct {
 	manageNotice
-	Domain    string
-	CSRF      string
-	Nav       string
-	Strategy  string
-	Upstreams []upstreamRow
+	Domain          string
+	CSRF            string
+	Nav             string
+	Strategy        string
+	StrategyOptions []strategyOption
+	Endpoints       []endpointOption
+	Upstreams       []upstreamRow
 }
 
 // upstreamRowFor renders one upstream: the config supplies the identity
@@ -279,11 +293,14 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 		Domain:       p.pageDomain(),
 		CSRF:         p.manageCSRF(r),
 		Nav:          "upstreams",
+		Endpoints:    endpointOptions(),
 	}
 
+	strategy := ""
 	cfg := p.currentConfig()
 	if cfg != nil {
-		view.Strategy = cfg.Strategy
+		strategy = cfg.Strategy
+		view.Strategy = strategy
 		st := p.statusSnapshot(r)
 		live := make(map[string]api.UpstreamStatus, len(st.Upstreams))
 		for _, u := range st.Upstreams {
@@ -294,8 +311,138 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 			view.Upstreams = append(view.Upstreams, upstreamRowFor(u, live[u.ID]))
 		}
 	}
+	view.StrategyOptions = strategyOptions(strategy)
 
 	p.render(w, status, "upstreams", view)
+}
+
+// endpointOptions builds the catalog picker from the provider catalog,
+// one entry per provider and transport (the first endpoint of each, in
+// the catalog's DoH, DoT, DoQ, plain order), so every option value is
+// unique and the order is stable.
+func endpointOptions() []endpointOption {
+	var out []endpointOption
+	for _, prov := range providers.List() {
+		seen := make(map[string]bool)
+		for _, e := range prov.AllEndpoints() {
+			if seen[e.Transport] {
+				continue
+			}
+			seen[e.Transport] = true
+			out = append(out, endpointOption{
+				Value: prov.ID + "|" + e.Transport,
+				Label: fmt.Sprintf("%s — %s · %s", prov.Name, transportLabel(e.Transport), e.Address),
+			})
+		}
+	}
+	return out
+}
+
+// transportLabel is the prose name of an upstream transport.
+func transportLabel(transport string) string {
+	switch transport {
+	case "doh":
+		return "DoH"
+	case "dot":
+		return "DoT"
+	case "doq":
+		return "DoQ"
+	default:
+		return "plain"
+	}
+}
+
+// validStrategy reports whether name is one of the routing strategies
+// the config accepts.
+func validStrategy(name string) bool {
+	for _, s := range strategies {
+		if s.value == name {
+			return true
+		}
+	}
+	return false
+}
+
+// knownTransport reports whether transport is one of the upstream
+// transports the config accepts.
+func knownTransport(transport string) bool {
+	for _, f := range protocolFields {
+		if f.field == transport {
+			return true
+		}
+	}
+	return false
+}
+
+// nextPriority is one past the highest existing priority, so a new
+// upstream sorts last under the failover strategy. An empty list yields 0.
+func nextPriority(upstreams []config.UpstreamConfig) int {
+	highest := -1
+	for _, u := range upstreams {
+		if u.Priority > highest {
+			highest = u.Priority
+		}
+	}
+	return highest + 1
+}
+
+// uniqueUpstreamID picks a free ID for a new upstream: the provider ID
+// when it is free, then provider-transport, then a numbered suffix.
+func uniqueUpstreamID(upstreams []config.UpstreamConfig, providerID, transport string) string {
+	taken := make(map[string]bool, len(upstreams))
+	for _, u := range upstreams {
+		taken[u.ID] = true
+	}
+	if !taken[providerID] {
+		return providerID
+	}
+	candidate := providerID + "-" + transport
+	if !taken[candidate] {
+		return candidate
+	}
+	for i := 2; ; i++ {
+		candidate = fmt.Sprintf("%s-%s-%d", providerID, transport, i)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
+}
+
+// upstreamIDFromAddress derives a slug ID from an upstream address when
+// the custom form leaves the ID empty: the URL host for DoH, the host of
+// a host:port for the other transports.
+func upstreamIDFromAddress(address string) string {
+	host := address
+	if u, err := url.Parse(address); err == nil && u.Host != "" {
+		host = u.Hostname()
+	} else if h, _, err := net.SplitHostPort(address); err == nil {
+		host = h
+	}
+	slug := slugID(host)
+	if slug == "" {
+		slug = "upstream"
+	}
+	return slug
+}
+
+// slugID lowercases s and keeps only [a-z0-9], turning every other run
+// of characters into a single dash; leading and trailing dashes go.
+func slugID(s string) string {
+	var b strings.Builder
+	pendingDash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			if pendingDash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingDash = false
+			b.WriteRune(r)
+		default:
+			pendingDash = true
+		}
+	}
+	return b.String()
 }
 
 // handleUpstreamToggle flips one upstream's enabled flag. The whole
@@ -355,6 +502,189 @@ func (p *Panel) handleUpstreamPriority(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.finishApply(w, r, next, upstreamsPath+"?ok=priority", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamStrategy saves the routing strategy chosen on the
+// upstreams page. The known set is shared with the settings page, so the
+// two cannot disagree.
+func (p *Panel) handleUpstreamStrategy(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	strategy := strings.TrimSpace(r.PostFormValue("strategy"))
+	if !validStrategy(strategy) {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестная стратегия: " + strategy})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	next.Strategy = strategy
+	p.finishApply(w, r, next, upstreamsPath+"?ok=strategy", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamAdd adds one provider endpoint from the catalog. The
+// posted provider value is "providerID|transport"; the first endpoint of
+// that provider and transport supplies the address.
+func (p *Panel) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	providerID, transport, ok := strings.Cut(strings.TrimSpace(r.PostFormValue("provider")), "|")
+	prov, found := providers.ByID(providerID)
+	if !ok || providerID == "" || transport == "" || !found {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "выберите провайдера и транспорт"})
+		return
+	}
+
+	endpoint, found := providers.Endpoint{}, false
+	for _, e := range prov.AllEndpoints() {
+		if e.Transport == transport {
+			endpoint, found = e, true
+			break
+		}
+	}
+	if !found {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+			Error: fmt.Sprintf("у провайдера «%s» нет транспорта %s", prov.Name, transport),
+		})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	for _, u := range next.Upstreams {
+		if u.Transport == endpoint.Transport && u.Address == endpoint.Address {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+				Error: "этот upstream уже добавлен: " + endpoint.Address,
+			})
+			return
+		}
+	}
+
+	up := endpoint.UpstreamConfig(uniqueUpstreamID(next.Upstreams, prov.ID, endpoint.Transport), prov.Name)
+	up.Priority = nextPriority(next.Upstreams)
+	next.Upstreams = append(next.Upstreams, up)
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamCustom adds an upstream the admin types in. The ID is
+// optional (derived from the address host when empty); everything
+// semantic — the transport, the address shape — is left to
+// config.Validate, which UpdateConfig runs, so the page and the daemon
+// cannot disagree.
+func (p *Panel) handleUpstreamCustom(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	transport := strings.TrimSpace(r.PostFormValue("transport"))
+	address := strings.TrimSpace(r.PostFormValue("address"))
+	serverName := strings.TrimSpace(r.PostFormValue("server_name"))
+	rawPriority := strings.TrimSpace(r.PostFormValue("priority"))
+
+	if address == "" {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "укажите адрес upstream"})
+		return
+	}
+	if !knownTransport(transport) {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный транспорт: " + transport})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	if id == "" {
+		id = uniqueUpstreamID(next.Upstreams, upstreamIDFromAddress(address), transport)
+	} else {
+		for _, u := range next.Upstreams {
+			if u.ID == id {
+				p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream с таким ID уже есть: " + id})
+				return
+			}
+		}
+	}
+
+	priority := nextPriority(next.Upstreams)
+	if rawPriority != "" {
+		n, err := strconv.Atoi(rawPriority)
+		if err != nil || n < 0 {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "приоритет: ожидается целое число не меньше нуля"})
+			return
+		}
+		priority = n
+	}
+
+	if name == "" {
+		name = id
+	}
+	next.Upstreams = append(next.Upstreams, config.UpstreamConfig{
+		ID:         id,
+		Name:       name,
+		Transport:  transport,
+		Address:    address,
+		ServerName: serverName,
+		Priority:   priority,
+		Enabled:    true,
+	})
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamRemove drops one upstream. Removing the last enabled one
+// is refused: the daemon would have nothing to forward to.
+func (p *Panel) handleUpstreamRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	next := cloneConfig(cfg)
+	idx := -1
+	for i := range next.Upstreams {
+		if next.Upstreams[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream не найден: " + id})
+		return
+	}
+
+	enabled := 0
+	for _, u := range next.Upstreams {
+		if u.Enabled {
+			enabled++
+		}
+	}
+	if next.Upstreams[idx].Enabled && enabled <= 1 {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+			Error: "нельзя удалить последний включённый upstream — демону будет некуда пересылать запросы",
+		})
+		return
+	}
+
+	next.Upstreams = append(next.Upstreams[:idx], next.Upstreams[idx+1:]...)
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
 }
