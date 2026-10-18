@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"embed"
 	"html/template"
 	"net/http"
 )
@@ -11,21 +12,19 @@ type loginView struct {
 	Error string
 }
 
-// indexView is the data behind the authenticated landing page.
-type indexView struct {
-	Domain    string
-	Version   string
-	Strategy  string
-	Listeners int
-	CSRF      string
-}
+// templateFS holds the page templates. They are embedded so a release
+// is one binary, like the static assets.
+//
+//go:embed templates/*.html
+var templateFS embed.FS
 
-// templates holds the page templates by name. They are plain strings
-// for now; later tasks add per-page files under templates/ and parse
-// them the same way.
+// templates holds the page templates by name. A page file defines one
+// root template (its page name) plus any {{template}} fragments it
+// renders, so the same set serves both a full page and an SSE frame
+// (see status.html's feed_row).
 var templates = map[string]*template.Template{
-	"login": template.Must(template.New("login").Parse(loginPage)),
-	"index": template.Must(template.New("index").Parse(indexPage)),
+	"login":  template.Must(template.New("login").Parse(loginPage)),
+	"status": template.Must(template.New("status").ParseFS(templateFS, "templates/status.html")),
 }
 
 // render writes one page. Every header is set before the status so a
@@ -47,7 +46,7 @@ func (p *Panel) render(w http.ResponseWriter, status int, name string, data any)
 	if status != http.StatusOK {
 		w.WriteHeader(status)
 	}
-	if err := templates[name].Execute(w, data); err != nil {
+	if err := templates[name].ExecuteTemplate(w, name, data); err != nil {
 		p.logger.Warn("panel: rendering a page", "name", name, "error", err)
 	}
 }
@@ -55,7 +54,7 @@ func (p *Panel) render(w http.ResponseWriter, status int, name string, data any)
 // loginPage is the sign-in screen: the copper accent and ink palette of
 // the mockups, one password field, and the CSRF token bound to the
 // pre-session cookie.
-const loginPage = `<!doctype html>
+const loginPage = `{{define "login"}}<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
@@ -79,47 +78,4 @@ const loginPage = `<!doctype html>
 </main>
 </body>
 </html>
-`
-
-// indexPage is the authenticated shell. Task 7 fills the main area with
-// the status screen (gauges, donuts, live feed); the shell, palette and
-// navigation are already the ones the mockups specify.
-const indexPage = `<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mdns — панель</title>
-<link rel="stylesheet" href="/panel/static/app.css">
-<script src="/panel/static/htmx.min.js" defer></script>
-<script src="/panel/static/app.js" defer></script>
-</head>
-<body>
-<div class="shell">
-  <aside class="rail">
-    <div class="brand">mdns<small>{{.Domain}}</small></div>
-    <nav class="nav">
-      <a class="on" href="/panel/" aria-current="page">Статус</a>
-    </nav>
-    <form method="post" action="/logout" class="rail-foot">
-      <input type="hidden" name="csrf" value="{{.CSRF}}">
-      <button class="btn small" type="submit">Выйти</button>
-    </form>
-  </aside>
-  <main class="main">
-    <div class="topline">
-      <h2>Статус</h2>
-      <div class="state"><span class="dot"></span>работает{{if .Version}} · <b>{{.Version}}</b>{{end}}</div>
-    </div>
-    <dl class="kv">
-      <div><dt>Домен</dt><dd>{{.Domain}}</dd></div>
-      <div><dt>Версия</dt><dd>{{.Version}}</dd></div>
-      {{if .Strategy}}<div><dt>Стратегия</dt><dd>{{.Strategy}}</dd></div>{{end}}
-      {{if .Listeners}}<div><dt>Слушателей</dt><dd>{{.Listeners}}</dd></div>{{end}}
-    </dl>
-    <p class="note">Панель подключена. Приборы, распределение запросов и живая лента появятся здесь на следующем шаге.</p>
-  </main>
-</div>
-</body>
-</html>
-`
+{{end}}`

@@ -195,8 +195,161 @@ h3 { font: 600 13px/1 var(--sans); color: var(--muted); margin: 26px 0 10px; }
 }
 .field input:hover { border-color: var(--copper); }
 
+/* ---- status: gauges, diagrams, live feed, addresses, certificate -- */
+
+.gauges {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.g { padding: 14px 16px; border-right: 1px solid var(--line-soft); }
+.g:last-child { border-right: 0; }
+.g .k { color: var(--muted); font-size: 12px; }
+.g .v { font: 600 20px/1.3 var(--mono); margin-top: 4px; }
+.g .v small { font: 400 12px var(--sans); color: var(--muted); margin-left: 6px; }
+
+h3 .sub { font-weight: 400; }
+
+/* Diagrams. The ring palette is fixed by slot, so one slice colour
+   means one thing across all four charts. */
+.piefold { display: grid; grid-template-columns: 1.1fr 1fr 1fr 1fr; gap: 14px; }
+.pie {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 12px 14px 10px;
+  min-width: 0;
+}
+.pie .t { font-size: 12.5px; color: var(--muted); margin-bottom: 6px; }
+.pie svg { display: block; width: 118px; height: 118px; margin: 0 auto; }
+.pie .track { fill: none; stroke: var(--ink-3); stroke-width: 14; }
+.pie .ring {
+  fill: none;
+  stroke-width: 14;
+  cursor: pointer;
+  transition: stroke-width .12s ease, opacity .12s ease;
+}
+.pie .ring:hover,
+.pie .ring:focus-visible { stroke-width: 18; }
+.pie a.seg:focus-visible { outline: 2px solid var(--copper-2); outline-offset: 2px; }
+.pie .legend { display: grid; gap: 4px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.pie .legend span b { color: var(--text); font-weight: 600; font-family: var(--mono); }
+.pie .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+
+.pie .c-0 { stroke: var(--copper); }
+.pie .c-1 { stroke: var(--ok); }
+.pie .c-2 { stroke: var(--warn); }
+.pie .c-3 { stroke: var(--muted); }
+.pie .c-4 { stroke: var(--copper-2); }
+.pie .c-5 { stroke: var(--err); }
+.sw-0 { background: var(--copper); }
+.sw-1 { background: var(--ok); }
+.sw-2 { background: var(--warn); }
+.sw-3 { background: var(--muted); }
+.sw-4 { background: var(--copper-2); }
+.sw-5 { background: var(--err); }
+
+/* Tooltip for the ring segments. Its position is set from app.js via
+   the CSSOM (a style attribute in the HTML would break the CSP). */
+.tooltip {
+  position: fixed;
+  z-index: 9;
+  background: #0b1119;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-size: 12.5px;
+  color: var(--text);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .1s;
+}
+.tooltip b { color: var(--copper-2); }
+
+/* Live feed. */
+.wire { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+.wire .head {
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+.wire .feedctl { display: flex; gap: 8px; align-items: center; }
+.wire .q {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr) 64px 110px 170px;
+  gap: 14px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13.5px;
+  align-items: center;
+}
+.wire .q:last-child { border-bottom: 0; }
+.wire .q .t { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.wire .q .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wire .q .proto,
+.wire .q .ms { color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.wire .q.empty { display: block; color: var(--muted); font-size: 13px; }
+
+.tag.block { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.tag.cache { color: var(--copper); border-color: color-mix(in srgb, var(--copper) 45%, transparent); }
+
+.links { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 26px; }
+.link {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  align-items: center;
+}
+.link .p { color: var(--muted); font-size: 12.5px; }
+.link .u {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--copper-2);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cert {
+  display: flex;
+  gap: 26px;
+  align-items: baseline;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 16px;
+}
+.cert .big { font: 600 22px var(--serif); }
+.cert .m { color: var(--muted); font-size: 13px; }
+.cert.ok .big { color: var(--ok); }
+.cert.waiting .big { color: var(--warn); }
+.cert.error .big { color: var(--err); }
+
+/* htmx injects indicator styles by default; app.js turns that off (the
+   CSP forbids the injected <style>), so the two rules live here. */
+.htmx-indicator { opacity: 0; visibility: hidden; }
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator {
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 200ms ease-in;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+}
+
+@media (max-width: 1080px) {
+  .piefold { grid-template-columns: 1fr 1fr; }
 }
 
 @media (max-width: 720px) {
@@ -206,4 +359,15 @@ h3 { font: 600 13px/1 var(--sans); color: var(--muted); margin: 26px 0 10px; }
   .nav { flex-direction: row; }
   .rail-foot { margin: 0 0 0 auto; padding: 0; }
   .main { padding: 20px 16px; }
+  .gauges { grid-template-columns: 1fr 1fr; }
+  .g { border-bottom: 1px solid var(--line-soft); }
+  .g:nth-child(2n) { border-right: 0; }
+  .g:nth-child(n + 3) { border-bottom: 0; }
+  .piefold { grid-template-columns: 1fr; }
+  .links { grid-template-columns: 1fr; }
+  .cert { flex-direction: column; gap: 6px; }
+  .wire .head { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .wire .q { grid-template-columns: 60px minmax(0, 1fr) auto auto; gap: 10px; }
+  .wire .q .proto { display: none; }
 }
+

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"io"
 	"net"
 	"net/http"
 	"time"
@@ -213,72 +212,4 @@ func (p *Panel) handleLogout(w http.ResponseWriter, r *http.Request) {
 	}
 	p.clearSessionCookie(w)
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
-}
-
-// handleIndex is the authenticated landing page. Task 7 replaces it with
-// the full status screen; for now it renders the shell so the sign-in
-// path has somewhere to land.
-func (p *Panel) handleIndex(w http.ResponseWriter, r *http.Request) {
-	view := indexView{
-		Version: p.version,
-		CSRF:    p.csrfToken(sessionCSRFBinding(p.sessionToken(r))),
-	}
-	if p.ctrl != nil {
-		if cfg := p.ctrl.Config(); cfg != nil {
-			view.Domain = cfg.Domain
-		}
-		if st, err := p.ctrl.Status(r.Context()); err == nil {
-			view.Strategy = st.Strategy
-			view.Listeners = len(st.Listeners)
-		}
-	}
-	p.render(w, http.StatusOK, "index", view)
-}
-
-// handleEvents is the placeholder SSE stream: it authenticates through
-// the session cookie (never a URL token) and keeps the connection open
-// with pings. Task 7 replaces the body with the real event stream.
-func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	// The DoH listener sets a 10s write timeout for its hardening, but a
-	// stream outlives it. Clear the per-connection write deadline for
-	// this request so the pings keep flowing; the request context still
-	// ends the loop when the client goes away.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-
-	w.WriteHeader(http.StatusOK)
-
-	writePing := func() bool {
-		if _, err := io.WriteString(w, "event: ping\ndata: {}\n\n"); err != nil {
-			return false
-		}
-		flusher.Flush()
-		return true
-	}
-	if !writePing() {
-		return
-	}
-
-	ticker := time.NewTicker(p.pingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-ticker.C:
-			if !writePing() {
-				return
-			}
-		}
-	}
 }

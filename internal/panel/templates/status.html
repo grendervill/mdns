@@ -1,0 +1,86 @@
+{{define "status"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — панель</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+<script src="/panel/static/htmx.min.js" defer></script>
+<script src="/panel/static/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="brand">mdns<small>{{.Domain}}</small></div>
+    <nav class="nav">
+      <a class="on" href="/panel/" aria-current="page">Статус</a>
+    </nav>
+    <form method="post" action="/logout" class="rail-foot">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button class="btn small" type="submit">Выйти</button>
+    </form>
+  </aside>
+  <main class="main">
+    <div class="topline">
+      <h2>Статус</h2>
+      <div class="state"><span class="dot"></span>работает{{if .Version}} · <b>{{.Version}}</b>{{end}}</div>
+    </div>
+
+    <div class="gauges">
+      <div class="g"><div class="k">Запросов всего</div><div class="v">{{.Total}}</div></div>
+      <div class="g"><div class="k">Кеш</div><div class="v">{{.CachePercent}}{{if .CacheEntries}}<small>{{.CacheEntries}}</small>{{end}}</div></div>
+      <div class="g"><div class="k">Заблокировано</div><div class="v">{{.Blocked}}<small>{{.BlockedPercent}}</small></div></div>
+      <div class="g"><div class="k">Лучший upstream</div><div class="v">{{.BestLatency}}{{if .BestName}}<small>{{.BestName}}</small>{{end}}</div></div>
+    </div>
+
+    <h3>Куда идут запросы <span class="sub">— наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <div class="piefold">
+      {{range .Donuts}}{{template "donut" .}}{{end}}
+    </div>
+
+    <h3>Живая лента <span class="sub">— последние 30 · пауза · очистить · полная история</span></h3>
+    <div class="wire">
+      <div class="head">
+        <span>время · протокол · результат · задержка</span>
+        <span class="feedctl">
+          <button type="button" class="btn small" id="feed-pause" aria-pressed="false">Пауза</button>
+          <button type="button" class="btn small" id="feed-clear">Очистить</button>
+          <a class="btn small" href="/panel/history">Полная история</a>
+        </span>
+      </div>
+      <div id="feed">{{if .Feed}}{{range .Feed}}{{template "feed_row" .}}{{end}}{{else}}<div class="q empty">Пока нет запросов</div>{{end}}</div>
+    </div>
+
+    <h3>Адреса для устройств</h3>
+    <div class="links">
+      {{range .Links}}<div class="link"><span class="p">{{.Title}}</span><a class="u" href="{{.URI}}">{{.URI}}</a></div>{{end}}
+      {{if not .Links}}<p class="note">Ни один протокол не включён.</p>{{end}}
+    </div>
+
+    {{if .Cert.Show}}
+    <h3>Сертификат</h3>
+    <div class="cert {{.Cert.State}}">
+      <span class="big">{{.Cert.Label}}</span>
+      <span class="m">{{.Cert.Detail}}</span>
+    </div>
+    {{end}}
+  </main>
+</div>
+<div class="tooltip" id="tip" role="status" aria-live="polite"></div>
+</body>
+</html>
+{{end}}
+{{define "donut"}}
+<div class="pie">
+  <div class="t">{{.Title}}</div>
+  <svg viewBox="0 0 42 42" role="img" aria-label="{{.Title}}">
+    <circle class="track" cx="21" cy="21" r="15.9"></circle>
+    {{range .Segments}}{{template "segment" .}}{{end}}
+  </svg>
+  <div class="legend">
+    {{range .Segments}}<span><i class="sw sw-{{.Slot}}"></i>{{.Label}} <b>{{.Percent}} %</b></span>{{end}}
+  </div>
+</div>
+{{end}}
+{{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}
+{{define "feed_row"}}<div class="q"><span class="t">{{.Time}}</span><span class="name" title="{{.Title}}">{{.QName}}</span><span class="proto">{{.Proto}}</span><span class="tag {{.Tag}}">{{.TagText}}</span><span class="ms">{{.Detail}}</span></div>{{end}}

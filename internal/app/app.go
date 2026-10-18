@@ -310,6 +310,7 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 
 	a.panel = panel.New(panel.Options{
 		Ctrl:    a,
+		Bus:     a.bus,
 		Version: version.String(),
 		Logger:  logger,
 		Auth:    a.panelAuth,

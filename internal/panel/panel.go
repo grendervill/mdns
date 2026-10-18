@@ -16,6 +16,8 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/qlog"
+	"mydns/internal/stats"
 )
 
 const (
@@ -34,8 +36,8 @@ const (
 	// in a URL: the SSE stream and every page read it from the header.
 	sessionCookie = "mdns_session"
 
-	// defaultPingInterval paces the /panel/events keep-alives until the
-	// status page replaces the placeholder stream.
+	// defaultPingInterval paces the /panel/events keep-alives between
+	// live query events.
 	defaultPingInterval = 15 * time.Second
 )
 
@@ -47,6 +49,11 @@ type Controller interface {
 	Config() *config.Config
 	// Status returns the read-only daemon snapshot.
 	Status(ctx context.Context) (api.Status, error)
+	// Stats returns the cumulative query statistics since start.
+	Stats() stats.Snapshot
+	// Requests returns the newest n query records, oldest first. The
+	// status feed backfills its buffer with it.
+	Requests(n int) []qlog.Entry
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -78,6 +85,12 @@ type Options struct {
 	// Ctrl is the daemon behind the panel. It may be nil in tests that
 	// only exercise routing and auth.
 	Ctrl Controller
+
+	// Bus carries the live query events behind /panel/events. It may be
+	// nil: the page still renders and the stream still delivers its
+	// snapshot and pings, it just never gains a new row.
+	Bus *api.Bus
+
 	// Version is the daemon version shown in the shell.
 	Version string
 	// Logger receives warnings; nil falls back to slog.Default.
@@ -106,6 +119,16 @@ type Panel struct {
 	csrfKey []byte
 
 	pingInterval time.Duration
+
+	// feed is the rolling buffer behind the status page's live feed. It
+	// holds the newest feedSize entries, shared by every SSE client, so
+	// a client that connects late (or reconnects) still sees the recent
+	// traffic instead of an empty list.
+	feed *feed
+
+	// bus is the live event source; nil when the panel is not wired to
+	// a daemon.
+	bus *api.Bus
 }
 
 // New builds a Panel. A nil Sessions or Throttle is replaced with the
@@ -135,7 +158,7 @@ func New(opts Options) *Panel {
 		authFn = func() (bool, string) { return enabled, hash }
 	}
 
-	return &Panel{
+	p := &Panel{
 		authFn:       authFn,
 		version:      opts.Version,
 		ctrl:         opts.Ctrl,
@@ -144,7 +167,35 @@ func New(opts Options) *Panel {
 		logger:       logger,
 		csrfKey:      mustRandom(32),
 		pingInterval: ping,
+		feed:         newFeed(feedSize),
+		bus:          opts.Bus,
 	}
+	p.startFeed()
+	return p
+}
+
+// startFeed seeds the live feed with the recent queries the daemon
+// already has and, when a bus is wired, keeps it current. The panel is
+// a process-lifetime object, so the subscription is deliberately not
+// torn down; it ends with the process.
+func (p *Panel) startFeed() {
+	if p.ctrl != nil {
+		p.feed.seed(p.ctrl.Requests(feedSize))
+	}
+	if p.bus == nil {
+		return
+	}
+	events, _ := p.bus.Subscribe()
+	go func() {
+		for e := range events {
+			if e.Type != "requests" {
+				continue
+			}
+			if entry, ok := e.Data.(qlog.Entry); ok {
+				p.feed.push(entry)
+			}
+		}
+	}()
 }
 
 // auth reports the live enabled flag and stored password hash. When
@@ -169,7 +220,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	// Static assets are public: the login page itself needs them.
 	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
 	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
-	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleIndex)))
+	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleStatus)))
 
 	// Catch-alls for the wrong method or an unknown subpath. They gate
 	// on the session like the rest of /panel/, and answer 404 behind

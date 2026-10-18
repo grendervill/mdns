@@ -21,6 +21,8 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/config"
 	"mydns/internal/panel"
+	"mydns/internal/qlog"
+	"mydns/internal/stats"
 )
 
 // testPassword is the fixture password the login tests authenticate
@@ -38,6 +40,10 @@ func (f *fakeController) Config() *config.Config { return f.cfg }
 func (f *fakeController) Status(context.Context) (api.Status, error) {
 	return api.Status{Version: "v-test"}, nil
 }
+
+func (f *fakeController) Stats() stats.Snapshot { return stats.Snapshot{} }
+
+func (f *fakeController) Requests(int) []qlog.Entry { return nil }
 
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {
