@@ -18,5 +18,11 @@
 # Python-окружение Playwright для e2e панели (создаётся scripts/e2e-panel.sh)
 /.venv-pw/
 
+# Локальные перф-артефакты (стенд scripts/perf-local.sh пишет во /tmp,
+# но эти пути могут появиться при ручных прогонах)
+/perf-out/
+/.perf/
+*.perf.log
+
 # Workspace SDD (служебный)
 .superpowers/
