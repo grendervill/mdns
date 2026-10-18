@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"mydns/internal/config"
 )
 
 // queryTimeout bounds a single UDP or TCP exchange when the caller's
@@ -21,6 +23,13 @@ const queryTimeout = 2 * time.Second
 type Plain struct {
 	addr     string
 	resolver *bootstrapResolver
+}
+
+// newPlainWithResolver is New's plain variant with the hostname resolver
+// injected, mirroring newDoHWithResolver so a test can point the
+// bootstrap lookup at a local fake DNS server.
+func newPlainWithResolver(cfg config.UpstreamConfig, resolver *bootstrapResolver) *Plain {
+	return &Plain{addr: cfg.Address, resolver: resolver}
 }
 
 // Name implements Transport.
