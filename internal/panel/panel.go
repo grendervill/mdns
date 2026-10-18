@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"mydns/internal/api"
@@ -154,6 +155,15 @@ type Panel struct {
 	// POST returns at once and the download runs in the background, so
 	// the DoH listener's write timeout cannot truncate it.
 	refresh filterRefresh
+
+	// streams is closed when the runtime generation behind the panel
+	// stops, so /panel/events handlers return instead of holding the
+	// listeners open. http.Server.Shutdown does not cancel a handler's
+	// request context, so the stream would otherwise block it until the
+	// stop timeout. EndStreams replaces the channel with a fresh one so
+	// a later generation's connections get a live signal.
+	streamsMu sync.Mutex
+	streams   chan struct{}
 }
 
 // New builds a Panel. A nil Sessions or Throttle is replaced with the
@@ -194,9 +204,38 @@ func New(opts Options) *Panel {
 		pingInterval: ping,
 		feed:         newFeed(feedSize),
 		bus:          opts.Bus,
+		streams:      make(chan struct{}),
 	}
 	p.startFeed()
 	return p
+}
+
+// EndStreams closes the signal every live /panel/events handler is
+// watching, so those handlers return instead of holding the listeners
+// open: http.Server.Shutdown does not cancel a handler's request
+// context, so a stream would otherwise keep the stop waiting until its
+// timeout. The channel is replaced at once, so connections from the
+// next runtime generation (the panel outlives them) get a live signal.
+func (p *Panel) EndStreams() {
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+
+	select {
+	case <-p.streams:
+		// Already closed by an earlier EndStreams.
+	default:
+		close(p.streams)
+	}
+	p.streams = make(chan struct{})
+}
+
+// streamDone returns the current stream-end signal. A handler captures
+// it once at start so EndStreams ends this connection, while a later
+// generation's connection captures the fresh channel.
+func (p *Panel) streamDone() <-chan struct{} {
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+	return p.streams
 }
 
 // startFeed seeds the live feed with the recent queries the daemon

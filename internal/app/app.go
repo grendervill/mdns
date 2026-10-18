@@ -382,6 +382,11 @@ func (a *App) Stop(ctx context.Context) error {
 		a.cancel = nil
 	}
 
+	// End the panel's open SSE streams first: Shutdown does not cancel
+	// handler contexts, so a live /panel/events stream would otherwise
+	// make the stop wait for its timeout. The panel outlives the
+	// runtime, but its streams must end with it.
+	a.panel.EndStreams()
 	err := a.rt.stop(ctx)
 
 	// Persist the statistics history once on the way out. A failure is
@@ -470,6 +475,12 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	defer cancel()
 
 	oldRT := a.rt
+	// End the panel's open SSE streams before stopping the runtime.
+	// http.Server.Shutdown does not cancel handler contexts, so a live
+	// /panel/events stream would hold the old listeners open until the
+	// stop timeout instead of returning at once. The panel itself
+	// outlives the generation; only its streams must end.
+	a.panel.EndStreams()
 	if err := oldRT.stop(stopCtx); err != nil {
 		a.logger.Warn("app: stopping the old listeners", "error", err)
 	}

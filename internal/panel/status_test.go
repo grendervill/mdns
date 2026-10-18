@@ -595,6 +595,53 @@ func TestStatusLiveRow(t *testing.T) {
 	}
 }
 
+// TestEventsEndStreams checks that EndStreams ends a live SSE handler:
+// http.Server.Shutdown does not cancel handler contexts, so without the
+// signal an open stream would hold the listener until the stop timeout.
+// A fresh request after EndStreams must still stream, because the signal
+// is replaced for the next runtime generation.
+func TestEventsEndStreams(t *testing.T) {
+	p, srv := statusPanelBus(t, mockupStatus(), api.NewBus())
+
+	resp := authedRequest(t, p, srv, "/panel/events")
+	defer resp.Body.Close()
+
+	br := bufio.NewReader(resp.Body)
+	if got := nextSSE(t, br); got.name != "ping" {
+		t.Fatalf("first event = %q, want ping", got.name)
+	}
+	if got := nextSSE(t, br); got.name != "snapshot" {
+		t.Fatalf("second event = %q, want snapshot", got.name)
+	}
+
+	// The handler must return as soon as EndStreams fires, well under
+	// the 5 s stop timeout the app uses. EOF on the body means it did.
+	p.EndStreams()
+	drained := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(io.Discard, br)
+		drained <- err
+	}()
+	select {
+	case err := <-drained:
+		if err != nil {
+			t.Fatalf("draining the ended stream: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream handler did not return within 2s of EndStreams")
+	}
+
+	// The channel was replaced, so a connection from the next
+	// generation still streams.
+	resp2 := authedRequest(t, p, srv, "/panel/events")
+	defer resp2.Body.Close()
+
+	br2 := bufio.NewReader(resp2.Body)
+	if got := nextSSE(t, br2); got.name != "ping" {
+		t.Fatalf("event on the fresh stream = %q, want ping", got.name)
+	}
+}
+
 // TestGaugeFormats checks the derived gauge values: the best upstream is
 // the fastest healthy one, the cache share rounds the way the mockup
 // shows it, and the client overflow bucket survives into the diagram.

@@ -788,9 +788,16 @@ func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(p.pingInterval)
 	defer ticker.Stop()
 
+	// EndStreams closes this when the runtime behind the panel stops;
+	// Shutdown does not cancel r.Context(), so without it the handler
+	// would block the stop until its timeout.
+	done := p.streamDone()
+
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-done:
 			return
 		case e, ok := <-events:
 			if !ok {
