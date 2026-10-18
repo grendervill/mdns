@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -194,7 +195,29 @@ func TestRequestsFilter(t *testing.T) {
 		t.Errorf("the cancelled edit dropped the filter:\n%s", m.View())
 	}
 
-	// Esc on the screen clears the filter and restores every row.
+	// Committing an empty value clears the filter.
+	m = step(m, key('f'))
+	for range m.input {
+		m = step(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	}
+	m = step(m, enterKey())
+	if m.requestsFilter != "" {
+		t.Fatalf("an empty filter commit left %q", m.requestsFilter)
+	}
+	view = m.View()
+	for _, want := range []string{"ads2.example.com.", "nodomain.example.net."} {
+		if !strings.Contains(view, want) {
+			t.Errorf("an empty filter commit did not restore %q:\n%s", want, view)
+		}
+	}
+
+	// Esc on the screen also clears the filter.
+	m = step(m, key('f'))
+	m = typeText(m, "ads")
+	m = step(m, enterKey())
+	if m.requestsFilter != "ads" {
+		t.Fatalf("requestsFilter = %q, want the filter re-applied before the esc check", m.requestsFilter)
+	}
 	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 	if m.requestsFilter != "" {
 		t.Fatalf("esc on the requests screen left the filter %q", m.requestsFilter)
@@ -203,6 +226,79 @@ func TestRequestsFilter(t *testing.T) {
 	for _, want := range []string{"ads2.example.com.", "nodomain.example.net."} {
 		if !strings.Contains(view, want) {
 			t.Errorf("View() misses %q after clearing the filter:\n%s", want, view)
+		}
+	}
+}
+
+// TestRequestsFilterPromptVisible checks that the filter prompt stays on
+// screen while its result set is empty, so typing is never blind.
+func TestRequestsFilterPromptVisible(t *testing.T) {
+	// Empty journal.
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, key('f'))
+	m = typeText(m, "abc")
+	view := m.View()
+	if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): abc▏") {
+		t.Errorf("View() misses the prompt on an empty journal:\n%s", view)
+	}
+	if !strings.Contains(view, "Запросов пока нет.") {
+		t.Errorf("View() misses the empty-journal note:\n%s", view)
+	}
+
+	// A committed filter that matches nothing: re-opening it keeps both
+	// the prompt and the no-match note visible.
+	m = New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, requestEvent(qlog.Entry{QName: "a.example.com.", Proto: "udp"}))
+	m = step(m, key('f'))
+	m = typeText(m, "zzz")
+	m = step(m, enterKey())
+	if view := m.View(); !strings.Contains(view, "Нет запросов по фильтру «zzz»") {
+		t.Fatalf("View() misses the no-match note:\n%s", view)
+	}
+
+	m = step(m, key('f'))
+	m = typeText(m, "!")
+	view = m.View()
+	if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): zzz!▏") {
+		t.Errorf("View() misses the prompt while editing a no-match filter:\n%s", view)
+	}
+	if !strings.Contains(view, "Нет запросов по фильтру «zzz»") {
+		t.Errorf("View() dropped the no-match note while editing:\n%s", view)
+	}
+}
+
+// TestRequestsRowWidth checks the journal table against its width
+// budget: every row and the header stay within 113 columns.
+func TestRequestsRowWidth(t *testing.T) {
+	const budget = 113
+
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	entries := []qlog.Entry{
+		{
+			QName: strings.Repeat("very-long-label.", 8) + "example.com.", Proto: "dot",
+			ClientIP: "2001:db8::1234:5678:9abc:def0", Upstream: strings.Repeat("upstream", 6),
+			LatencyMS: 1234.5,
+		},
+		{
+			QName: "ads.example.com.", Proto: "udp", ClientIP: "192.168.100.200",
+			Blocked: true, BlockSource: strings.Repeat("block-list", 5),
+		},
+		{QName: "cached.example.com.", Proto: "doh", ClientIP: "10.0.0.1", CacheHit: true},
+	}
+
+	for _, e := range entries {
+		if line := m.requestLine(e); utf8.RuneCountInString(line) > budget {
+			t.Errorf("row is %d columns, want <= %d: %q", utf8.RuneCountInString(line), budget, line)
+		}
+		m = step(m, requestEvent(e))
+	}
+	if got := utf8.RuneCountInString(requestsHeader()); got != budget {
+		t.Errorf("header is %d columns, want %d", got, budget)
+	}
+
+	for _, line := range strings.Split(m.View(), "\n") {
+		if strings.Contains(line, "example.com.") && utf8.RuneCountInString(line) > budget {
+			t.Errorf("rendered row is %d columns, want <= %d: %q", utf8.RuneCountInString(line), budget, line)
 		}
 	}
 }

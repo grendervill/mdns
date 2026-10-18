@@ -130,6 +130,12 @@ func diagConfigCheck(msg diagLoadedMsg) diagCheck {
 // diagListenerCheck compares the listeners the daemon reports with the
 // ones the config enables.
 func diagListenerCheck(msg diagLoadedMsg) diagCheck {
+	want := configListeners(msg.cfg)
+	// All protocols disabled is a valid setup, and the CLI reports it
+	// as a passing check rather than a missing listener.
+	if want != nil && len(want) == 0 {
+		return diagCheck{diagOK, "Порты", "все протоколы выключены"}
+	}
 	if msg.statusErr != nil {
 		return diagCheck{diagWarn, "Порты", "демон недоступен: " + msg.statusErr.Error()}
 	}
@@ -137,7 +143,7 @@ func diagListenerCheck(msg diagLoadedMsg) diagCheck {
 	if len(got) == 0 {
 		return diagCheck{diagWarn, "Порты", "демон не сообщил ни об одном листенере"}
 	}
-	if want := configListeners(msg.cfg); want != nil && !sameStrings(want, got) {
+	if want != nil && !sameStrings(want, got) {
 		return diagCheck{diagWarn, "Порты", fmt.Sprintf("листенеры расходятся с конфигом: слушает %s, в конфиге %s",
 			strings.Join(got, ", "), strings.Join(want, ", "))}
 	}
@@ -150,7 +156,7 @@ func configListeners(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
 	}
-	var out []string
+	out := make([]string, 0, 4)
 	for _, p := range []struct {
 		name string
 		on   bool
@@ -207,12 +213,21 @@ func diagCertCheck(c tlscert.Status, statusErr error) diagCheck {
 	case "waiting":
 		return diagCheck{diagWarn, "Сертификат", "ожидание выпуска"}
 	case "error":
-		if c.Error != "" {
-			return diagCheck{diagFail, "Сертификат", "ошибка — " + c.Error}
+		if detail := oneLine(c.Error, 40); detail != "" {
+			return diagCheck{diagFail, "Сертификат", "ошибка — " + detail}
 		}
 		return diagCheck{diagFail, "Сертификат", "ошибка"}
 	}
 	return diagCheck{diagWarn, "Сертификат", "демон не сообщил состояние сертификата"}
+}
+
+// oneLine keeps the first line of s, trimmed and cut to n runes, so a
+// multi-line ACME error cannot break the fixed-width check list.
+func oneLine(s string, n int) string {
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = s[:i]
+	}
+	return truncate(strings.TrimSpace(s), n)
 }
 
 // diagUpstreamChecks pings the enabled upstreams and reports every

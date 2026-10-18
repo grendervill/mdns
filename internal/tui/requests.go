@@ -42,10 +42,12 @@ func (m *Model) requestsView() string {
 
 	if len(m.requests) == 0 {
 		b.WriteString(dimStyle.Render("Запросов пока нет.") + "\n")
+		m.writeRequestsInput(&b)
 		return b.String()
 	}
 	if len(shown) == 0 {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("Нет запросов по фильтру «%s» (esc — сбросить).", m.requestsFilter)) + "\n")
+		m.writeRequestsInput(&b)
 		return b.String()
 	}
 
@@ -77,12 +79,20 @@ func (m *Model) requestsView() string {
 		b.WriteString("\n")
 	}
 
-	if m.inputActive && m.inputMode == inputRequestsFilter {
-		b.WriteString("\n")
-		b.WriteString(titleStyle.Render("Фильтр ленты (домен/клиент/upstream/прото): ") + m.input + "▏")
-		b.WriteString("\n")
-	}
+	m.writeRequestsInput(&b)
 	return b.String()
+}
+
+// writeRequestsInput appends the feed filter prompt while it is open.
+// It runs on every render path, so the line stays visible even when
+// the active filter matches nothing.
+func (m *Model) writeRequestsInput(b *strings.Builder) {
+	if !m.inputActive || m.inputMode != inputRequestsFilter {
+		return
+	}
+	b.WriteString("\n")
+	b.WriteString(titleStyle.Render("Фильтр ленты (домен/клиент/upstream/прото): ") + m.input + "▏")
+	b.WriteString("\n")
 }
 
 // Column widths of the journal table: time, protocol, client, domain,

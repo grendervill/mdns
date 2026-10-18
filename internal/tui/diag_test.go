@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -13,6 +14,16 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/tlscert"
 )
+
+// checkLine returns the view line naming the given check, or "".
+func checkLine(view, name string) string {
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, name+":") {
+			return line
+		}
+	}
+	return ""
+}
 
 // diagStatus is the all-good status the diagnostics tests render: one
 // listener, matching the config, and an issued certificate.
@@ -93,6 +104,48 @@ func TestDiagScreen(t *testing.T) {
 		}
 	})
 
+	t.Run("certificate error is one short line", func(t *testing.T) {
+		sc := diagClient()
+		sc.status.Cert = tlscert.Status{
+			Mode:  "acme",
+			State: "error",
+			Error: "acme: first line\nsecond line with a stack trace that must not be rendered",
+		}
+
+		view := openDiag(t, sc).View()
+		if !strings.Contains(view, "✗ Сертификат: ошибка — acme: first line") {
+			t.Errorf("View() misses the sanitized certificate line:\n%s", view)
+		}
+		if strings.Contains(view, "second line") {
+			t.Errorf("View() rendered a multi-line certificate error:\n%s", view)
+		}
+
+		sc.status.Cert.Error = strings.Repeat("x", 200)
+		view = openDiag(t, sc).View()
+		if !strings.Contains(view, "…") {
+			t.Errorf("View() did not truncate a long certificate error:\n%s", view)
+		}
+		if line := checkLine(view, "Сертификат"); utf8.RuneCountInString(line) > 70 {
+			t.Errorf("certificate line is %d columns wide: %q", utf8.RuneCountInString(line), line)
+		}
+	})
+
+	t.Run("all protocols disabled", func(t *testing.T) {
+		sc := diagClient()
+		cfg := diagConfig()
+		cfg.Protocols = config.Protocols{}
+		sc.cfg = cfg
+		sc.status.Listeners = nil
+
+		view := openDiag(t, sc).View()
+		if !strings.Contains(view, "✓ Порты: все протоколы выключены") {
+			t.Errorf("View() misses the all-disabled ports line:\n%s", view)
+		}
+		if strings.Contains(view, "ни об одном листенере") {
+			t.Errorf("View() warns about missing listeners with every protocol off:\n%s", view)
+		}
+	})
+
 	t.Run("probe failure", func(t *testing.T) {
 		sc := diagClient()
 		sc.probeResults = []probe.Result{{Err: "dial tcp 1.1.1.1:53: i/o timeout"}}
@@ -165,7 +218,11 @@ func TestDiagNav(t *testing.T) {
 	}
 
 	// A digit also leaves the overlay.
-	_, _ = m.Update(key('?'))
+	updated, _ = m.Update(key('?'))
+	m = updated.(Model)
+	if m.screen != screenHelp {
+		t.Fatalf("? reopened %v, want help", m.screen)
+	}
 	updated, _ = m.Update(key('1'))
 	m = updated.(Model)
 	if m.screen != screenStatus {
