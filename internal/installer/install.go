@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"mydns/internal/config"
 	"mydns/internal/links"
@@ -110,6 +111,16 @@ func Run(opts InstallOptions) error {
 		return err
 	}
 	keep := existing != nil && opts.Spec != nil && !opts.Reconfigure
+	// A kept config is the one the daemon will run, so it has to be valid:
+	// otherwise the service this run enables and restarts would fail to
+	// start. Check it before any unit or service action, so the failure
+	// names the file instead of showing up later as a dead unit.
+	if keep {
+		if err := existing.Validate(); err != nil {
+			return fmt.Errorf("существующий конфиг %s недействителен: %v\n"+
+				"исправьте его вручную или пересоздайте: sudo mdns install --non-interactive --reconfigure …", configPath, err)
+		}
+	}
 
 	// The config that will actually run decides the ports to check, the
 	// firewall rules and the summary.
@@ -121,7 +132,7 @@ func Run(opts InstallOptions) error {
 		effective = config.Default()
 	}
 	if len(o.BindPorts) == 0 {
-		o.BindPorts = enabledPorts(effective)
+		o.BindPorts = checkPortsFor(effective)
 	}
 	// The A/AAAA check needs the domain. A non-interactive run knows it
 	// from the spec (or from the existing config it keeps); in the
@@ -243,6 +254,13 @@ func Run(opts InstallOptions) error {
 	if _, err := o.Runner("systemctl", "restart", "mdns"); err != nil {
 		return fmt.Errorf("systemctl restart mdns: %w", err)
 	}
+	// restart returns as soon as the job is queued: the unit can still be
+	// activating, or fail a moment later. The install succeeded only once
+	// the daemon is actually up, so wait for is-active before reporting
+	// success.
+	if err := waitActive(o.Runner); err != nil {
+		return err
+	}
 
 	// 7. Firewall.
 	if err := applyUFW(out, o.Runner, ufwRules(effective)); err != nil {
@@ -304,6 +322,62 @@ func enabledPorts(cfg *config.Config) []int {
 		ports = append(ports, p.Port)
 	}
 	return ports
+}
+
+// http01 reports whether ACME will fall back to the HTTP-01 challenge,
+// which binds :80: TLS mode acme with no DoH listener on 443 to carry
+// TLS-ALPN-01. The firewall rules and the preflight port list both derive
+// from this one predicate.
+func http01(cfg *config.Config) bool {
+	return cfg.TLS.Mode == "acme" && !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443)
+}
+
+// checkPortsFor lists the ports the preflight must check: the enabled
+// protocol ports plus :80 when the HTTP-01 challenge will bind it.
+func checkPortsFor(cfg *config.Config) []int {
+	ports := enabledPorts(cfg)
+	if !http01(cfg) {
+		return ports
+	}
+	for _, p := range ports {
+		if p == 80 {
+			return ports
+		}
+	}
+	return append(ports, 80)
+}
+
+// serviceActiveAttempts and serviceActiveInterval bound the wait for the
+// service to come up after the restart (tests shorten the interval).
+var (
+	serviceActiveAttempts = 5
+	serviceActiveInterval = 500 * time.Millisecond
+)
+
+// waitActive polls systemctl is-active mdns until the unit reports exactly
+// "active". Anything else after the last attempt — activating, failed, an
+// unknown state or a failing systemctl — is reported as a failed install,
+// with the commands that show what went wrong.
+func waitActive(run func(string, ...string) ([]byte, error)) error {
+	var (
+		out []byte
+		err error
+	)
+	for i := 0; i < serviceActiveAttempts; i++ {
+		if i > 0 {
+			time.Sleep(serviceActiveInterval)
+		}
+		out, err = run("systemctl", "is-active", "mdns")
+		if err == nil && strings.TrimSpace(string(out)) == "active" {
+			return nil
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("служба mdns не запустилась: systemctl is-active mdns: %v\n"+
+			"проверьте журнал: sudo journalctl -u mdns (или mdns logs)", err)
+	}
+	return fmt.Errorf("служба mdns не запустилась: systemctl is-active mdns сообщает %q\n"+
+		"проверьте журнал: sudo journalctl -u mdns (или mdns logs)", strings.TrimSpace(string(out)))
 }
 
 // configAction names what the config step will do, for the dry run.
@@ -380,7 +454,7 @@ func ufwRules(cfg *config.Config) []string {
 
 	both(cfg.Protocols.Plain)
 	both(cfg.Protocols.DoH)
-	if cfg.TLS.Mode == "acme" && !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443) {
+	if http01(cfg) {
 		add("80/tcp")
 	}
 	if cfg.Protocols.DoT.Enabled {

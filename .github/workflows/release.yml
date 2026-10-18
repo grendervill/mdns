@@ -9,7 +9,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+# One release run per ref at a time; a tag push must never be cancelled by a
+# later dispatch or push on the same ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -58,6 +64,9 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    # Only this job publishes to the releases; the build job stays read-only.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 

@@ -136,7 +136,9 @@ sudo mdns uninstall --keep-binary   # leave /usr/local/bin/mdns in place
 the binary, and keeps `/etc/mdns/config.json`, `/var/lib/mdns` and the
 certificates by default, so a reinstall finds them again; `--purge`
 removes them too. A second uninstall does not fail: missing paths are
-reported, not treated as errors.
+reported, not treated as errors. The ufw rules `mdns install` added are
+not removed by `mdns uninstall`; close the ports by hand (`sudo ufw
+delete allow …`) if you no longer need them.
 
 ## Build
 
@@ -254,6 +256,13 @@ change. Failed attempts are retried with a backoff from 5 minutes,
 doubling up to 6 hours, spread by ±20% jitter, until the first
 success; once the certificate arrives the TLS listeners start without
 a restart of the daemon.
+
+**Switching a running daemon to ACME.** Changing `tls.mode` to `acme`
+on a daemon that is already serving (a config update or
+`mdns install --reconfigure`) takes DoT and DoQ offline until the
+certificate is issued: plain DNS keeps answering and the status shows
+the `waiting` state meanwhile. A fresh install configured with ACME
+from the start has no such window — nothing was serving TLS before.
 
 **Renewal.** autocert renews over the handshake path before the leaf
 expires — at the lesser of 30 days or a third of the certificate

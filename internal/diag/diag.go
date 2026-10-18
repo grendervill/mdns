@@ -149,7 +149,7 @@ func checkConfig(report func(mark, name, detail string), configPath string) *con
 // port is a warning: the daemon holding its own ports is the normal
 // state of a healthy installation.
 func checkPorts(report func(mark, name, detail string), cfg *config.Config, daemonUp bool) {
-	ports := enabledPorts(cfg)
+	ports := checkPortsFor(cfg)
 	if len(ports) == 0 {
 		report(markOK, "Порты", "все протоколы выключены")
 		return
@@ -492,6 +492,29 @@ func enabledPorts(cfg *config.Config) []int {
 		ports = append(ports, p.Port)
 	}
 	return ports
+}
+
+// http01 reports whether ACME will bind :80 for the HTTP-01 challenge:
+// TLS mode acme with no DoH listener on 443 to carry TLS-ALPN-01. The
+// installer derives its firewall and preflight ports from the same rule;
+// each package keeps its own unexported copy.
+func http01(cfg *config.Config) bool {
+	return cfg.TLS.Mode == "acme" && !(cfg.Protocols.DoH.Enabled && cfg.Protocols.DoH.Port == 443)
+}
+
+// checkPortsFor lists the ports to probe: the enabled protocol ports plus
+// :80 when the HTTP-01 challenge will bind it.
+func checkPortsFor(cfg *config.Config) []int {
+	ports := enabledPorts(cfg)
+	if !http01(cfg) {
+		return ports
+	}
+	for _, p := range ports {
+		if p == 80 {
+			return ports
+		}
+	}
+	return append(ports, 80)
 }
 
 // portBusy reports whether 0.0.0.0:port cannot be bound on TCP or UDP.

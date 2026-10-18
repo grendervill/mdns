@@ -2,12 +2,14 @@ package installer
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"mydns/internal/config"
 	"mydns/internal/filter"
@@ -83,7 +85,8 @@ func (f *fakeRunner) serviceRestarts() int {
 func noChecks(Options) []Check { return nil }
 
 // installFixture builds a Root, a source binary and a runner that
-// accepts systemctl and ufw with ufw active.
+// accepts systemctl and ufw with ufw active. The service reports active,
+// so the post-restart success check passes.
 func installFixture(t *testing.T) (root, binarySource string, runner *fakeRunner) {
 	t.Helper()
 	root = t.TempDir()
@@ -95,6 +98,7 @@ func installFixture(t *testing.T) (root, binarySource string, runner *fakeRunner
 	runner.ok["systemctl"] = true
 	runner.ok["ufw"] = true
 	runner.responses["ufw status"] = []byte("Status: active\n")
+	runner.responses["systemctl is-active mdns"] = []byte("active\n")
 	return root, binarySource, runner
 }
 
@@ -542,7 +546,7 @@ func TestInstallWritesAndStarts(t *testing.T) {
 	assertMode(t, unitPath, 0o644)
 
 	cmds := runner.commands()
-	wantCmds := []string{"systemctl daemon-reload", "systemctl enable mdns", "systemctl restart mdns", "ufw status"}
+	wantCmds := []string{"systemctl daemon-reload", "systemctl enable mdns", "systemctl restart mdns", "systemctl is-active mdns", "ufw status"}
 	if len(cmds) < len(wantCmds) || !slices.Equal(cmds[:len(wantCmds)], wantCmds) {
 		t.Errorf("commands = %v, want %v first", cmds, wantCmds)
 	}
@@ -759,6 +763,173 @@ func TestIdempotentKeepsConfig(t *testing.T) {
 	}
 	if loaded.Domain != "new.example.com" {
 		t.Errorf("reconfigured Domain = %q, want new.example.com", loaded.Domain)
+	}
+}
+
+// TestCheckPortsFor pins the derivation of the preflight port list:
+// HTTP-01 binds :80 exactly when ACME has no DoH listener on 443 to carry
+// TLS-ALPN-01.
+func TestCheckPortsFor(t *testing.T) {
+	acme := func(c *config.Config) *config.Config {
+		c.TLS = config.TLS{Mode: "acme", ACME: config.ACME{Provider: "letsencrypt", Email: "a@example.com"}}
+		return c
+	}
+	tests := []struct {
+		name   string
+		cfg    *config.Config
+		want80 bool
+	}{
+		{
+			name:   "acme with a non-443 DoH port needs 80",
+			cfg:    acme(func() *config.Config { c := config.Default(); c.Protocols.DoH.Port = 8443; return c }()),
+			want80: true,
+		},
+		{
+			name:   "acme with DoH disabled needs 80",
+			cfg:    acme(func() *config.Config { c := config.Default(); c.Protocols.DoH.Enabled = false; return c }()),
+			want80: true,
+		},
+		{
+			name: "acme with DoH on 443 needs no 80",
+			cfg:  acme(config.Default()),
+		},
+		{
+			name: "self-signed needs no 80",
+			cfg:  func() *config.Config { c := config.Default(); c.TLS.Mode = "self-signed"; return c }(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkPortsFor(tt.cfg)
+			if has80 := slices.Contains(got, 80); has80 != tt.want80 {
+				t.Errorf("checkPortsFor(%+v) = %v, contains 80 = %v, want %v", tt.cfg.Protocols, got, has80, tt.want80)
+			}
+		})
+	}
+}
+
+// TestRunPreflightChecksHTTP01Port checks that Run feeds the derived port
+// list (with :80) to the preflight when ACME will use HTTP-01.
+func TestRunPreflightChecksHTTP01Port(t *testing.T) {
+	root, source, runner := installFixture(t)
+	var gotPorts []int
+	checks := func(o Options) []Check {
+		gotPorts = o.BindPorts
+		return nil
+	}
+	spec := Spec{Domain: "dns.example.com", TLSMode: "acme", ACMEEmail: "a@example.com", DoHPort: 8443}
+
+	var out bytes.Buffer
+	if err := Run(InstallOptions{
+		Options:      Options{Root: root, Runner: runner.run},
+		preflight:    checks,
+		BinarySource: source,
+		Spec:         &spec,
+		Output:       &out,
+	}); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if !slices.Contains(gotPorts, 80) {
+		t.Errorf("preflight BindPorts = %v, want it to include :80 for HTTP-01", gotPorts)
+	}
+}
+
+// TestKeptInvalidConfigFails checks that a kept config is validated before
+// any unit or service action: an invalid file aborts the run, names the
+// path and suggests --reconfigure, and the service is never restarted.
+func TestKeptInvalidConfigFails(t *testing.T) {
+	root, source, runner := installFixture(t)
+	configPath := filepath.Join(root, "etc/mdns/config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+	bad := config.Default()
+	bad.Domain = "" // Validate rejects an empty domain
+	if err := bad.Save(configPath); err != nil {
+		t.Fatalf("save invalid config: %v", err)
+	}
+
+	var out bytes.Buffer
+	err := Run(InstallOptions{
+		Options:      Options{Root: root, Runner: runner.run},
+		preflight:    noChecks,
+		BinarySource: source,
+		Spec:         &Spec{Domain: "dns.example.com"},
+		Output:       &out,
+	})
+	if err == nil {
+		t.Fatalf("Run() = nil, want an invalid kept-config error")
+	}
+	if !strings.Contains(err.Error(), configPath) {
+		t.Errorf("Run() error = %q, want it to name %s", err, configPath)
+	}
+	if !strings.Contains(err.Error(), "--reconfigure") {
+		t.Errorf("Run() error = %q, want it to suggest --reconfigure", err)
+	}
+	if got := runner.serviceRestarts(); got != 0 {
+		t.Errorf("restart calls = %d, want 0 before the invalid config is caught: %v", got, runner.commands())
+	}
+	// The check precedes the unit write, so no unit is left behind.
+	assertNotExist(t, filepath.Join(root, "etc/systemd/system/mdns.service"))
+}
+
+// TestServiceNotActiveFails checks that the installer does not report
+// success when the unit is not actually up after the restart: a state
+// other than "active" (or a failing systemctl) ends the run with an error
+// naming the logs and no success summary.
+func TestServiceNotActiveFails(t *testing.T) {
+	old := serviceActiveInterval
+	serviceActiveInterval = time.Millisecond
+	t.Cleanup(func() { serviceActiveInterval = old })
+
+	tests := []struct {
+		name  string
+		state string
+		fail  bool
+	}{
+		{name: "activating", state: "activating"},
+		{name: "is-active fails", fail: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, source, runner := installFixture(t)
+			if tt.fail {
+				delete(runner.responses, "systemctl is-active mdns")
+			} else {
+				runner.responses["systemctl is-active mdns"] = []byte(tt.state + "\n")
+			}
+			run := func(name string, args ...string) ([]byte, error) {
+				if tt.fail && name == "systemctl" && slices.Equal(args, []string{"is-active", "mdns"}) {
+					return nil, errors.New("systemctl is-active: Unit mdns.service could not be found")
+				}
+				return runner.run(name, args...)
+			}
+			spec := Spec{Domain: "dns.example.com"}
+
+			var out bytes.Buffer
+			err := Run(InstallOptions{
+				Options:      Options{Root: root, Runner: run},
+				preflight:    noChecks,
+				BinarySource: source,
+				Spec:         &spec,
+				Output:       &out,
+			})
+			if err == nil {
+				t.Fatalf("Run() = nil, want an error when the service is not active")
+			}
+			if !strings.Contains(err.Error(), "mdns не запустилась") {
+				t.Errorf("Run() error = %q, want it to say the service did not start", err)
+			}
+			if !strings.Contains(err.Error(), "journalctl -u mdns") {
+				t.Errorf("Run() error = %q, want it to point at the journal", err)
+			}
+			if got := runner.serviceRestarts(); got != 1 {
+				t.Errorf("restart calls = %d, want 1", got)
+			}
+			if strings.Contains(out.String(), "Установлено: бинарник") {
+				t.Errorf("output claims success although the service is not up:\n%s", out.String())
+			}
+		})
 	}
 }
 

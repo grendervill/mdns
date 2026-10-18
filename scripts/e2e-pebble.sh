@@ -240,6 +240,9 @@ CLIENT
 phase_a() {
   echo
   echo "=== phase A: issuance and deferred TLS (hot start) ==="
+  echo "--- fresh state: down -v ---"
+  "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+
   start_ca
   point_domain_at_daemon
 
@@ -486,6 +489,18 @@ fi
 echo "TCP accepted, no certificate served (as expected without a CA)"
 CLIENT
 
+  echo "--- DoT (:853) is not accepting connections while no certificate exists ---"
+  # The deferred TLS listeners must stay down until the certificate is
+  # available: the DoT port is not even bound, so a TCP connect is refused.
+  "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
+set -euo pipefail
+if timeout 3 bash -c '</dev/tcp/daemon/853' 2>/dev/null; then
+  echo "DoT :853 accepts TCP although no certificate exists (TLS listeners must wait)" >&2
+  exit 1
+fi
+echo "DoT :853 refused (the TLS listeners stay down while waiting)"
+CLIENT
+
   echo "--- start the CA; the daemon must heal itself through the backoff ---"
   start_ca
   point_domain_at_daemon
@@ -511,6 +526,8 @@ CLIENT
   fi
 
   echo "--- control API: the certificate healed without a restart ---"
+  # The served leaf's serial is saved for phase C, which must serve the
+  # very same certificate from the cache instead of a fresh one.
   "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
 set -euo pipefail
 out=$(openssl s_client -connect daemon:443 -servername mdns.test \
@@ -520,6 +537,8 @@ printf '%s\n' "$out" | openssl x509 -noout -issuer | grep -q 'Pebble'
 curl -s --max-time 5 --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/status > /tmp/status.json
 sed -n 's/.*\("Cert":{[^}]*}\).*/\1/p' /tmp/status.json
 grep -q '"state":"ok"' /tmp/status.json
+printf '%s\n' "$out" | openssl x509 -noout -serial > /tmp/leaf-serial
+cat /tmp/leaf-serial
 CLIENT
 }
 
@@ -572,6 +591,20 @@ curl -s --max-time 5 --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/s
 sed -n 's/.*\("Cert":{[^}]*}\).*/\1/p' /tmp/status.json
 grep -q '"state":"ok"' /tmp/status.json
 echo "cached certificate served with the ACME server down"
+CLIENT
+
+  echo "--- phase C serves the SAME leaf as phase B (cache reuse, not a fresh cert) ---"
+  "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
+set -euo pipefail
+out=$(openssl s_client -connect daemon:443 -servername mdns.test \
+  -CAfile /tmp/pebble-root.pem </dev/null 2>&1)
+printf '%s\n' "$out" | openssl x509 -noout -serial > /tmp/leaf-serial-c
+b=$(cat /tmp/leaf-serial)
+c=$(cat /tmp/leaf-serial-c)
+echo "phase B leaf serial: $b"
+echo "phase C leaf serial: $c"
+[ "$b" = "$c" ]
+echo "the cached leaf is the same one issued in phase B, not a fresh one"
 CLIENT
 }
 

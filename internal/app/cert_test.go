@@ -9,12 +9,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 
@@ -242,12 +244,17 @@ func TestTLSSwitchInvalidACMERejected(t *testing.T) {
 // directory makes the manager fail fast against a closed local port.
 func TestCertStatusACMEMode(t *testing.T) {
 	// ACME mode serves the tls-alpn-01 challenge on the privileged port
-	// 443. GitHub's ubuntu runners are not root and cannot bind it, so
-	// skip there rather than fail; everywhere the port binds, every
-	// assertion below still runs.
+	// 443. GitHub's ubuntu runners are not root and cannot bind it, so skip
+	// there rather than fail; anywhere the port binds, every assertion
+	// below still runs. Only a privilege error justifies the skip: any
+	// other bind failure (a real conflict on :443) must fail loudly
+	// instead of hiding behind a silent skip.
 	probe, err := net.Listen("tcp", ":443")
 	if err != nil {
-		t.Skip("requires binding :443 (privileged ports unavailable)")
+		if errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM) {
+			t.Skip("requires binding :443 (privileged ports unavailable)")
+		}
+		t.Fatalf("net.Listen(:443) = %v, want nil", err)
 	}
 	_ = probe.Close()
 

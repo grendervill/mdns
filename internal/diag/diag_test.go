@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -626,4 +627,41 @@ func TestRealFileStream(t *testing.T) {
 // itoa is a small helper keeping the port assertions readable.
 func itoa(n int) string {
 	return strconv.Itoa(n)
+}
+
+// TestCheckPortsForHTTP01 pins the derived port list the diagnostic
+// probes: :80 is included exactly when ACME has no DoH listener on 443 to
+// carry TLS-ALPN-01.
+func TestCheckPortsForHTTP01(t *testing.T) {
+	acme := func(c *config.Config) *config.Config {
+		c.TLS = config.TLS{Mode: "acme", ACME: config.ACME{Provider: "letsencrypt", Email: "a@example.com"}}
+		return c
+	}
+	tests := []struct {
+		name   string
+		cfg    *config.Config
+		want80 bool
+	}{
+		{
+			name:   "acme with a non-443 DoH port needs 80",
+			cfg:    acme(func() *config.Config { c := config.Default(); c.Protocols.DoH.Port = 8443; return c }()),
+			want80: true,
+		},
+		{
+			name: "acme with DoH on 443 needs no 80",
+			cfg:  acme(config.Default()),
+		},
+		{
+			name: "self-signed needs no 80",
+			cfg:  func() *config.Config { c := config.Default(); c.TLS.Mode = "self-signed"; return c }(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkPortsFor(tt.cfg)
+			if has80 := slices.Contains(got, 80); has80 != tt.want80 {
+				t.Errorf("checkPortsFor() = %v, contains 80 = %v, want %v", got, has80, tt.want80)
+			}
+		})
+	}
 }
