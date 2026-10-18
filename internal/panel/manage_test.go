@@ -700,6 +700,182 @@ func TestFilterRules(t *testing.T) {
 	})
 }
 
+// TestFilterListAdd covers the catalog add and the custom list add,
+// including the rejected forms.
+func TestFilterListAdd(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg) // filter on, no lists
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	// A ready-made catalog list is stored with an empty URL.
+	resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"oisd-small"}})
+	wantRedirect(t, resp, "/panel/filters?ok=list")
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if got := sent[0].Filter.Lists; len(got) != 1 || got[0].ID != "oisd-small" || got[0].URL != "" {
+		t.Errorf("lists = %+v, want [{oisd-small }]", got)
+	}
+	if !sent[0].Filter.Enabled {
+		t.Error("adding a list silently changed the filter enabled flag")
+	}
+
+	// A custom list is stored with its slug and URL.
+	resp, _ = managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+		"custom_id": {"my-list"}, "custom_url": {"https://example.test/hosts.txt"},
+	})
+	wantRedirect(t, resp, "/panel/filters?ok=list")
+	sent = ctrl.sent()
+	if len(sent) != 2 {
+		t.Fatalf("UpdateConfig called %d times, want 2", len(sent))
+	}
+	if got := sent[1].Filter.Lists; len(got) != 2 || got[1].ID != "my-list" || got[1].URL != "https://example.test/hosts.txt" {
+		t.Errorf("lists = %+v, want the custom list appended", got)
+	}
+
+	t.Run("duplicate catalog add", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"oisd-small"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "уже добавлен") {
+			t.Errorf("the duplicate message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate catalog list reached UpdateConfig")
+		}
+	})
+
+	t.Run("unknown catalog id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"no-such-list"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an unknown catalog id reached UpdateConfig")
+		}
+	})
+
+	t.Run("http url rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"plain-http"}, "custom_url": {"http://example.test/hosts.txt"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "https") {
+			t.Error("the https-required message is missing")
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an http list reach UpdateConfig")
+		}
+	})
+
+	t.Run("empty url rejected", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"no-url"}, "custom_url": {""},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("bad slug rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"Bad_Slug"}, "custom_url": {"https://example.test/hosts.txt"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "ID списка") {
+			t.Error("the slug message is missing")
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a bad slug reached UpdateConfig")
+		}
+	})
+}
+
+// TestFilterListRemove drops one list only.
+func TestFilterListRemove(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Filter.Lists = []config.FilterList{
+		{ID: "oisd-small"},
+		{ID: "hagezi-pro"},
+		{ID: "my-list", URL: "https://example.test/hosts.txt"},
+	}
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/filters/lists/remove", url.Values{"id": {"hagezi-pro"}})
+	wantRedirect(t, resp, "/panel/filters?ok=list")
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0].Filter.Lists
+	if len(got) != 2 || got[0].ID != "oisd-small" || got[1].ID != "my-list" {
+		t.Errorf("lists = %+v, want oisd-small and my-list", got)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/remove", url.Values{"id": {"no-such"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("an unknown list id reached UpdateConfig")
+		}
+	})
+}
+
+// TestFiltersCatalogPage checks the ready-made list section renders the
+// catalog with the Russian category and the added state.
+func TestFiltersCatalogPage(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Filter.Lists = []config.FilterList{{ID: "oisd-small"}}
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/filters")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters = %d, want 200\n%s", code, body)
+	}
+	wants := []string{
+		"Готовые списки",
+		"реклама и трекеры", "комбинированные",
+		`action="/panel/filters/lists/add"`,
+		`action="/panel/filters/lists/remove"`,
+		`value="adguard-dns-filter"`,
+		"OISD Small",
+		"Убрать", "Добавить",
+		"Свой список",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("filters page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+
+	t.Run("disabled disables the buttons", func(t *testing.T) {
+		off := manageConfig(t) // filter off
+		c := &manageCtrl{cfg: off}
+		p2, srv2 := managePanel(t, c)
+		_, body := authedGET(t, p2, srv2, "/panel/filters")
+		if !strings.Contains(body, " disabled") {
+			t.Error("the catalog buttons are not disabled while filtering is off")
+		}
+		if !strings.Contains(body, "Фильтрация выключена") {
+			t.Error("the disabled hint is missing")
+		}
+	})
+}
+
 // ---- settings ----------------------------------------------------
 
 // validSettingsForm is a complete, valid settings submission.

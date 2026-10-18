@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -102,6 +103,8 @@ func okMessage(key string) string {
 		return "порядок сохранён"
 	case "lists":
 		return "обновление запущено"
+	case "list":
+		return "список сохранён"
 	case "mode":
 		return "режим применён"
 	case "rule":
@@ -414,11 +417,26 @@ func validFilterMode(mode string) bool {
 	return false
 }
 
-// ruleForm is the state of the «add a rule» form, echoed back when a
-// submission is rejected so the admin does not retype it.
-type ruleForm struct {
+// filtersForm is the state of the filters page's forms, echoed back when
+// a submission is rejected so the admin does not retype it: the add-rule
+// fields plus the custom-list ID and URL.
+type filtersForm struct {
 	Domain string
 	Kind   string
+
+	CustomID  string
+	CustomURL string
+}
+
+// catalogRow is one entry of the ready-made list catalog on the filters
+// page: the catalog metadata, the Russian category label and whether the
+// daemon already configures the list.
+type catalogRow struct {
+	ID          string
+	Name        string
+	Category    string
+	Description string
+	Added       bool
 }
 
 // filtersView is the whole filters page.
@@ -432,24 +450,28 @@ type filtersView struct {
 	ModeLabel    string
 	TotalBlocked string
 
-	Lists []filterListRow
-	Modes []filterModeOption
+	Lists   []filterListRow
+	Catalog []catalogRow
+	Modes   []filterModeOption
 
 	Allow []string
 	Block []string
 
 	AddDomain string
 	AddKind   string
+
+	CustomID  string
+	CustomURL string
 }
 
 // handleFilters renders the filters screen.
 func (p *Panel) handleFilters(w http.ResponseWriter, r *http.Request) {
-	p.renderFilters(w, r, http.StatusOK, notice(r), ruleForm{Kind: "block"})
+	p.renderFilters(w, r, http.StatusOK, notice(r), filtersForm{Kind: "block"})
 }
 
-// renderFilters renders the page with the current config, the engine's
-// per-list status and the add-rule form's state.
-func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form ruleForm) {
+// renderFilters renders the page with the current config, the catalog,
+// the engine's per-list status and the form state.
+func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form filtersForm) {
 	view := filtersView{
 		manageNotice: n,
 		Domain:       p.pageDomain(),
@@ -457,17 +479,32 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		Nav:          "filters",
 		AddDomain:    form.Domain,
 		AddKind:      form.Kind,
+		CustomID:     form.CustomID,
+		CustomURL:    form.CustomURL,
 	}
 
 	mode := "zero"
+	added := make(map[string]bool)
 	if cfg := p.currentConfig(); cfg != nil {
 		view.Enabled = cfg.Filter.Enabled
 		mode = cfg.Filter.Mode
 		view.Allow = cfg.Filter.UserAllow
 		view.Block = cfg.Filter.UserBlock
+		for _, l := range cfg.Filter.Lists {
+			added[l.ID] = true
+		}
 	}
 	view.ModeLabel = filterModeLabel(mode)
 	view.Modes = filterModeOptions(mode)
+	for _, e := range filter.Catalog() {
+		view.Catalog = append(view.Catalog, catalogRow{
+			ID:          e.ID,
+			Name:        e.Name,
+			Category:    listCategoryLabel(e.Category),
+			Description: e.Description,
+			Added:       added[e.ID],
+		})
+	}
 
 	if p.ctrl != nil {
 		if st := p.statusSnapshot(r); st.Filter.TotalBlocked > 0 {
@@ -479,6 +516,126 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 	}
 
 	p.render(w, status, "filters", view)
+}
+
+// listCategoryLabel is the Russian label of a catalog category.
+func listCategoryLabel(category string) string {
+	switch category {
+	case "ads":
+		return "реклама и трекеры"
+	case "combined":
+		return "комбинированные"
+	default:
+		return category
+	}
+}
+
+// hasFilterList reports whether id is already configured.
+func hasFilterList(lists []config.FilterList, id string) bool {
+	for _, l := range lists {
+		if l.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// validListSlug reports whether id is a usable custom-list ID: a
+// lowercase slug [a-z0-9][a-z0-9-]{0,47}.
+func validListSlug(id string) bool {
+	if id == "" || len(id) > 48 {
+		return false
+	}
+	for i, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// handleFilterListAdd appends a ready-made catalog list (id) or a custom
+// list (custom_id + custom_url) to the block-list configuration. An
+// empty URL marks a catalog list, which the engine resolves by ID.
+func (p *Panel) handleFilterListAdd(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+
+	form := filtersForm{
+		Kind:      "block",
+		CustomID:  strings.TrimSpace(r.PostFormValue("custom_id")),
+		CustomURL: strings.TrimSpace(r.PostFormValue("custom_url")),
+	}
+	id := strings.TrimSpace(r.PostFormValue("id"))
+
+	next := cloneConfig(cfg)
+	var list config.FilterList
+	if id != "" {
+		if _, ok := filter.EntryByID(id); !ok {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный список: " + id}, form)
+			return
+		}
+		if hasFilterList(next.Filter.Lists, id) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список уже добавлен: " + id}, form)
+			return
+		}
+		list = config.FilterList{ID: id}
+	} else {
+		if !validListSlug(form.CustomID) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{
+				Error: "ID списка: строчные латинские буквы, цифры и дефис, до 48 символов",
+			}, form)
+			return
+		}
+		if hasFilterList(next.Filter.Lists, form.CustomID) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список уже добавлен: " + form.CustomID}, form)
+			return
+		}
+		u, err := url.Parse(form.CustomURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "URL списка должен быть https-ссылкой с хостом"}, form)
+			return
+		}
+		list = config.FilterList{ID: form.CustomID, URL: form.CustomURL}
+	}
+
+	next.Filter.Lists = append(next.Filter.Lists, list)
+	p.finishApply(w, r, next, filtersPath+"?ok=list", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, form)
+	})
+}
+
+// handleFilterListRemove drops one configured list and nothing else.
+func (p *Panel) handleFilterListRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	next := cloneConfig(cfg)
+	if !hasFilterList(next.Filter.Lists, id) {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список не найден: " + id}, filtersForm{Kind: "block"})
+		return
+	}
+	kept := make([]config.FilterList, 0, len(next.Filter.Lists))
+	for _, l := range next.Filter.Lists {
+		if l.ID != id {
+			kept = append(kept, l)
+		}
+	}
+	next.Filter.Lists = kept
+
+	p.finishApply(w, r, next, filtersPath+"?ok=list", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, filtersForm{Kind: "block"})
+	})
 }
 
 // filterListRowFor renders one list's live state.
@@ -512,7 +669,7 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 // POST while the update runs is refused with a banner.
 func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	if p.ctrl == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
@@ -536,7 +693,7 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 	if !started {
 		p.renderFilters(w, r, http.StatusConflict,
-			manageNotice{Error: "обновление уже идёт"}, ruleForm{Kind: "block"})
+			manageNotice{Error: "обновление уже идёт"}, filtersForm{Kind: "block"})
 		return
 	}
 	http.Redirect(w, r, filtersPath+"?ok=lists", http.StatusSeeOther)
@@ -546,20 +703,20 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterMode(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	mode := strings.TrimSpace(r.PostFormValue("mode"))
 	if !validFilterMode(mode) {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный режим блокировки: " + mode}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный режим блокировки: " + mode}, filtersForm{Kind: "block"})
 		return
 	}
 
 	next := cloneConfig(cfg)
 	next.Filter.Mode = mode
 	p.finishApply(w, r, next, filtersPath+"?ok=mode", func(status int, n manageNotice) {
-		p.renderFilters(w, r, status, n, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, status, n, filtersForm{Kind: "block"})
 	})
 }
 
@@ -567,13 +724,13 @@ func (p *Panel) handleFilterMode(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterRuleAdd(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	kind := r.PostFormValue("kind")
 	raw := strings.TrimSpace(r.PostFormValue("domain"))
-	form := ruleForm{Domain: raw, Kind: kind}
+	form := filtersForm{Domain: raw, Kind: kind}
 	if kind != "allow" && kind != "block" {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
 		return
@@ -606,13 +763,13 @@ func (p *Panel) handleFilterRuleAdd(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterRuleRemove(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	kind := r.PostFormValue("kind")
 	domain := dnsname.Normalize(strings.TrimSpace(r.PostFormValue("domain")))
-	form := ruleForm{Domain: domain, Kind: kind}
+	form := filtersForm{Domain: domain, Kind: kind}
 	if kind != "allow" && kind != "block" {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
 		return

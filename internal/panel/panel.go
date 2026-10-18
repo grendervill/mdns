@@ -258,6 +258,8 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))
 	mux.Handle("POST /panel/filters/refresh", p.requireSession(http.HandlerFunc(p.handleFiltersRefresh)))
 	mux.Handle("POST /panel/filters/mode", p.requireSession(http.HandlerFunc(p.handleFilterMode)))
+	mux.Handle("POST /panel/filters/lists/add", p.requireSession(http.HandlerFunc(p.handleFilterListAdd)))
+	mux.Handle("POST /panel/filters/lists/remove", p.requireSession(http.HandlerFunc(p.handleFilterListRemove)))
 	mux.Handle("POST /panel/filters/rules/add", p.requireSession(http.HandlerFunc(p.handleFilterRuleAdd)))
 	mux.Handle("POST /panel/filters/rules/remove", p.requireSession(http.HandlerFunc(p.handleFilterRuleRemove)))
 

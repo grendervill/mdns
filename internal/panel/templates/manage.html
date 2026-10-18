@@ -81,6 +81,34 @@
     {{template "notice" .}}
     {{if not .Enabled}}<p class="note">Фильтрация выключена — включите её в «Настройках».</p>{{end}}
 
+    <h3>Готовые списки <span class="sub">— с публичных реестров, без скачивания вручную</span></h3>
+    <div class="cards">
+      {{range .Catalog}}
+      <div class="card">
+        <div class="k">{{.Name}} · <span class="muted">{{.Category}}</span></div>
+        <p class="hint">{{.Description}}</p>
+        <form method="post" action="/panel/filters/lists/{{if .Added}}remove{{else}}add{{end}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <p class="row-actions">
+            <button class="btn small" type="submit"{{if not $.Enabled}} disabled{{end}}>{{if .Added}}Убрать{{else}}Добавить{{end}}</button>
+            {{if not $.Enabled}}<span class="hint">Фильтрация выключена</span>{{end}}
+          </p>
+        </form>
+      </div>
+      {{end}}
+    </div>
+
+    <h3>Свой список</h3>
+    <form method="post" action="/panel/filters/lists/add">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>ID списка</span><input class="ctl" type="text" name="custom_id" value="{{.CustomID}}" placeholder="my-list" spellcheck="false"></label>
+        <label class="field"><span>URL (https)</span><input class="ctl" type="url" name="custom_url" value="{{.CustomURL}}" placeholder="https://example.com/hosts.txt" spellcheck="false"></label>
+      </div>
+      <p class="row-actions"><button class="btn primary" type="submit">Добавить список</button></p>
+    </form>
+
     <h3>Списки <span class="sub">— обновить один или все</span></h3>
     <form method="post" action="/panel/filters/refresh">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
