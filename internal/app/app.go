@@ -245,6 +245,53 @@ func (rt *runtime) closeResources(keep *runtime) {
 	}
 }
 
+// retireRuntime drains a replaced generation in the background so the
+// structural swap that replaced it never waits for it. The old listeners
+// were already released, but the old HTTP server still holds the
+// connections it accepted — the management POST that triggered the swap
+// among them — so stop is bounded by a 10 s budget; when that runs out
+// ForceClose drops the remaining servers and the reason is logged at
+// Debug (the in-flight panel response is the expected one). Resources
+// the keep generation does not reuse are then freed.
+func (a *App) retireRuntime(oldRT *runtime, keep *runtime) {
+	a.retiring.Add(1)
+	go func() {
+		defer a.retiring.Done()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := oldRT.stop(ctx); err != nil {
+			a.logger.Debug("app: forcing the retired runtime closed", "error", err)
+			oldRT.server.ForceClose()
+		}
+		oldRT.closeResources(keep)
+	}()
+}
+
+// restoreRuntime brings the previous configuration back after a failed
+// swap. The old generation's listeners were released before the new one
+// started, so a fresh runtime built from the old config takes over and
+// the released generation retires alongside it.
+func (a *App) restoreRuntime(old *config.Config, oldRT *runtime) error {
+	restored, err := buildRuntime(old, nil, a.opts, a.logger, a.bus)
+	if err != nil {
+		return err
+	}
+	restored.server.SetPanel(a.panel)
+	if a.appCtx != nil {
+		if err := restored.start(a.appCtx); err != nil {
+			restored.closeResources(nil)
+			return err
+		}
+	}
+
+	a.rt = restored
+	a.cfg = old
+	a.wireEvents(restored)
+	a.retireRuntime(oldRT, restored)
+	return nil
+}
+
 // App is one assembled server instance. Start, Stop and UpdateConfig
 // are safe for sequential use from one goroutine each.
 type App struct {
@@ -285,6 +332,11 @@ type App struct {
 
 	appCtx context.Context
 	cancel context.CancelFunc
+
+	// retiring tracks the runtime generations a structural swap handed
+	// to a background goroutine to drain. App.Stop joins it before
+	// releasing resources, so a stopped daemon owns nothing.
+	retiring sync.WaitGroup
 }
 
 // New validates cfg and builds every component; nothing binds until
@@ -421,6 +473,20 @@ func (a *App) Stop(ctx context.Context) error {
 		a.apiLn = nil
 	}
 
+	// Join every generation a background swap retired: those goroutines
+	// still drain their listeners and release the resources they own, so
+	// Stop must not return before they are done. Stop holds a.mu, so no
+	// new Add can race this Wait.
+	done := make(chan struct{})
+	go func() {
+		a.retiring.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+
 	a.rt.closeResources(nil)
 	return err
 }
@@ -460,8 +526,12 @@ func (a *App) Config() *config.Config {
 // UpdateConfig validates, applies and persists a new configuration.
 // Soft changes (strategy, cache, limits, filter mode and user rules)
 // apply in place; structural changes (domain, TLS, protocols, ports,
-// upstreams, log, filter lists) rebuild the runtime. On any failure the
-// previous runtime keeps serving and the config file is untouched.
+// upstreams, log, filter lists) rebuild the runtime. A structural swap
+// is asynchronous: the old listeners are released at once, the new
+// runtime takes over, and the old one is retired in the background, so
+// the management request that triggered the change returns without
+// waiting for its own server to stop. On any failure service is
+// restored from the previous config and the config file is untouched.
 func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -486,26 +556,28 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	// built DoH listener before that listener starts.
 	newRT.server.SetPanel(a.panel)
 
-	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
 	oldRT := a.rt
-	// End the panel's open SSE streams before stopping the runtime.
+	// End the panel's open SSE streams before releasing the runtime.
 	// http.Server.Shutdown does not cancel handler contexts, so a live
 	// /panel/events stream would hold the old listeners open until the
-	// stop timeout instead of returning at once. The panel itself
-	// outlives the generation; only its streams must end.
+	// stop timeout. The panel itself outlives the generation; only its
+	// streams must end.
 	a.panel.EndStreams()
-	if err := oldRT.stop(stopCtx); err != nil {
-		a.logger.Warn("app: stopping the old listeners", "error", err)
-	}
+	// Free the old sockets at once. The response to the management POST
+	// that got us here is still being written on one of them, so the old
+	// runtime is stopped in the background, not here: releasing the
+	// listeners immediately leaves the POST connection writable and the
+	// ports free for the new generation.
+	oldRT.server.ReleaseListeners()
 
 	if a.appCtx != nil {
 		if err := newRT.start(a.appCtx); err != nil {
-			// Roll back to the previous runtime; the half-started one
-			// must not leak its transports or a freshly opened log.
+			// Roll back: the old generation's listeners are gone, so a
+			// fresh runtime rebuilt from the old config takes over. The
+			// half-started one must not leak its transports or a
+			// freshly opened log.
 			newRT.closeResources(oldRT)
-			if rerr := oldRT.start(a.appCtx); rerr != nil {
+			if rerr := a.restoreRuntime(old, oldRT); rerr != nil {
 				a.logger.Error("app: rollback failed", "error", rerr)
 				return fmt.Errorf("app: applying config: %w (rollback failed: %v)", err, rerr)
 			}
@@ -515,19 +587,23 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 
 	if err := next.Save(a.opts.ConfigPath); err != nil {
 		if a.appCtx != nil {
+			// Stop the half-started generation: it never became the
+			// caller's server, so a short budget is enough.
+			stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = newRT.stop(stopCtx)
-			if rerr := oldRT.start(a.appCtx); rerr != nil {
-				a.logger.Error("app: rollback after save failure failed", "error", rerr)
-			}
+			cancel()
 		}
-		newRT.closeResources(oldRT) // discarded without ever going live
+		newRT.closeResources(nil) // discarded without ever going live
+		if rerr := a.restoreRuntime(old, oldRT); rerr != nil {
+			a.logger.Error("app: rollback after save failure failed", "error", rerr)
+		}
 		return fmt.Errorf("app: saving config: %w", err)
 	}
 
 	a.rt = newRT
 	a.cfg = next
 	a.wireEvents(newRT)
-	oldRT.closeResources(newRT)
+	a.retireRuntime(oldRT, newRT)
 	a.bus.Publish(api.Event{Type: "filter", Data: a.filterSnapshotLocked()})
 	return nil
 }

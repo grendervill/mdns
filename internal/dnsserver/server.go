@@ -58,6 +58,7 @@ type Server struct {
 	doqUp     bool
 	plainSrv  []*dns.Server
 	tlsSrv    []*dns.Server
+	dohLn     net.Listener
 	httpSrv   *http.Server
 	h3Srv     *http3.Server
 	quicLn    *quic.Listener
@@ -304,6 +305,66 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return err
 }
 
+// ReleaseListeners frees every listening socket without cancelling
+// s.baseCtx and without calling httpSrv.Shutdown. The HTTP server stays
+// up so the management POST that triggered a runtime swap — in flight on
+// the very listener being released — can still write its response; only
+// the sockets go, so the next generation can bind the same ports. The
+// accepted connections keep being served by the old HTTP server until
+// the retirement goroutine stops it. A second call is a no-op.
+func (s *Server) ReleaseListeners() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, srv := range s.plainSrv {
+		if srv.PacketConn != nil {
+			_ = srv.PacketConn.Close()
+		}
+		if srv.Listener != nil {
+			_ = srv.Listener.Close()
+		}
+	}
+	s.plainSrv = nil
+
+	for _, srv := range s.tlsSrv {
+		if srv.Listener != nil {
+			_ = srv.Listener.Close()
+		}
+	}
+	s.tlsSrv = nil
+
+	if s.dohLn != nil {
+		_ = s.dohLn.Close()
+		s.dohLn = nil
+	}
+	if s.h3Srv != nil {
+		_ = s.h3Srv.Close()
+		s.h3Srv = nil
+	}
+	if s.quicLn != nil {
+		_ = s.quicLn.Close()
+		s.quicLn = nil
+	}
+}
+
+// ForceClose closes the remaining HTTP and HTTP/3 servers outright
+// (Close, not Shutdown). It is the retirement goroutine's fallback when
+// the graceful stop times out because a handler — the management POST
+// that triggered the swap — is still writing on an accepted connection.
+func (s *Server) ForceClose() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Close()
+		s.httpSrv = nil
+	}
+	if s.h3Srv != nil {
+		_ = s.h3Srv.Close()
+		s.h3Srv = nil
+	}
+}
+
 // stopLocked cancels the base context and stops all listeners,
 // collecting the first error. The caller must hold s.mu.
 func (s *Server) stopLocked(ctx context.Context) error {
@@ -390,6 +451,7 @@ func (s *Server) stopDoHLocked(ctx context.Context) error {
 		}
 		s.h3Srv = nil
 	}
+	s.dohLn = nil
 	s.dohUp = false
 	return firstErr
 }
@@ -433,7 +495,8 @@ func (s *Server) trackTLS(srv *dns.Server) {
 // ActivateAndServe, so a Shutdown racing the goroutine would otherwise
 // see "server not started" and leak the listener, leaving the port
 // bound. NotifyStartedFunc fires after that flag is set, so waiting on
-// it closes the race.
+// it closes the race. A listener released by ReleaseListeners makes the
+// loop return net.ErrClosed, which is a normal swap and not a warning.
 func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	started := make(chan struct{})
 	srv.NotifyStartedFunc = func() { close(started) }
@@ -441,7 +504,7 @@ func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := srv.ActivateAndServe(); err != nil {
+		if err := srv.ActivateAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.logger.Warn("listener stopped", "proto", proto, "port", port, "error", err)
 		}
 	}()

@@ -94,11 +94,12 @@ func (s *Server) startDoH() error {
 		return fmt.Errorf("doh tcp :%d: %w", port, err)
 	}
 
+	s.dohLn = ln
 	s.httpSrv = httpSrv
 	s.h3Srv = h3Srv
 
 	go func() {
-		if err := httpSrv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := httpSrv.ServeTLS(ln, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			s.logger.Warn("DoH HTTPS listener stopped", "port", port, "error", err)
 		}
 	}()

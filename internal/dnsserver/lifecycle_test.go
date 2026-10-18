@@ -1,6 +1,7 @@
 package dnsserver
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -290,6 +291,25 @@ func dohClient() *http.Client {
 			ForceAttemptHTTP2: true,
 		},
 	}
+}
+
+// rawHTTPGet sends one HTTP/1.1 GET over an already-open connection and
+// reads the response, leaving the connection alive for the next call.
+func rawHTTPGet(t *testing.T, conn net.Conn, br *bufio.Reader, path string) *http.Response {
+	t.Helper()
+
+	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: mdns.test\r\n\r\n", path); err != nil {
+		t.Fatalf("write request %s = %v, want nil", path, err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://mdns.test"+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s) = %v, want nil", path, err)
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("ReadResponse(%s) = %v, want nil", path, err)
+	}
+	return resp
 }
 
 // wantClosed fails when port accepts a TCP connection.
@@ -857,5 +877,68 @@ func TestDoHACMETLSALPN(t *testing.T) {
 
 	if got := conn.ConnectionState().NegotiatedProtocol; got != "acme-tls/1" {
 		t.Errorf("NegotiatedProtocol = %q, want acme-tls/1", got)
+	}
+}
+
+// TestReleaseListenersFreesPortsKeepsResponses covers the async swap's
+// core promise: releasing the listeners frees every port for the next
+// generation while the old HTTP server keeps serving the connections it
+// already accepted, so the request that triggered the swap can still
+// write its response. Closing a listener directly must not warn.
+func TestReleaseListenersFreesPortsKeepsResponses(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoH: config.Protocol{Enabled: true, Port: port},
+	}
+
+	logs := &syncBuffer{}
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), slog.New(slog.NewTextHandler(logs, nil)))
+	start(t, srv)
+
+	// One keep-alive HTTP/1.1 connection completes a request first.
+	conn, err := tls.Dial("tcp", loopback(port), &tls.Config{
+		InsecureSkipVerify: true, // self-signed test certificate
+		NextProtos:         []string{"http/1.1"},
+	})
+	if err != nil {
+		t.Fatalf("tls.Dial(doh) = %v, want nil", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	first := rawHTTPGet(t, conn, br, "/dns-query")
+	if first.StatusCode != http.StatusBadRequest {
+		t.Fatalf("first response status = %d, want 400 (GET without ?dns=)", first.StatusCode)
+	}
+	_ = first.Body.Close()
+
+	// Release the sockets: the ports must be free for the next generation.
+	srv.ReleaseListeners()
+
+	// A second server binds the same port and answers over it.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	start(t, srv2)
+
+	resp, err := dohClient().Get(fmt.Sprintf("https://127.0.0.1:%d/dns-query", port))
+	if err != nil {
+		t.Fatalf("DoH GET on the released port = %v, want nil (the next generation must bind it)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("second generation status = %d, want 400", resp.StatusCode)
+	}
+
+	// The first connection still gets a response from the released but
+	// not yet stopped HTTP server.
+	second := rawHTTPGet(t, conn, br, "/dns-query")
+	if second.StatusCode != http.StatusBadRequest {
+		t.Errorf("in-flight connection status = %d, want 400 (the old server must still write it)", second.StatusCode)
+	}
+	_ = second.Body.Close()
+
+	if got := logs.String(); strings.Contains(got, "listener stopped") {
+		t.Errorf("log = %q, want no \"listener stopped\" warning after ReleaseListeners", got)
 	}
 }
