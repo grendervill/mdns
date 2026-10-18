@@ -324,12 +324,24 @@ printf '%s\n' "$out" | openssl x509 -noout -issuer | grep -q 'Pebble'
 printf '%s\n' "$out" | openssl x509 -noout -ext subjectAltName | grep -q 'mdns.test'
 CLIENT
 
-  echo "--- plain DNS (dig @daemon) ---"
+  echo "--- plain DNS (dig @daemon, <= 3 attempts) ---"
+  # The answer comes through the daemon from a real upstream, so a single
+  # container-network hiccup must not red the run: retry a few times and
+  # print which attempt answered.
   "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
 set -euo pipefail
-out=$(dig @daemon example.com A +short +timeout=4 +tries=1)
-echo "$out"
-[ -n "$out" ]
+for attempt in 1 2 3; do
+  out=$(dig @daemon example.com A +short +timeout=4 +tries=1 2>&1) || out=""
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    echo "plain DNS answered on attempt $attempt"
+    exit 0
+  fi
+  echo "plain DNS attempt $attempt did not answer" >&2
+  sleep 1
+done
+echo "plain DNS never answered after 3 attempts" >&2
+exit 1
 CLIENT
 
   echo "--- DoT (kdig +tls, :853) ---"
@@ -378,24 +390,38 @@ CLIENT
     probe_retry doq
   fi
 
-  echo "--- DoH (curl, RFC 8484 GET, :443) ---"
+  echo "--- DoH (curl, RFC 8484 GET, :443, <= 3 attempts) ---"
+  # Like plain DNS, the reply is upstream-backed; retry the whole check a
+  # few times so a container-network hiccup does not red the run.
   "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
 set -euo pipefail
-Q=$(printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' \
-  | base64 | tr '+/' '-_' | tr -d '=')
-code=$(curl -s --max-time 5 -o /tmp/doh.bin -w '%{http_code}' \
-  --cacert /tmp/pebble-root.pem \
-  --connect-to mdns.test:443:daemon:443 \
-  -H 'Accept: application/dns-message' \
-  "https://mdns.test/dns-query?dns=$Q")
-echo "doh http status: $code"
-[ "$code" = 200 ]
-[ "$(wc -c < /tmp/doh.bin)" -gt 12 ]
-id=$(od -An -tx1 -N2 /tmp/doh.bin | tr -d ' \n')
-flags=$(od -An -tx1 -j2 -N1 /tmp/doh.bin | tr -d ' \n')
-echo "doh reply id: $id flags: $flags"
-[ "$id" = "1234" ]
-[ $(( 0x$flags & 0x80 )) -ne 0 ]
+doh_check() {
+  Q=$(printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' \
+    | base64 | tr '+/' '-_' | tr -d '=')
+  code=$(curl -s --max-time 5 -o /tmp/doh.bin -w '%{http_code}' \
+    --cacert /tmp/pebble-root.pem \
+    --connect-to mdns.test:443:daemon:443 \
+    -H 'Accept: application/dns-message' \
+    "https://mdns.test/dns-query?dns=$Q")
+  echo "doh http status: $code"
+  [ "$code" = 200 ] || return 1
+  [ "$(wc -c < /tmp/doh.bin)" -gt 12 ] || return 1
+  id=$(od -An -tx1 -N2 /tmp/doh.bin | tr -d ' \n')
+  flags=$(od -An -tx1 -j2 -N1 /tmp/doh.bin | tr -d ' \n')
+  echo "doh reply id: $id flags: $flags"
+  [ "$id" = "1234" ] || return 1
+  [ $(( 0x$flags & 0x80 )) -ne 0 ] || return 1
+}
+for attempt in 1 2 3; do
+  if doh_check; then
+    echo "DoH answered on attempt $attempt"
+    exit 0
+  fi
+  echo "DoH attempt $attempt failed" >&2
+  sleep 1
+done
+echo "DoH never answered correctly after 3 attempts" >&2
+exit 1
 CLIENT
 
   echo "--- control API: certificate status over the unix socket ---"
@@ -610,7 +636,10 @@ CLIENT
 
 # start_plain_loop runs a 1 query/second plain-DNS loop in the client,
 # appending one line per query to /tmp/plain.log, until /tmp/plain-stop
-# exists. It is backgrounded on the host; stop_plain_loop ends it.
+# exists. It is backgrounded on the host; stop_plain_loop ends it. The
+# queried name is the one phase_d pre-warmed into the daemon cache, so a
+# failure here points at the listener or the switch timing, not at the
+# upstream.
 start_plain_loop() {
   "${COMPOSE[@]}" exec -T client bash -c '
 rm -f /tmp/plain-stop /tmp/plain.log
@@ -665,6 +694,25 @@ if printf '%s\n' "$verified" | grep -q 'Verify return code: 0 (ok)'; then
   exit 1
 fi
 echo "self-signed served and not issued by pebble"
+CLIENT
+
+  echo "--- pre-warm example.com so the continuity loop's answers are cache-local (<= 3 attempts) ---"
+  # The loop must measure the plain-DNS listener through the switch, not
+  # the internet: one completed query puts example.com in the daemon cache
+  # (and its TTL is far longer than the whole phase), so the loop's answers
+  # no longer depend on the upstream being reachable.
+  "${COMPOSE[@]}" exec -T client bash -s <<'CLIENT'
+set -euo pipefail
+for attempt in 1 2 3; do
+  if dig @daemon example.com A +timeout=4 +tries=1 >/dev/null 2>&1; then
+    echo "example.com cached on attempt $attempt"
+    exit 0
+  fi
+  echo "pre-warm attempt $attempt did not answer" >&2
+  sleep 1
+done
+echo "could not pre-warm example.com through the daemon" >&2
+exit 1
 CLIENT
 
   echo "--- start a plain-DNS loop (1 query/second) for the duration of the switch ---"
@@ -730,6 +778,7 @@ set -euo pipefail
 total=$(wc -l < /tmp/plain.log)
 fails=$(grep -c '^FAIL' /tmp/plain.log || true)
 echo "plain DNS queries during the switch: $total, failures: $fails"
+grep '^FAIL' /tmp/plain.log || true
 [ "$total" -gt 0 ]
 [ "$fails" -eq 0 ]
 CLIENT
