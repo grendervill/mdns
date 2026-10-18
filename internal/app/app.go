@@ -262,6 +262,10 @@ type App struct {
 	// wireEvents.
 	collector *stats.Collector
 
+	// statsPath is where the collector's history is persisted (under
+	// DataDir); empty disables persistence.
+	statsPath string
+
 	// started is the time the app was constructed, reported as the
 	// stats "since". New is where a daemon run begins.
 	started time.Time
@@ -305,6 +309,14 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		bus:       bus,
 		collector: stats.NewCollector(),
 		started:   time.Now(),
+	}
+	if cfgCopy.DataDir != "" {
+		a.statsPath = filepath.Join(cfgCopy.DataDir, "stats.json")
+		// A broken history file is not fatal: the daemon keeps running
+		// with empty history rather than refusing to start.
+		if err := a.collector.Load(a.statsPath); err != nil {
+			logger.Warn("app: loading the query statistics history", "error", err)
+		}
 	}
 	a.wireEvents(rt)
 
@@ -355,6 +367,7 @@ func (a *App) Start(ctx context.Context) error {
 	}
 
 	go a.publishUpstreams(appCtx)
+	go a.saveStatsLoop(appCtx)
 	return nil
 }
 
@@ -370,6 +383,12 @@ func (a *App) Stop(ctx context.Context) error {
 	}
 
 	err := a.rt.stop(ctx)
+
+	// Persist the statistics history once on the way out. A failure is
+	// logged, never returned: the daemon must stop regardless.
+	if serr := a.collector.Save(a.statsPath); serr != nil {
+		a.logger.Warn("app: saving the query statistics history", "error", serr)
+	}
 
 	// Wait for the control API goroutine so its socket is gone by the
 	// time Stop returns.

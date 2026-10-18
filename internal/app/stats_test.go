@@ -2,10 +2,13 @@ package app_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"mydns/internal/app"
 )
 
 // TestAppCollectsStats checks the app wiring: queries served by the
@@ -60,5 +63,77 @@ func TestAppCollectsStats(t *testing.T) {
 	}
 	if snap.Upstreams["fake"] != 3 {
 		t.Errorf("Upstreams after the update = %v, want the fake counted 3 times", snap.Upstreams)
+	}
+}
+
+// TestAppStatsPersistAcrossRestart checks the file wiring end to end:
+// the history is saved on Stop and reloaded by a fresh App over the same
+// data directory, so the counters survive a daemon restart.
+func TestAppStatsPersistAcrossRestart(t *testing.T) {
+	fake := newFakeUpstream(t)
+	port := freePort(t)
+	cfg := testConfig(t, fake, port)
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := cfg.Save(cfgPath); err != nil {
+		t.Fatalf("cfg.Save() = %v, want nil", err)
+	}
+
+	ask := func(name string) {
+		t.Helper()
+		cl := &dns.Client{Net: "udp", Timeout: time.Second}
+		if _, _, err := cl.Exchange(query(name), loopback(port)); err != nil {
+			t.Fatalf("Exchange(%s) = %v, want nil", name, err)
+		}
+	}
+
+	// First run: serve two queries, then Stop persists the history.
+	opts := testOptions(t)
+	opts.ConfigPath = cfgPath
+	a, err := app.New(cfg, opts, discardLogger())
+	if err != nil {
+		t.Fatalf("app.New() = %v, want nil", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := a.Start(ctx); err != nil {
+		cancel()
+		t.Fatalf("Start() = %v, want nil", err)
+	}
+	ask("one.example.com")
+	ask("two.example.com")
+
+	sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := a.Stop(sctx); err != nil {
+		scancel()
+		cancel()
+		t.Fatalf("Stop() = %v, want nil", err)
+	}
+	scancel()
+	cancel()
+
+	// Second run over the same data directory: the counters carried over.
+	opts2 := testOptions(t)
+	opts2.ConfigPath = cfgPath
+	a2, err := app.New(cfg, opts2, discardLogger())
+	if err != nil {
+		t.Fatalf("app.New() on restart = %v, want nil", err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	if err := a2.Start(ctx2); err != nil {
+		cancel2()
+		t.Fatalf("Start() on restart = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer scancel()
+		_ = a2.Stop(sctx)
+		cancel2()
+	})
+
+	if got := a2.Stats().Total; got != 2 {
+		t.Errorf("Total after restart = %d, want 2 (history must survive)", got)
+	}
+	if got := a2.StatsRange(time.Time{}, time.Time{}).Total; got != 2 {
+		t.Errorf("range Total after restart = %d, want 2", got)
 	}
 }
