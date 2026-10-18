@@ -15,22 +15,23 @@
 # Phases:
 #   A  download-mode install: download + checksum, binary, config, unit,
 #      running service, a DNS answer, `mdns status` and `mdns diag`.
-#   B  idempotence: a re-run over the running service keeps the config;
-#      --reconfigure rewrites it and the service comes up on it cleanly.
+#   B  idempotence and the live reconfigure: a re-run over the running
+#      service keeps the config and restarts the daemon on the new binary;
+#      --reconfigure rewrites the config and the *running* daemon serves
+#      it without any manual restart.
 #   C  a failed install leaves no half-state: a bad domain aborts before
 #      anything is written, the unit is not enabled, no config exists.
 #   D  uninstall: the config/data survive by default, --keep-binary keeps
 #      the binary, --purge removes everything.
 #
-# Known defect this script measures (found by Task 14, not fixed there):
-# a re-run over a *running* service aborts in the installer's port
-# preflight, because the service it installed already holds the ports the
-# new config asks for — the installer even names the holder
-# ("53 (занят: mdns)"). Re-running the one-liner is how this project
-# upgrades (design spec §3, "обновление — переустановкой скриптом"), so
-# B1 asserts it and is RED until `internal/installer` stops (or exempts)
-# its own service before the port check. Everything else passes; see
-# .superpowers/sdd/2026-10-17-mdns-tls-install/task-14-report.md.
+# Phase B is the regression test for two installer defects Task 14 found
+# and 01372cc fixed (ledger R14): the port preflight used to abort when the
+# service it installed held the very ports the new config wants, and
+# `systemctl enable --now mdns` is a no-op on an active unit, so a
+# reconfigure never reached the running daemon. Both matter because the
+# design spec §3 makes re-running the one-liner the upgrade path
+# ("обновление — переустановкой скриптом") and §4 makes "повторный запуск
+# ломает уже настроенное" an anti-goal.
 #
 # Container notes (macOS / Docker Desktop):
 #   * ubuntu:24.04 ships no init, so the container starts as
@@ -66,20 +67,16 @@ PLAIN_PORT=53
 DOH_PORT=443
 DOT_PORT=853
 DOQ_PORT=853
-# Ports of the --reconfigure phase: a different port set, so the rewrite
-# is visible in the config and in the running daemon. (Reconfiguring with
-# the same ports while the service runs hits the defect phase B measures,
-# see the note there.)
-RE_PLAIN_PORT=5300
-RE_DOH_PORT=4430
-RE_DOT_PORT=8530
-RE_DOQ_PORT=8530
-RE_DOMAIN=reconf.test
+# The --reconfigure run changes the domain and keeps the ports, so it is
+# both the natural "change my domain" reconfiguration and the strongest
+# case for the port preflight: the running service holds exactly the ports
+# the new config asks for.
+RE_DOMAIN=mdns2.test
 
 # Flags of every successful install below; phase C deliberately breaks
 # the domain.
 INSTALL_FLAGS="--non-interactive --domain $DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT"
-RECONFIG_FLAGS="--non-interactive --reconfigure --domain $RE_DOMAIN --tls self-signed --provider cloudflare --plain-port $RE_PLAIN_PORT --doh-port $RE_DOH_PORT --dot-port $RE_DOT_PORT --doq-port $RE_DOQ_PORT"
+RECONFIG_FLAGS="--non-interactive --reconfigure --domain $RE_DOMAIN --tls self-signed --provider cloudflare --plain-port $PLAIN_PORT --doh-port $DOH_PORT --dot-port $DOT_PORT --doq-port $DOQ_PORT"
 
 # The container bootstrap installs systemd (the image has none), the
 # client tools the phases need, disables the resolved stub listener and
@@ -346,74 +343,87 @@ else
   fail "A11 mdns diag reports no failed check (only ! items are accepted)" "$diag_out"
 fi
 
-# --- phase B: idempotence -------------------------------------------------
+# --- phase B: idempotence and the live reconfigure ------------------------
 echo
-echo "=== phase B: idempotence ==="
-config_before=$(docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1)
-note "config hash before the re-run: $config_before"
+echo "=== phase B: idempotence and the live reconfigure ==="
+# The hash of the config and the identity of the running daemon, before
+# anything: the hash proves "config kept / config rewritten", the MainPID
+# proves the installer actually restarted the service.
+config_hash() { docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1; }
+main_pid() { docker exec "$NAME" systemctl show -p MainPID --value mdns 2>/dev/null | tr -d ' \n'; }
+active_since() { docker exec "$NAME" systemctl show -p ActiveEnterTimestamp --value mdns 2>/dev/null; }
+
+config_before=$(config_hash)
+pid_before=$(main_pid)
+note "before the re-run: config $config_before, daemon MainPID $pid_before, $(active_since)"
 
 iassert "B1  a second run over the running service exits 0" "$INSTALL_FLAGS" ok
-if [ "$LAST_STATUS" -ne 0 ]; then
-  note "NOTE: the installer aborted in its port preflight because the"
-  note "service it installed already holds 53/443/853 — the installer even"
-  note "names the holder: 'ports: заняты порты: 53 (занят: mdns), ...'. A"
-  note "live re-run is how this project upgrades (design spec §3) and must"
-  note "not fail (§4: 'повторный запуск ломает уже настроенное' is an"
-  note "anti-goal). Defect measured by B1; see the Task 14 report."
+note "$(printf '%s\n' "$LAST_OUT" | grep -E 'скачиваем|сумма|оставлен без изменений' | head -3 || true)"
+if printf '%s\n' "$LAST_OUT" | grep -q 'оставлен без изменений'; then
+  pass "B2  the re-run reported that it keeps the existing config"
+else
+  fail "B2  the re-run reported that it keeps the existing config" "$LAST_OUT"
 fi
-ccontains "B2  the service is still active after the re-run" 'systemctl is-active mdns' 'active'
-config_after=$(docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1)
+config_after=$(config_hash)
 if [ "$config_after" = "$config_before" ]; then
-  pass "B3  the existing config was kept (hash unchanged)"
+  pass "B3  the config file is unchanged (hash $config_before)"
 else
-  fail "B3  the existing config was kept (hash unchanged)" \
-    "before $config_before / after $config_after"
+  fail "B3  the config file is unchanged" "before $config_before / after $config_after"
+fi
+ccontains "B4  the service is active after the re-run" 'systemctl is-active mdns' 'active'
+pid_after=$(main_pid)
+if [ -n "$pid_after" ] && [ "$pid_after" != "0" ] && [ "$pid_after" != "$pid_before" ]; then
+  pass "B5  the re-run restarted the daemon (MainPID $pid_before -> $pid_after)"
+else
+  fail "B5  the re-run restarted the daemon" "MainPID before $pid_before, after ${pid_after:-none}"
 fi
 
-# Diagnostic probe (not an assertion): measure the same re-run with the
-# service stopped, to pin the root cause of B1 on the running service.
-# The installer starts it again through `systemctl enable --now`.
-docker exec "$NAME" systemctl stop mdns
-probe_status=0
-probe_hash=""
-probe_status_text=""
-probe_log=$(run_installer "$INSTALL_FLAGS" 2>&1) || probe_status=$?
-probe_hash=$(docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1)
-if [ "$probe_hash" = "$config_before" ]; then probe_status_text=unchanged; else probe_status_text=rewritten; fi
-note "probe: with 'systemctl stop mdns' first, the same command exits $probe_status;"
-note "       the config is $probe_status_text and the service is $(docker exec "$NAME" systemctl is-active mdns)"
-
-iassert "B4  a --reconfigure run exits 0" "$RECONFIG_FLAGS" ok
+iassert "B6  a --reconfigure run exits 0 (same ports, new domain $RE_DOMAIN)" "$RECONFIG_FLAGS" ok
 note "$(printf '%s\n' "$LAST_OUT" | grep -E 'конфиг записан|Установлено' | head -2 || true)"
-reconfig_hash=$(docker exec "$NAME" sha256sum /etc/mdns/config.json | cut -d' ' -f1)
+reconfig_hash=$(config_hash)
 if [ "$reconfig_hash" != "$config_before" ]; then
-  pass "B5  --reconfigure rewrote the config (hash changed)"
+  pass "B7  --reconfigure rewrote the config (hash changed)"
 else
-  fail "B5  --reconfigure rewrote the config (hash changed)" \
-    "the config is still $reconfig_hash"
+  fail "B7  --reconfigure rewrote the config (hash changed)" "the config is still $reconfig_hash"
 fi
-ccontains "B6  the service is still active after the reconfigure" 'systemctl is-active mdns' 'active'
+ccontains "B8  the service is active after the reconfigure" 'systemctl is-active mdns' 'active'
+reconfig_pid=$(main_pid)
+if [ -n "$reconfig_pid" ] && [ "$reconfig_pid" != "0" ] && [ "$reconfig_pid" != "$pid_after" ]; then
+  pass "B9  the reconfigure restarted the daemon (MainPID $pid_after -> $reconfig_pid)"
+else
+  fail "B9  the reconfigure restarted the daemon" "MainPID before $pid_after, after ${reconfig_pid:-none}"
+fi
 
-# `systemctl enable --now` is a no-op on an already-active unit, so the
-# running daemon keeps the old config until it is restarted; restart it
-# here to prove the rewritten config is valid and complete.
-note "NOTE: the installer does not restart an active service, so the"
-note "reconfigure applies from the next start (measured; see the report)."
-docker exec "$NAME" systemctl restart mdns
+# The strongest proof of D2's fix: the daemon that is running right now —
+# nobody restarted it by hand — reports the rewritten config. The status
+# call is polled because the restart ends the old listener first.
+live_domain=""
+for _ in $(seq 1 30); do
+  live_domain=$(docker exec "$NAME" mdns status 2>/dev/null | sed -n 's/^Домен: //p' || true)
+  [ "$live_domain" = "$RE_DOMAIN" ] && break
+  sleep 1
+done
+if [ "$live_domain" = "$RE_DOMAIN" ]; then
+  pass "B10 the running daemon serves the new config (mdns status: Домен: $live_domain)"
+else
+  fail "B10 the running daemon serves the new config (mdns status: Домен: $live_domain)" \
+    "$(docker exec "$NAME" mdns status 2>&1 || true)"
+fi
+note "daemon MainPID $pid_before -> $pid_after -> $reconfig_pid; $(active_since)"
+
 dns_re=""
 for _ in $(seq 1 30); do
-  dns_re=$(docker exec "$NAME" dig @127.0.0.1 -p "$RE_PLAIN_PORT" example.com A +short +timeout=2 +tries=1 2>/dev/null || true)
+  dns_re=$(docker exec "$NAME" dig @127.0.0.1 -p "$PLAIN_PORT" example.com A +short +timeout=2 +tries=1 2>/dev/null || true)
   [ -n "$dns_re" ] && break
   sleep 1
 done
 if [ -n "$dns_re" ]; then
-  pass "B7  the rewritten config is valid: the service runs it after a restart"
-  note "example.com A on :$RE_PLAIN_PORT -> $(printf '%s' "$dns_re" | tr '\n' ' ')"
+  pass "B11 plain DNS still answers on :$PLAIN_PORT after the reconfigure"
+  note "example.com A -> $(printf '%s' "$dns_re" | tr '\n' ' ')"
 else
-  fail "B7  the rewritten config is valid: the service runs it after a restart" \
+  fail "B11 plain DNS still answers on :$PLAIN_PORT after the reconfigure" \
     "$(docker exec "$NAME" mdns status 2>&1 || true)"
 fi
-ccontains "B8  the restarted daemon reports the new domain" 'mdns status' "Домен: $RE_DOMAIN"
 
 # --- phase C: a failed install leaves no half-state -----------------------
 echo
