@@ -113,7 +113,8 @@ The non-interactive flags (`mdns install --help`): `--non-interactive`,
 resolver catalog id), `--strategy`, `--plain-port`, `--doh-port`,
 `--dot-port`, `--doq-port`, `--filter` (`off`, `basic`, `strict`).
 Only `--domain` is required with `--non-interactive`. `--dry-run`
-prints the plan and changes nothing.
+prints the plan and changes nothing (it still runs the full preflight,
+so it needs root).
 
 ### Re-running, updating, removing
 
@@ -198,10 +199,11 @@ section:
 
 `tls.mode` selects where the server certificate comes from:
 
-- `self-signed` — an ECDSA P-256 certificate for the domain is
-  generated in memory at startup and never written to disk; valid for
-  90 days, so a restart of a long-running install gets a fresh one.
-  Good for a first try; every client needs `-k` / an explicit trust.
+- `self-signed` — an ECDSA P-256 certificate for the domain, generated
+  in memory at every startup and never written to disk, so each restart
+  regenerates it. It is valid for 90 days — that is only its lifetime,
+  not something a restart extends. Good for a first try; every client
+  needs `-k` / an explicit trust.
 - `files` — the PEM pair given by `tls.cert_file` and `tls.key_file`.
   It is loaded at startup, so a missing or broken pair fails the start
   instead of the first handshake.
@@ -318,7 +320,7 @@ One binary, `mdns`; every command has a `--help`.
 | `mdns diag [--config <path>] [--socket <path>] [--data-dir <path>]` | installation self-check: config, ports, certificate, upstream reachability, data dir, unit |
 | `mdns logs [-n <N>] [-f] [--config <path>]` | tail the daemon log: the configured log file, the systemd journal otherwise |
 | `mdns install [flags]` | install or update the service: binary, config, systemd unit, firewall (see above) |
-| `mdns uninstall [--purge] [--keep-binary] [--yes]` | remove the service; config, data and certificates survive unless `--purge` |
+| `mdns uninstall [--purge] [--keep-binary] [--config <path>] [--data-dir <path>] [--yes]` | remove the service; config, data and certificates survive unless `--purge` (`--non-interactive` is the same as `--yes`) |
 | `mdns tui [--socket <path>]` | open the terminal interface |
 | `mdns version` | print the version |
 
