@@ -62,6 +62,10 @@ type manageCtrl struct {
 	refreshes  []string
 	refreshErr error
 
+	// refreshPanic makes FilterUpdate panic with this value, standing in
+	// for a controller bug that would otherwise crash the daemon.
+	refreshPanic any
+
 	// refreshStarted receives the id of every FilterUpdate call before
 	// the call blocks on refreshGate, so a test can observe a background
 	// refresh while it is still in flight.
@@ -118,6 +122,9 @@ func (c *manageCtrl) FilterUpdate(_ context.Context, id string) error {
 	}
 	if c.refreshGate != nil {
 		<-c.refreshGate
+	}
+	if c.refreshPanic != nil {
+		panic(c.refreshPanic)
 	}
 
 	c.mu.Lock()
@@ -474,6 +481,10 @@ func TestFiltersRefresh(t *testing.T) {
 	gate := make(chan struct{})
 	ctrl := &manageCtrl{cfg: cfg, refreshStarted: started, refreshGate: gate}
 	p, srv := managePanel(t, ctrl)
+	// Bound this test's requests: if the handler regressed to running the
+	// download synchronously, the first POST fails fast instead of hanging
+	// until the go test timeout.
+	srv.Client().Timeout = 5 * time.Second
 
 	begin := time.Now()
 	resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
@@ -529,6 +540,46 @@ func TestFiltersRefresh(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("the second background FilterUpdate did not start")
+	}
+}
+
+// TestFiltersRefreshPanic checks that a panicking updater cannot take the
+// daemon down: the POST still redirects, the process keeps serving, and
+// the single-flight flag clears so later refreshes are accepted.
+func TestFiltersRefreshPanic(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	ctrl := &manageCtrl{cfg: cfg, refreshPanic: "boom", refreshStarted: make(chan string, 1)}
+	p, srv := managePanel(t, ctrl)
+
+	resp, _ := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {"oisd"}})
+	wantRedirect(t, resp, "/panel/filters?ok=lists")
+
+	// The panicking updater really ran (the message is sent before the
+	// panic); without recovery this goroutine would take the process down.
+	select {
+	case id := <-ctrl.refreshStarted:
+		if id != "oisd" {
+			t.Errorf("FilterUpdate id = %q, want oisd", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the background FilterUpdate did not start")
+	}
+
+	waitFor(t, "the single-flight flag to clear after the panic", func() bool {
+		return !p.refresh.isRunning()
+	})
+
+	// The recover kept the process alive: the panel still answers.
+	code, page := authedGET(t, p, srv, "/panel/filters?ok=lists")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters?ok=lists after the panic = %d, want 200\n%s", code, page)
+	}
+	if !strings.Contains(page, "обновление запущено") {
+		t.Errorf("the success banner «обновление запущено» is missing after the panic:\n%s", page)
+	}
+	if got := ctrl.refreshed(); len(got) != 0 {
+		t.Errorf("a panicking FilterUpdate recorded %q, want nothing", got)
 	}
 }
 

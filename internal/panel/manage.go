@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -517,6 +518,16 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 
 	id := strings.TrimSpace(r.PostFormValue("id"))
 	started := p.refresh.start(func() {
+		// The update runs outside net/http's per-request recover, so a
+		// panicking controller would otherwise take the daemon down.
+		// Recover first (innermost defer) so the single-flight reset
+		// registered by start still runs after the panic is contained.
+		defer func() {
+			if r := recover(); r != nil {
+				p.logger.Error("panel: block list refresh panicked",
+					"id", id, "panic", r, "stack", string(debug.Stack()))
+			}
+		}()
 		if err := p.ctrl.FilterUpdate(context.Background(), id); err != nil {
 			p.logger.Warn("panel: refreshing block lists", "id", id, "error", err)
 			return
