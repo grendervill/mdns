@@ -835,6 +835,112 @@ func TestWizardPanelDisabled(t *testing.T) {
 	}
 }
 
+// enablePanelAtPanel walks the first-time panel flow: answer «д» and set
+// the password pair, leaving the wizard on the panel step with the hash
+// stored.
+func enablePanelAtPanel(t *testing.T, w WizardModel) WizardModel {
+	t.Helper()
+
+	w = typeWizard(t, w, "д")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "supersecret")
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, "supersecret")
+	w = wizardStep(t, w, enterKey())
+	if !w.cfg.Panel.Enabled {
+		t.Fatalf("the panel is not enabled after the password pair: err=%v", w.err)
+	}
+	return w
+}
+
+// TestWizardPanelPasswordMasked checks the password and its confirmation
+// are shown as bullets, never as plaintext.
+func TestWizardPanelPasswordMasked(t *testing.T) {
+	w := newWizardAtPanel(t, newFakeWizardBackend(t))
+	w = typeWizard(t, w, "д")
+	w = wizardStep(t, w, enterKey())
+
+	const pw = "supersecret"
+	w = typeWizard(t, w, pw)
+	if view := w.View(); strings.Contains(view, pw) {
+		t.Errorf("the password field echoes the password:\n%s", view)
+	} else if !strings.Contains(view, strings.Repeat("•", len(pw))) {
+		t.Errorf("the password field is not masked:\n%s", view)
+	}
+
+	w = wizardStep(t, w, enterKey())
+	w = typeWizard(t, w, pw)
+	if view := w.View(); strings.Contains(view, pw) {
+		t.Errorf("the confirmation field echoes the password:\n%s", view)
+	} else if !strings.Contains(view, strings.Repeat("•", len(pw))) {
+		t.Errorf("the confirmation field is not masked:\n%s", view)
+	}
+}
+
+// TestWizardPanelReentryPassive checks that coming back to a configured
+// panel step is passive: «д» and Enter keep the stored hash, esc only
+// leaves the step, and an explicit «н» turns the panel off.
+func TestWizardPanelReentryPassive(t *testing.T) {
+	reenter := func(t *testing.T) WizardModel {
+		t.Helper()
+		w := enablePanelAtPanel(t, newWizardAtPanel(t, newFakeWizardBackend(t)))
+		if cmd := w.enterStage(stagePanel); cmd != nil {
+			t.Fatalf("enterStage(stagePanel) returned a command")
+		}
+		if w.inputActive {
+			t.Fatalf("re-entering the enabled panel step opened an input")
+		}
+		if view := w.View(); !strings.Contains(view, "включена, пароль сохранён") {
+			t.Errorf("the passive panel view misses the note:\n%s", view)
+		}
+		return w
+	}
+
+	t.Run("д keeps the hash", func(t *testing.T) {
+		w := reenter(t)
+		hash := w.cfg.Panel.PasswordHash
+		w = typeWizard(t, w, "д")
+		if !w.cfg.Panel.Enabled || w.cfg.Panel.PasswordHash != hash {
+			t.Errorf("«д» changed the panel: %+v", w.cfg.Panel)
+		}
+		if w.inputActive {
+			t.Errorf("«д» opened an input on the passive step")
+		}
+	})
+
+	t.Run("enter keeps the hash", func(t *testing.T) {
+		w := reenter(t)
+		hash := w.cfg.Panel.PasswordHash
+		w = wizardStep(t, w, enterKey())
+		if !w.cfg.Panel.Enabled || w.cfg.Panel.PasswordHash != hash {
+			t.Errorf("Enter changed the panel: %+v", w.cfg.Panel)
+		}
+		if w.inputActive {
+			t.Errorf("Enter opened the question on the passive step")
+		}
+	})
+
+	t.Run("esc keeps the hash", func(t *testing.T) {
+		w := reenter(t)
+		hash := w.cfg.Panel.PasswordHash
+		w = wizardStep(t, w, tea.KeyMsg{Type: tea.KeyEsc})
+		if w.stage != stageFilters {
+			t.Errorf("stage = %v, want filters after esc", w.stage)
+		}
+		if !w.cfg.Panel.Enabled || w.cfg.Panel.PasswordHash != hash {
+			t.Errorf("esc changed the panel: %+v", w.cfg.Panel)
+		}
+	})
+
+	t.Run("н disables", func(t *testing.T) {
+		w := reenter(t)
+		w = typeWizard(t, w, "н")
+		if w.cfg.Panel.Enabled || w.cfg.Panel.PasswordHash != "" {
+			t.Errorf("«н» did not disable the panel: %+v", w.cfg.Panel)
+		}
+	})
+}
+
 // TestWizardProbeChainInvalidated checks that results of a superseded
 // probe chain are ignored.
 func TestWizardProbeChainInvalidated(t *testing.T) {

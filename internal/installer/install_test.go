@@ -417,6 +417,26 @@ func TestBuildConfigPanelFlagBehavior(t *testing.T) {
 			t.Errorf("error = %q, want it to name the minimum length", err)
 		}
 	})
+
+	t.Run("whitespace-only password is rejected", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "        "})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("error = %q, want it to name the whitespace", err)
+		}
+	})
+
+	t.Run("surrounding whitespace is rejected", func(t *testing.T) {
+		cfg, err := buildConfig(Spec{Domain: "dns.example.com", PanelPassword: "longenough "})
+		if err == nil {
+			t.Fatalf("buildConfig() = %+v, want an error", cfg)
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("error = %q, want it to name the whitespace", err)
+		}
+	})
 }
 
 // TestInstallSummaryPanelLine checks the summary's panel line in both

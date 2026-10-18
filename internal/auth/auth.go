@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/argon2"
 )
@@ -61,6 +62,35 @@ var productionParams = argon2Params{mem: 64 * 1024, iters: 3, par: 2}
 // params is the cost HashPassword uses. Tests shrink it through
 // SetParamsForTests (see export_test.go).
 var params = productionParams
+
+// MinPasswordLen is the shortest admin password accepted by the panel,
+// the installer and the setup wizard.
+const MinPasswordLen = 8
+
+// Reasons ValidatePassword rejects a password. They are sentinels so
+// every caller can render its own (localized) message.
+var (
+	// ErrPasswordWhitespace means the password starts or ends with a
+	// blank. In a field whose content is not echoed such a blank is
+	// almost always a typo, so it is rejected rather than trimmed.
+	ErrPasswordWhitespace = errors.New("auth: password must not start or end with whitespace")
+	// ErrPasswordTooShort means the password has fewer than
+	// MinPasswordLen runes.
+	ErrPasswordTooShort = errors.New("auth: password is too short")
+)
+
+// ValidatePassword checks an admin password against the one rule the
+// panel, the installer and the wizard share: at least MinPasswordLen
+// runes and no leading or trailing whitespace.
+func ValidatePassword(pw string) error {
+	if strings.TrimSpace(pw) != pw {
+		return ErrPasswordWhitespace
+	}
+	if utf8.RuneCountInString(pw) < MinPasswordLen {
+		return ErrPasswordTooShort
+	}
+	return nil
+}
 
 // HashPassword derives a PHC argon2id string of the form
 //

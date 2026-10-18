@@ -113,14 +113,11 @@ func buildConfig(spec Spec) (*config.Config, error) {
 	return cfg, nil
 }
 
-// minPanelPasswordLen is the shortest admin password the panel accepts.
-// It matches the wizard's minimum.
-const minPanelPasswordLen = 8
-
 // buildPanel turns the spec's panel settings into a PanelConfig. The
 // panel is on when PanelEnabled says so, or by default when a password
 // was given; an enabled panel without a password is an error. The
-// password is hashed with argon2id and never stored in the clear.
+// password is checked with the shared auth rule and hashed with
+// argon2id; it is never stored in the clear.
 func buildPanel(spec Spec) (config.PanelConfig, error) {
 	enabled := spec.PanelPassword != ""
 	if spec.PanelEnabled != nil {
@@ -132,8 +129,11 @@ func buildPanel(spec Spec) (config.PanelConfig, error) {
 	if spec.PanelPassword == "" {
 		return config.PanelConfig{}, errors.New("installer: the web panel needs a password (--panel requires --password)")
 	}
-	if len([]rune(spec.PanelPassword)) < minPanelPasswordLen {
-		return config.PanelConfig{}, fmt.Errorf("installer: the web panel password must be at least %d characters", minPanelPasswordLen)
+	switch err := auth.ValidatePassword(spec.PanelPassword); {
+	case errors.Is(err, auth.ErrPasswordWhitespace):
+		return config.PanelConfig{}, errors.New("installer: the web panel password must not start or end with whitespace")
+	case errors.Is(err, auth.ErrPasswordTooShort):
+		return config.PanelConfig{}, fmt.Errorf("installer: the web panel password must be at least %d characters", auth.MinPasswordLen)
 	}
 	hash, err := auth.HashPassword(spec.PanelPassword)
 	if err != nil {

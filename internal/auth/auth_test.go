@@ -3,6 +3,7 @@ package auth_test
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -594,4 +595,31 @@ func TestThrottle(t *testing.T) {
 			t.Errorf("throttle tracks %d IPs, want at most 8", size)
 		}
 	})
+}
+
+// TestValidatePassword pins the shared password rule: at least
+// MinPasswordLen runes and no leading or trailing whitespace.
+func TestValidatePassword(t *testing.T) {
+	tests := []struct {
+		name    string
+		pw      string
+		wantErr error
+	}{
+		{"the shortest accepted password", strings.Repeat("a", auth.MinPasswordLen), nil},
+		{"unicode runes count as characters", strings.Repeat("я", auth.MinPasswordLen), nil},
+		{"one rune too short", strings.Repeat("a", auth.MinPasswordLen-1), auth.ErrPasswordTooShort},
+		{"empty", "", auth.ErrPasswordTooShort},
+		{"leading whitespace", " hunter2hunter2", auth.ErrPasswordWhitespace},
+		{"trailing whitespace", "hunter2hunter2 ", auth.ErrPasswordWhitespace},
+		{"only whitespace", "        ", auth.ErrPasswordWhitespace},
+		{"inner whitespace is fine", "hunter 2 hunter2", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := auth.ValidatePassword(tt.pw)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("ValidatePassword(%q) = %v, want %v", tt.pw, err, tt.wantErr)
+			}
+		})
+	}
 }

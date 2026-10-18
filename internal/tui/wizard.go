@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -75,10 +76,6 @@ const (
 	inputPanelPassword = "panel-password"
 	inputPanelConfirm  = "panel-confirm"
 )
-
-// minPanelPasswordLen is the shortest admin password the wizard and the
-// installer accept.
-const minPanelPasswordLen = 8
 
 // WizardBackend is the environment the wizard works against: the local
 // setup backend before the first run, or the daemon API from the TUI.
@@ -407,6 +404,15 @@ func (w WizardModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case stagePanel:
+		// Re-entering an enabled step is passive: «н» is the deliberate
+		// way to turn the panel off, while «д» and Enter keep the hash.
+		if w.cfg.Panel.Enabled {
+			if msg.String() == "н" {
+				w.cfg.Panel = config.PanelConfig{Enabled: false}
+				w.panelPassword = ""
+			}
+			return w, nil
+		}
 		if msg.String() == "enter" {
 			w.openInput(inputPanelEnabled, "")
 		}
@@ -516,17 +522,17 @@ func parseYesNo(s string) (value, ok bool) {
 	return false, false
 }
 
-// validPanelPassword checks an admin password: at least
-// minPanelPasswordLen runes and no leading or trailing whitespace (the
-// surrounding blanks are almost always a typo in a hidden field).
+// validPanelPassword checks an admin password with the shared rule
+// (auth.ValidatePassword), rendered in the wizard's Russian wording.
 func validPanelPassword(pw string) error {
-	if strings.TrimSpace(pw) != pw {
+	err := auth.ValidatePassword(pw)
+	switch {
+	case errors.Is(err, auth.ErrPasswordWhitespace):
 		return errors.New("пароль не должен начинаться или заканчиваться пробелом")
+	case errors.Is(err, auth.ErrPasswordTooShort):
+		return fmt.Errorf("пароль должен быть не короче %d символов", auth.MinPasswordLen)
 	}
-	if len([]rune(pw)) < minPanelPasswordLen {
-		return fmt.Errorf("пароль должен быть не короче %d символов", minPanelPasswordLen)
-	}
-	return nil
+	return err
 }
 
 // acmeProviderTitle names the CA in the summaries.
@@ -570,7 +576,12 @@ func (w *WizardModel) enterStage(s stage) tea.Cmd {
 	case stageFilters:
 		w.cursor = filterPresetCursor(w.cfg)
 	case stagePanel:
-		w.openInput(inputPanelEnabled, "")
+		// Re-entering an already configured step is passive: the stored
+		// hash survives д and Enter, and only an explicit «н» turns the
+		// panel off. A step that is still off keeps the full question.
+		if !w.cfg.Panel.Enabled {
+			w.openInput(inputPanelEnabled, "")
+		}
 	}
 	return nil
 }
@@ -700,8 +711,9 @@ func (w WizardModel) commitInput() (tea.Model, tea.Cmd) {
 		return w, nil
 
 	case w.inputTarget == inputPanelPassword:
-		// The password is taken verbatim: trimming it would hide a
-		// typo in a field whose content is not echoed.
+		// The password is taken verbatim: the field is masked, so a
+		// surrounding blank would be invisible, and validPanelPassword
+		// rejects it rather than trimming it away.
 		if err := validPanelPassword(w.input); err != nil {
 			w.err = err
 			return w, nil
@@ -1157,7 +1169,11 @@ func (w WizardModel) View() string {
 		b.WriteString("\n")
 	case stagePanel:
 		b.WriteString("Веб-панель управления: графический интерфейс в браузере.\n")
-		b.WriteString("Логин admin, пароль задаётся здесь и хранится только как хэш.\n")
+		if w.cfg.Panel.Enabled {
+			b.WriteString("Веб-панель: включена, пароль сохранён (смена пароля — в самой панели)\n")
+		} else {
+			b.WriteString("Логин admin, пароль задаётся здесь и хранится только как хэш.\n")
+		}
 		b.WriteString(dimStyle.Render("Панель будет доступна на https://" + w.cfg.Domain + "/"))
 		b.WriteString("\n")
 	case stageSummary:
@@ -1190,7 +1206,7 @@ func (w WizardModel) View() string {
 
 	if w.inputActive {
 		b.WriteString("\n")
-		b.WriteString(titleStyle.Render(inputPrompt(w.inputTarget)) + " " + w.input + "▏")
+		b.WriteString(titleStyle.Render(inputPrompt(w.inputTarget)) + " " + maskInput(w.inputTarget, w.input) + "▏")
 		b.WriteString("\n")
 	}
 	if w.err != nil {
@@ -1202,6 +1218,16 @@ func (w WizardModel) View() string {
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("enter — выбор · n — далее · esc — назад · ctrl+c — выход"))
 	return b.String()
+}
+
+// maskInput renders the open input line. The panel password and its
+// confirmation are secrets, so they are shown as bullets; every other
+// input is echoed verbatim.
+func maskInput(target, value string) string {
+	if target == inputPanelPassword || target == inputPanelConfirm {
+		return strings.Repeat("•", utf8.RuneCountInString(value))
+	}
+	return value
 }
 
 // inputPrompt names the open input.
@@ -1226,7 +1252,7 @@ func inputPrompt(target string) string {
 	case target == inputPanelEnabled:
 		return "Включить веб-панель управления? (д/н):"
 	case target == inputPanelPassword:
-		return fmt.Sprintf("Пароль администратора (не короче %d символов):", minPanelPasswordLen)
+		return fmt.Sprintf("Пароль администратора (не короче %d символов):", auth.MinPasswordLen)
 	case target == inputPanelConfirm:
 		return "Повторите пароль:"
 	case strings.HasPrefix(target, "port:"):
