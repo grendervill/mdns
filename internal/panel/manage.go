@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -25,6 +27,7 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/dnsname"
 	"mydns/internal/filter"
+	"mydns/internal/providers"
 	"mydns/internal/tlscert"
 )
 
@@ -98,10 +101,20 @@ func okMessage(key string) string {
 	switch key {
 	case "upstream":
 		return "upstream переключён"
+	case "upstream-added":
+		return "upstream добавлен"
+	case "upstream-removed":
+		return "upstream удалён"
+	case "strategy":
+		return "стратегия сохранена"
 	case "priority":
 		return "порядок сохранён"
 	case "lists":
 		return "обновление запущено"
+	case "list-added":
+		return "список добавлен"
+	case "list-removed":
+		return "список удалён"
 	case "mode":
 		return "режим применён"
 	case "rule":
@@ -214,14 +227,24 @@ type upstreamRow struct {
 	Errors     string
 }
 
+// endpointOption is one reachable provider endpoint in the catalog
+// picker. Value is the "providerID|transport" pair the add form posts;
+// Label is the human-readable provider, transport and address.
+type endpointOption struct {
+	Value string
+	Label string
+}
+
 // upstreamsView is the whole upstreams page.
 type upstreamsView struct {
 	manageNotice
-	Domain    string
-	CSRF      string
-	Nav       string
-	Strategy  string
-	Upstreams []upstreamRow
+	Domain          string
+	CSRF            string
+	Nav             string
+	Strategy        string
+	StrategyOptions []strategyOption
+	Endpoints       []endpointOption
+	Upstreams       []upstreamRow
 }
 
 // upstreamRowFor renders one upstream: the config supplies the identity
@@ -276,11 +299,14 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 		Domain:       p.pageDomain(),
 		CSRF:         p.manageCSRF(r),
 		Nav:          "upstreams",
+		Endpoints:    endpointOptions(),
 	}
 
+	strategy := ""
 	cfg := p.currentConfig()
 	if cfg != nil {
-		view.Strategy = cfg.Strategy
+		strategy = cfg.Strategy
+		view.Strategy = strategy
 		st := p.statusSnapshot(r)
 		live := make(map[string]api.UpstreamStatus, len(st.Upstreams))
 		for _, u := range st.Upstreams {
@@ -291,8 +317,138 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 			view.Upstreams = append(view.Upstreams, upstreamRowFor(u, live[u.ID]))
 		}
 	}
+	view.StrategyOptions = strategyOptions(strategy)
 
 	p.render(w, status, "upstreams", view)
+}
+
+// endpointOptions builds the catalog picker from the provider catalog,
+// one entry per provider and transport (the first endpoint of each, in
+// the catalog's DoH, DoT, DoQ, plain order), so every option value is
+// unique and the order is stable.
+func endpointOptions() []endpointOption {
+	var out []endpointOption
+	for _, prov := range providers.List() {
+		seen := make(map[string]bool)
+		for _, e := range prov.AllEndpoints() {
+			if seen[e.Transport] {
+				continue
+			}
+			seen[e.Transport] = true
+			out = append(out, endpointOption{
+				Value: prov.ID + "|" + e.Transport,
+				Label: fmt.Sprintf("%s — %s · %s", prov.Name, transportLabel(e.Transport), e.Address),
+			})
+		}
+	}
+	return out
+}
+
+// transportLabel is the prose name of an upstream transport.
+func transportLabel(transport string) string {
+	switch transport {
+	case "doh":
+		return "DoH"
+	case "dot":
+		return "DoT"
+	case "doq":
+		return "DoQ"
+	default:
+		return "plain"
+	}
+}
+
+// validStrategy reports whether name is one of the routing strategies
+// the config accepts.
+func validStrategy(name string) bool {
+	for _, s := range strategies {
+		if s.value == name {
+			return true
+		}
+	}
+	return false
+}
+
+// knownTransport reports whether transport is one of the upstream
+// transports the config accepts.
+func knownTransport(transport string) bool {
+	for _, f := range protocolFields {
+		if f.field == transport {
+			return true
+		}
+	}
+	return false
+}
+
+// nextPriority is one past the highest existing priority, so a new
+// upstream sorts last under the failover strategy. An empty list yields 0.
+func nextPriority(upstreams []config.UpstreamConfig) int {
+	highest := -1
+	for _, u := range upstreams {
+		if u.Priority > highest {
+			highest = u.Priority
+		}
+	}
+	return highest + 1
+}
+
+// uniqueUpstreamID picks a free ID for a new upstream: the provider ID
+// when it is free, then provider-transport, then a numbered suffix.
+func uniqueUpstreamID(upstreams []config.UpstreamConfig, providerID, transport string) string {
+	taken := make(map[string]bool, len(upstreams))
+	for _, u := range upstreams {
+		taken[u.ID] = true
+	}
+	if !taken[providerID] {
+		return providerID
+	}
+	candidate := providerID + "-" + transport
+	if !taken[candidate] {
+		return candidate
+	}
+	for i := 2; ; i++ {
+		candidate = fmt.Sprintf("%s-%s-%d", providerID, transport, i)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
+}
+
+// upstreamIDFromAddress derives a slug ID from an upstream address when
+// the custom form leaves the ID empty: the URL host for DoH, the host of
+// a host:port for the other transports.
+func upstreamIDFromAddress(address string) string {
+	host := address
+	if u, err := url.Parse(address); err == nil && u.Host != "" {
+		host = u.Hostname()
+	} else if h, _, err := net.SplitHostPort(address); err == nil {
+		host = h
+	}
+	slug := slugID(host)
+	if slug == "" {
+		slug = "upstream"
+	}
+	return slug
+}
+
+// slugID lowercases s and keeps only [a-z0-9], turning every other run
+// of characters into a single dash; leading and trailing dashes go.
+func slugID(s string) string {
+	var b strings.Builder
+	pendingDash := false
+	for _, r := range strings.ToLower(s) {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			if pendingDash && b.Len() > 0 {
+				b.WriteByte('-')
+			}
+			pendingDash = false
+			b.WriteRune(r)
+		default:
+			pendingDash = true
+		}
+	}
+	return b.String()
 }
 
 // handleUpstreamToggle flips one upstream's enabled flag. The whole
@@ -307,19 +463,36 @@ func (p *Panel) handleUpstreamToggle(w http.ResponseWriter, r *http.Request) {
 
 	id := strings.TrimSpace(r.PostFormValue("id"))
 	next := cloneConfig(cfg)
-	found := false
+	idx := -1
 	for i := range next.Upstreams {
 		if next.Upstreams[i].ID != id {
 			continue
 		}
-		next.Upstreams[i].Enabled = !next.Upstreams[i].Enabled
-		found = true
+		idx = i
 		break
 	}
-	if !found {
+	if idx < 0 {
 		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream не найден: " + id})
 		return
 	}
+
+	// Disabling the last enabled upstream would leave the daemon with
+	// nothing to forward to, exactly like removing it.
+	if next.Upstreams[idx].Enabled {
+		enabled := 0
+		for _, u := range next.Upstreams {
+			if u.Enabled {
+				enabled++
+			}
+		}
+		if enabled <= 1 {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+				Error: "нельзя выключить последний включённый upstream — демону будет некуда пересылать запросы",
+			})
+			return
+		}
+	}
+	next.Upstreams[idx].Enabled = !next.Upstreams[idx].Enabled
 
 	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
@@ -352,6 +525,189 @@ func (p *Panel) handleUpstreamPriority(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.finishApply(w, r, next, upstreamsPath+"?ok=priority", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamStrategy saves the routing strategy chosen on the
+// upstreams page. The known set is shared with the settings page, so the
+// two cannot disagree.
+func (p *Panel) handleUpstreamStrategy(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	strategy := strings.TrimSpace(r.PostFormValue("strategy"))
+	if !validStrategy(strategy) {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестная стратегия: " + strategy})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	next.Strategy = strategy
+	p.finishApply(w, r, next, upstreamsPath+"?ok=strategy", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamAdd adds one provider endpoint from the catalog. The
+// posted provider value is "providerID|transport"; the first endpoint of
+// that provider and transport supplies the address.
+func (p *Panel) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	providerID, transport, ok := strings.Cut(strings.TrimSpace(r.PostFormValue("provider")), "|")
+	prov, found := providers.ByID(providerID)
+	if !ok || providerID == "" || transport == "" || !found {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "выберите провайдера и транспорт"})
+		return
+	}
+
+	endpoint, found := providers.Endpoint{}, false
+	for _, e := range prov.AllEndpoints() {
+		if e.Transport == transport {
+			endpoint, found = e, true
+			break
+		}
+	}
+	if !found {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+			Error: fmt.Sprintf("у провайдера «%s» нет транспорта %s", prov.Name, transport),
+		})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	for _, u := range next.Upstreams {
+		if u.Transport == endpoint.Transport && u.Address == endpoint.Address {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+				Error: "этот upstream уже добавлен: " + endpoint.Address,
+			})
+			return
+		}
+	}
+
+	up := endpoint.UpstreamConfig(uniqueUpstreamID(next.Upstreams, prov.ID, endpoint.Transport), prov.Name)
+	up.Priority = nextPriority(next.Upstreams)
+	next.Upstreams = append(next.Upstreams, up)
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamCustom adds an upstream the admin types in. The ID is
+// optional (derived from the address host when empty); everything
+// semantic — the transport, the address shape — is left to
+// config.Validate, which UpdateConfig runs, so the page and the daemon
+// cannot disagree.
+func (p *Panel) handleUpstreamCustom(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	transport := strings.TrimSpace(r.PostFormValue("transport"))
+	address := strings.TrimSpace(r.PostFormValue("address"))
+	serverName := strings.TrimSpace(r.PostFormValue("server_name"))
+	rawPriority := strings.TrimSpace(r.PostFormValue("priority"))
+
+	if address == "" {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "укажите адрес upstream"})
+		return
+	}
+	if !knownTransport(transport) {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный транспорт: " + transport})
+		return
+	}
+
+	next := cloneConfig(cfg)
+	if id == "" {
+		id = uniqueUpstreamID(next.Upstreams, upstreamIDFromAddress(address), transport)
+	} else {
+		for _, u := range next.Upstreams {
+			if u.ID == id {
+				p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream с таким ID уже есть: " + id})
+				return
+			}
+		}
+	}
+
+	priority := nextPriority(next.Upstreams)
+	if rawPriority != "" {
+		n, err := strconv.Atoi(rawPriority)
+		if err != nil || n < 0 {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "приоритет: ожидается целое число не меньше нуля"})
+			return
+		}
+		priority = n
+	}
+
+	if name == "" {
+		name = id
+	}
+	next.Upstreams = append(next.Upstreams, config.UpstreamConfig{
+		ID:         id,
+		Name:       name,
+		Transport:  transport,
+		Address:    address,
+		ServerName: serverName,
+		Priority:   priority,
+		Enabled:    true,
+	})
+
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
+		p.renderUpstreams(w, r, status, n)
+	})
+}
+
+// handleUpstreamRemove drops one upstream. Removing the last enabled one
+// is refused: the daemon would have nothing to forward to.
+func (p *Panel) handleUpstreamRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	next := cloneConfig(cfg)
+	idx := -1
+	for i := range next.Upstreams {
+		if next.Upstreams[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream не найден: " + id})
+		return
+	}
+
+	enabled := 0
+	for _, u := range next.Upstreams {
+		if u.Enabled {
+			enabled++
+		}
+	}
+	if next.Upstreams[idx].Enabled && enabled <= 1 {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+			Error: "нельзя удалить последний включённый upstream — демону будет некуда пересылать запросы",
+		})
+		return
+	}
+
+	next.Upstreams = append(next.Upstreams[:idx], next.Upstreams[idx+1:]...)
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-removed", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
 }
@@ -414,11 +770,26 @@ func validFilterMode(mode string) bool {
 	return false
 }
 
-// ruleForm is the state of the «add a rule» form, echoed back when a
-// submission is rejected so the admin does not retype it.
-type ruleForm struct {
+// filtersForm is the state of the filters page's forms, echoed back when
+// a submission is rejected so the admin does not retype it: the add-rule
+// fields plus the custom-list ID and URL.
+type filtersForm struct {
 	Domain string
 	Kind   string
+
+	CustomID  string
+	CustomURL string
+}
+
+// catalogRow is one entry of the ready-made list catalog on the filters
+// page: the catalog metadata, the Russian category label and whether the
+// daemon already configures the list.
+type catalogRow struct {
+	ID          string
+	Name        string
+	Category    string
+	Description string
+	Added       bool
 }
 
 // filtersView is the whole filters page.
@@ -432,24 +803,28 @@ type filtersView struct {
 	ModeLabel    string
 	TotalBlocked string
 
-	Lists []filterListRow
-	Modes []filterModeOption
+	Lists   []filterListRow
+	Catalog []catalogRow
+	Modes   []filterModeOption
 
 	Allow []string
 	Block []string
 
 	AddDomain string
 	AddKind   string
+
+	CustomID  string
+	CustomURL string
 }
 
 // handleFilters renders the filters screen.
 func (p *Panel) handleFilters(w http.ResponseWriter, r *http.Request) {
-	p.renderFilters(w, r, http.StatusOK, notice(r), ruleForm{Kind: "block"})
+	p.renderFilters(w, r, http.StatusOK, notice(r), filtersForm{Kind: "block"})
 }
 
-// renderFilters renders the page with the current config, the engine's
-// per-list status and the add-rule form's state.
-func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form ruleForm) {
+// renderFilters renders the page with the current config, the catalog,
+// the engine's per-list status and the form state.
+func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form filtersForm) {
 	view := filtersView{
 		manageNotice: n,
 		Domain:       p.pageDomain(),
@@ -457,32 +832,193 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		Nav:          "filters",
 		AddDomain:    form.Domain,
 		AddKind:      form.Kind,
+		CustomID:     form.CustomID,
+		CustomURL:    form.CustomURL,
 	}
 
+	loc := p.location()
+	cfg := p.currentConfig()
 	mode := "zero"
-	if cfg := p.currentConfig(); cfg != nil {
+	added := make(map[string]bool)
+	if cfg != nil {
 		view.Enabled = cfg.Filter.Enabled
 		mode = cfg.Filter.Mode
 		view.Allow = cfg.Filter.UserAllow
 		view.Block = cfg.Filter.UserBlock
+		for _, l := range cfg.Filter.Lists {
+			added[l.ID] = true
+		}
 	}
 	view.ModeLabel = filterModeLabel(mode)
 	view.Modes = filterModeOptions(mode)
+	for _, e := range filter.Catalog() {
+		view.Catalog = append(view.Catalog, catalogRow{
+			ID:          e.ID,
+			Name:        e.Name,
+			Category:    listCategoryLabel(e.Category),
+			Description: e.Description,
+			Added:       added[e.ID],
+		})
+	}
 
+	// The table shows the configured lists, in config order, so a list the
+	// updater has not reported yet (a fresh addition, or a daemon that is
+	// not there) still appears with a placeholder state and its refresh
+	// control. A status entry the config no longer carries is stale and is
+	// dropped, and a status the config does carry wins over the placeholder.
+	live := make(map[string]filter.ListStatus)
 	if p.ctrl != nil {
 		if st := p.statusSnapshot(r); st.Filter.TotalBlocked > 0 {
 			view.TotalBlocked = formatCount(st.Filter.TotalBlocked)
 		}
 		for _, l := range p.ctrl.FilterStatus() {
-			view.Lists = append(view.Lists, filterListRowFor(l))
+			live[l.ID] = l
+		}
+	}
+	if cfg != nil {
+		view.Lists = make([]filterListRow, 0, len(cfg.Filter.Lists))
+		for _, l := range cfg.Filter.Lists {
+			if st, ok := live[l.ID]; ok {
+				view.Lists = append(view.Lists, filterListRowFor(st, loc))
+				continue
+			}
+			view.Lists = append(view.Lists, filterListRow{
+				ID:         l.ID,
+				Rules:      formatCount(0),
+				Skipped:    formatCount(0),
+				Updated:    "—",
+				StateClass: "warn",
+				StateText:  "не загружен",
+			})
 		}
 	}
 
 	p.render(w, status, "filters", view)
 }
 
-// filterListRowFor renders one list's live state.
-func filterListRowFor(l filter.ListStatus) filterListRow {
+// listCategoryLabel is the Russian label of a catalog category.
+func listCategoryLabel(category string) string {
+	switch category {
+	case "ads":
+		return "реклама и трекеры"
+	case "combined":
+		return "комбинированные"
+	default:
+		return category
+	}
+}
+
+// hasFilterList reports whether id is already configured.
+func hasFilterList(lists []config.FilterList, id string) bool {
+	for _, l := range lists {
+		if l.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// validListSlug reports whether id is a usable custom-list ID: a
+// lowercase slug [a-z0-9][a-z0-9-]{0,47}.
+func validListSlug(id string) bool {
+	if id == "" || len(id) > 48 {
+		return false
+	}
+	for i, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+		case r == '-' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// handleFilterListAdd appends a ready-made catalog list (id) or a custom
+// list (custom_id + custom_url) to the block-list configuration. An
+// empty URL marks a catalog list, which the engine resolves by ID.
+func (p *Panel) handleFilterListAdd(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+
+	form := filtersForm{
+		Kind:      "block",
+		CustomID:  strings.TrimSpace(r.PostFormValue("custom_id")),
+		CustomURL: strings.TrimSpace(r.PostFormValue("custom_url")),
+	}
+	id := strings.TrimSpace(r.PostFormValue("id"))
+
+	next := cloneConfig(cfg)
+	var list config.FilterList
+	if id != "" {
+		if _, ok := filter.EntryByID(id); !ok {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный список: " + id}, form)
+			return
+		}
+		if hasFilterList(next.Filter.Lists, id) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список уже добавлен: " + id}, form)
+			return
+		}
+		list = config.FilterList{ID: id}
+	} else {
+		if !validListSlug(form.CustomID) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{
+				Error: "ID списка: строчные латинские буквы, цифры и дефис, до 48 символов",
+			}, form)
+			return
+		}
+		if hasFilterList(next.Filter.Lists, form.CustomID) {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список уже добавлен: " + form.CustomID}, form)
+			return
+		}
+		u, err := url.Parse(form.CustomURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "URL списка должен быть https-ссылкой с хостом"}, form)
+			return
+		}
+		list = config.FilterList{ID: form.CustomID, URL: form.CustomURL}
+	}
+
+	next.Filter.Lists = append(next.Filter.Lists, list)
+	p.finishApply(w, r, next, filtersPath+"?ok=list-added", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, form)
+	})
+}
+
+// handleFilterListRemove drops one configured list and nothing else.
+func (p *Panel) handleFilterListRemove(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	next := cloneConfig(cfg)
+	if !hasFilterList(next.Filter.Lists, id) {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "список не найден: " + id}, filtersForm{Kind: "block"})
+		return
+	}
+	kept := make([]config.FilterList, 0, len(next.Filter.Lists))
+	for _, l := range next.Filter.Lists {
+		if l.ID != id {
+			kept = append(kept, l)
+		}
+	}
+	next.Filter.Lists = kept
+
+	p.finishApply(w, r, next, filtersPath+"?ok=list-removed", func(status int, n manageNotice) {
+		p.renderFilters(w, r, status, n, filtersForm{Kind: "block"})
+	})
+}
+
+// filterListRowFor renders one list's live state. The update time is
+// shown in loc, the panel's configured zone, like every other time.
+func filterListRowFor(l filter.ListStatus, loc *time.Location) filterListRow {
 	row := filterListRow{
 		ID:      l.ID,
 		Rules:   formatCount(uint64(l.Applied)),
@@ -490,7 +1026,7 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 		Updated: "—",
 	}
 	if !l.UpdatedAt.IsZero() {
-		row.Updated = l.UpdatedAt.Format("02.01 15:04:05")
+		row.Updated = l.UpdatedAt.In(loc).Format("02.01 15:04:05")
 	}
 
 	switch {
@@ -512,7 +1048,13 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 // POST while the update runs is refused with a banner.
 func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	if p.ctrl == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+	// With filtering off there is no engine to update: claiming a refresh
+	// started would be a lie the next page load contradicts.
+	if cfg := p.currentConfig(); cfg == nil || !cfg.Filter.Enabled {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "фильтрация выключена"}, filtersForm{Kind: "block"})
 		return
 	}
 
@@ -536,7 +1078,7 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 	if !started {
 		p.renderFilters(w, r, http.StatusConflict,
-			manageNotice{Error: "обновление уже идёт"}, ruleForm{Kind: "block"})
+			manageNotice{Error: "обновление уже идёт"}, filtersForm{Kind: "block"})
 		return
 	}
 	http.Redirect(w, r, filtersPath+"?ok=lists", http.StatusSeeOther)
@@ -546,20 +1088,20 @@ func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterMode(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	mode := strings.TrimSpace(r.PostFormValue("mode"))
 	if !validFilterMode(mode) {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный режим блокировки: " + mode}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный режим блокировки: " + mode}, filtersForm{Kind: "block"})
 		return
 	}
 
 	next := cloneConfig(cfg)
 	next.Filter.Mode = mode
 	p.finishApply(w, r, next, filtersPath+"?ok=mode", func(status int, n manageNotice) {
-		p.renderFilters(w, r, status, n, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, status, n, filtersForm{Kind: "block"})
 	})
 }
 
@@ -567,13 +1109,13 @@ func (p *Panel) handleFilterMode(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterRuleAdd(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	kind := r.PostFormValue("kind")
 	raw := strings.TrimSpace(r.PostFormValue("domain"))
-	form := ruleForm{Domain: raw, Kind: kind}
+	form := filtersForm{Domain: raw, Kind: kind}
 	if kind != "allow" && kind != "block" {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
 		return
@@ -606,13 +1148,13 @@ func (p *Panel) handleFilterRuleAdd(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) handleFilterRuleRemove(w http.ResponseWriter, r *http.Request) {
 	cfg := p.currentConfig()
 	if cfg == nil {
-		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, ruleForm{Kind: "block"})
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
 		return
 	}
 
 	kind := r.PostFormValue("kind")
 	domain := dnsname.Normalize(strings.TrimSpace(r.PostFormValue("domain")))
-	form := ruleForm{Domain: domain, Kind: kind}
+	form := filtersForm{Domain: domain, Kind: kind}
 	if kind != "allow" && kind != "block" {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "неизвестный тип правила: " + kind}, form)
 		return
@@ -722,8 +1264,9 @@ type settingsView struct {
 	CSRF   string
 	Nav    string
 
-	FormDomain string
-	Strategies []strategyOption
+	FormDomain   string
+	FormTimezone string
+	Strategies   []strategyOption
 
 	Protocols []protocolRow
 
@@ -739,6 +1282,7 @@ type settingsView struct {
 func settingsFromConfig(cfg *config.Config) settingsView {
 	view := settingsView{
 		FormDomain:     cfg.Domain,
+		FormTimezone:   cfg.Timezone,
 		CacheSize:      strconv.Itoa(cfg.Cache.Size),
 		CacheMinTTL:    strconv.FormatUint(uint64(cfg.Cache.MinTTL), 10),
 		CacheMaxTTL:    strconv.FormatUint(uint64(cfg.Cache.MaxTTL), 10),
@@ -767,6 +1311,7 @@ func settingsFromConfig(cfg *config.Config) settingsView {
 func settingsFromForm(r *http.Request) settingsView {
 	view := settingsView{
 		FormDomain:     r.PostFormValue("domain"),
+		FormTimezone:   strings.TrimSpace(r.PostFormValue("timezone")),
 		Strategies:     strategyOptions(strings.TrimSpace(r.PostFormValue("strategy"))),
 		CacheSize:      strings.TrimSpace(r.PostFormValue("cache.size")),
 		CacheMinTTL:    strings.TrimSpace(r.PostFormValue("cache.min_ttl")),
@@ -840,6 +1385,11 @@ func applySettingsForm(next *config.Config, r *http.Request) error {
 		return errors.New("домен не может быть пустым")
 	}
 	next.Domain = domain
+
+	// The timezone is left unvalidated here: an unknown IANA zone is a
+	// semantic error config.Validate reports, so the page and the daemon
+	// cannot disagree.
+	next.Timezone = strings.TrimSpace(r.PostFormValue("timezone"))
 
 	for _, f := range protocolFields {
 		port, err := formInt(r, f.field+".port")
@@ -1075,7 +1625,7 @@ func (p *Panel) renderMaintenance(w http.ResponseWriter, r *http.Request, status
 	}
 	if p.ctrl != nil {
 		if started := p.ctrl.Started(); !started.IsZero() {
-			view.Started = started.Format("02.01.2006 15:04:05")
+			view.Started = started.In(p.location()).Format("02.01.2006 15:04:05")
 			view.Uptime = formatUptime(time.Since(started))
 		}
 	}

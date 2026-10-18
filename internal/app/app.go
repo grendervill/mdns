@@ -262,6 +262,13 @@ type App struct {
 	// wireEvents.
 	collector *stats.Collector
 
+	// statsPath is where the collector's history is persisted (under
+	// DataDir); empty disables persistence.
+	statsPath string
+	// statsDone is closed by saveStatsLoop when it returns, so Stop can
+	// join the periodic writer before its own final Save.
+	statsDone chan struct{}
+
 	// started is the time the app was constructed, reported as the
 	// stats "since". New is where a daemon run begins.
 	started time.Time
@@ -305,6 +312,14 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		bus:       bus,
 		collector: stats.NewCollector(),
 		started:   time.Now(),
+	}
+	if cfgCopy.DataDir != "" {
+		a.statsPath = filepath.Join(cfgCopy.DataDir, "stats.json")
+		// A broken history file is not fatal: the daemon keeps running
+		// with empty history rather than refusing to start.
+		if err := a.collector.Load(a.statsPath); err != nil {
+			logger.Warn("app: loading the query statistics history", "error", err)
+		}
 	}
 	a.wireEvents(rt)
 
@@ -355,6 +370,8 @@ func (a *App) Start(ctx context.Context) error {
 	}
 
 	go a.publishUpstreams(appCtx)
+	a.statsDone = make(chan struct{})
+	go a.saveStatsLoop(appCtx, a.statsDone)
 	return nil
 }
 
@@ -369,7 +386,29 @@ func (a *App) Stop(ctx context.Context) error {
 		a.cancel = nil
 	}
 
+	// End the panel's open SSE streams first: Shutdown does not cancel
+	// handler contexts, so a live /panel/events stream would otherwise
+	// make the stop wait for its timeout. The panel outlives the
+	// runtime, but its streams must end with it.
+	a.panel.EndStreams()
 	err := a.rt.stop(ctx)
+
+	// Join the periodic saver before saving for the last time: the two
+	// writers would otherwise race on the same file, and the final Save
+	// must be the last word.
+	if a.statsDone != nil {
+		select {
+		case <-a.statsDone:
+		case <-ctx.Done():
+		}
+		a.statsDone = nil
+	}
+
+	// Persist the statistics history once on the way out. A failure is
+	// logged, never returned: the daemon must stop regardless.
+	if serr := a.collector.Save(a.statsPath); serr != nil {
+		a.logger.Warn("app: saving the query statistics history", "error", serr)
+	}
 
 	// Wait for the control API goroutine so its socket is gone by the
 	// time Stop returns.
@@ -451,6 +490,12 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	defer cancel()
 
 	oldRT := a.rt
+	// End the panel's open SSE streams before stopping the runtime.
+	// http.Server.Shutdown does not cancel handler contexts, so a live
+	// /panel/events stream would hold the old listeners open until the
+	// stop timeout instead of returning at once. The panel itself
+	// outlives the generation; only its streams must end.
+	a.panel.EndStreams()
 	if err := oldRT.stop(stopCtx); err != nil {
 		a.logger.Warn("app: stopping the old listeners", "error", err)
 	}

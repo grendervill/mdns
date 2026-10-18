@@ -111,6 +111,13 @@ func (a *App) Requests(n int) []qlog.Entry {
 // whole run of the daemon.
 func (a *App) Stats() stats.Snapshot { return a.collector.Snapshot() }
 
+// StatsRange returns the query statistics summed over the whole UTC days
+// in [from, to] inclusive; a zero bound is open. The panel builds the
+// period diagrams from it while the gauges keep the cumulative Snapshot.
+func (a *App) StatsRange(from, to time.Time) stats.Snapshot {
+	return a.collector.SnapshotRange(from, to)
+}
+
 // Started implements api.Controller: the time the app was constructed,
 // which the API reports as the stats "since".
 func (a *App) Started() time.Time { return a.started }
@@ -203,6 +210,34 @@ func (a *App) startAPI(ctx context.Context) error {
 		}
 	}()
 	return nil
+}
+
+// statsSaveInterval paces the periodic persistence of the statistics
+// history. Stop also saves once, so a clean shutdown never loses more
+// than this interval of observations.
+const statsSaveInterval = 30 * time.Second
+
+// saveStatsLoop persists the cumulative counters and the daily history
+// on a ticker until ctx ends. A failed write is logged and the loop
+// keeps going: persistence is a convenience, not a correctness
+// requirement for the live daemon. It closes done on the way out, so
+// Stop can join it before the final Save.
+func (a *App) saveStatsLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+
+	ticker := time.NewTicker(statsSaveInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := a.collector.Save(a.statsPath); err != nil {
+				a.logger.Warn("app: saving the query statistics history", "error", err)
+			}
+		}
+	}
 }
 
 // publishUpstreams pushes upstream snapshots to the bus every second

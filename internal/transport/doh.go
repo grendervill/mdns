@@ -36,6 +36,12 @@ type DoH struct {
 // addressed by IP. cfg.InsecureSkipVerify passes through for
 // self-signed upstreams.
 func newDoH(cfg config.UpstreamConfig) *DoH {
+	return newDoHWithResolver(cfg, defaultResolver)
+}
+
+// newDoHWithResolver is newDoH with the hostname resolver injected, so
+// tests can resolve the URL's host without real DNS.
+func newDoHWithResolver(cfg config.UpstreamConfig, resolver *bootstrapResolver) *DoH {
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	}
@@ -48,6 +54,7 @@ func newDoH(cfg config.UpstreamConfig) *DoH {
 		Transport: &http.Transport{
 			ForceAttemptHTTP2: true,
 			TLSClientConfig:   tlsCfg,
+			DialContext:       resolver.dialContext,
 		},
 	}
 	return &DoH{url: cfg.Address, client: client}

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"mydns/internal/dnsname"
 )
@@ -180,8 +181,12 @@ type PanelConfig struct {
 // Config is the versioned server configuration, stored as JSON with
 // 0600 permissions.
 type Config struct {
-	Version   int              `json:"version"`
-	Domain    string           `json:"domain"`
+	Version int    `json:"version"`
+	Domain  string `json:"domain"`
+	// Timezone is the IANA zone the panel renders query times in. An
+	// empty value means the daemon's local zone. It never affects the
+	// stored timestamps, only how they are displayed.
+	Timezone  string           `json:"timezone,omitempty"`
 	Protocols Protocols        `json:"protocols"`
 	TLS       TLS              `json:"tls"`
 	Upstreams []UpstreamConfig `json:"upstreams"`
@@ -280,9 +285,10 @@ func (c *Config) applyDefaults() {
 
 // Validate checks the config for consistency: domain shape, port ranges,
 // known strategy and TLS mode (including the ACME settings when that
-// mode is selected), upstream fields, data directory, the filter
-// settings and the panel password. Disabled upstreams are exempt from
-// address validation, as is the panel password when the panel is off.
+// mode is selected), the IANA timezone when one is set, upstream fields,
+// data directory, the filter settings and the panel password. Disabled
+// upstreams are exempt from address validation, as is the panel password
+// when the panel is off.
 func (c *Config) Validate() error {
 	if c.Domain == "" {
 		return errors.New("domain must not be empty")
@@ -292,6 +298,12 @@ func (c *Config) Validate() error {
 	}
 	if strings.ContainsAny(c.Domain, " \t\r\n") {
 		return errors.New("domain must not contain whitespace")
+	}
+
+	if c.Timezone != "" {
+		if _, err := time.LoadLocation(c.Timezone); err != nil {
+			return fmt.Errorf("timezone: cannot load IANA zone %q", c.Timezone)
+		}
 	}
 
 	for _, p := range []struct {

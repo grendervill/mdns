@@ -18,6 +18,46 @@
     </div>
     {{template "notice" .}}
 
+    <h3>Стратегия</h3>
+    <form method="post" action="/panel/upstreams/strategy" class="inline-form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <select class="ctl" name="strategy" aria-label="Стратегия">
+        {{range .StrategyOptions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+      <button class="btn" type="submit">Применить</button>
+      <span class="hint">failover идёт по приоритету: меньше число — раньше выбор.</span>
+    </form>
+
+    <h3>Добавить из каталога</h3>
+    <form method="post" action="/panel/upstreams/add" class="searchrow">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <select class="ctl grow" name="provider" aria-label="Провайдер и транспорт">
+        {{range .Endpoints}}<option value="{{.Value}}">{{.Label}}</option>{{end}}
+      </select>
+      <button class="btn primary" type="submit">Добавить</button>
+    </form>
+
+    <h3>Свой upstream</h3>
+    <form method="post" action="/panel/upstreams/custom">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>ID (необязательно)</span><input class="ctl" type="text" name="id" spellcheck="false"></label>
+        <label class="field"><span>Название</span><input class="ctl" type="text" name="name"></label>
+        <label class="field"><span>Транспорт</span>
+          <select class="ctl" name="transport">
+            <option value="plain">plain</option>
+            <option value="dot">dot</option>
+            <option value="doh">doh</option>
+            <option value="doq">doq</option>
+          </select>
+        </label>
+        <label class="field"><span>Адрес</span><input class="ctl" type="text" name="address" placeholder="1.1.1.1:53 или https://host/dns-query" spellcheck="false"></label>
+        <label class="field"><span>ServerName (для DoT/DoQ по IP)</span><input class="ctl" type="text" name="server_name" spellcheck="false"></label>
+        <label class="field"><span>Приоритет</span><input class="ctl num-input" type="number" name="priority" min="0" max="99" placeholder="авто"></label>
+      </div>
+      <p class="row-actions"><button class="btn primary" type="submit">Добавить upstream</button></p>
+    </form>
+
     {{if .Upstreams}}
     <form method="post" action="/panel/upstreams/priority">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -40,7 +80,10 @@
               <td class="num">{{.Answered}}</td>
               <td class="num">{{.Errors}}</td>
               <td><input class="ctl num-input" type="number" name="prio.{{.ID}}" value="{{.Priority}}" min="0" max="99" aria-label="Приоритет {{.Name}}"></td>
-              <td><button class="btn small" type="submit" formaction="/panel/upstreams/toggle" name="id" value="{{.ID}}">{{.Action}}</button></td>
+              <td>
+                <button class="btn small" type="submit" formaction="/panel/upstreams/toggle" name="id" value="{{.ID}}">{{.Action}}</button>
+                <button class="btn small" type="submit" formaction="/panel/upstreams/remove" name="id" value="{{.ID}}">Удалить</button>
+              </td>
             </tr>
             {{end}}
           </tbody>
@@ -81,6 +124,34 @@
     {{template "notice" .}}
     {{if not .Enabled}}<p class="note">Фильтрация выключена — включите её в «Настройках».</p>{{end}}
 
+    <h3>Готовые списки <span class="sub">— с публичных реестров, без скачивания вручную</span></h3>
+    <div class="cards">
+      {{range .Catalog}}
+      <div class="card">
+        <div class="k">{{.Name}} · <span class="muted">{{.Category}}</span></div>
+        <p class="hint">{{.Description}}</p>
+        <form method="post" action="/panel/filters/lists/{{if .Added}}remove{{else}}add{{end}}">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="id" value="{{.ID}}">
+          <p class="row-actions">
+            <button class="btn small" type="submit"{{if not $.Enabled}} disabled{{end}}>{{if .Added}}Убрать{{else}}Добавить{{end}}</button>
+            {{if not $.Enabled}}<span class="hint">Фильтрация выключена</span>{{end}}
+          </p>
+        </form>
+      </div>
+      {{end}}
+    </div>
+
+    <h3>Свой список</h3>
+    <form method="post" action="/panel/filters/lists/add">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <div class="formgrid">
+        <label class="field"><span>ID списка</span><input class="ctl" type="text" name="custom_id" value="{{.CustomID}}" placeholder="my-list" spellcheck="false"></label>
+        <label class="field"><span>URL (https)</span><input class="ctl" type="url" name="custom_url" value="{{.CustomURL}}" placeholder="https://example.com/hosts.txt" spellcheck="false"></label>
+      </div>
+      <p class="row-actions"><button class="btn primary" type="submit">Добавить список</button></p>
+    </form>
+
     <h3>Списки <span class="sub">— обновить один или все</span></h3>
     <form method="post" action="/panel/filters/refresh">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
@@ -97,7 +168,7 @@
               <td class="num">{{.Skipped}}</td>
               <td class="num">{{.Updated}}</td>
               <td>{{if .Title}}<span class="tag {{.StateClass}}" title="{{.Title}}">{{.StateText}}</span>{{else}}<span class="tag {{.StateClass}}">{{.StateText}}</span>{{end}}</td>
-              <td><button class="btn small" type="submit" name="id" value="{{.ID}}">Обновить</button></td>
+              <td><button class="btn small" type="submit" name="id" value="{{.ID}}"{{if not $.Enabled}} disabled{{end}}>Обновить</button></td>
             </tr>
             {{end}}
             {{if not .Lists}}
@@ -106,7 +177,7 @@
           </tbody>
         </table>
       </div>
-      <p class="row-actions"><button class="btn" type="submit" name="id" value="">Обновить все</button></p>
+      <p class="row-actions"><button class="btn" type="submit" name="id" value=""{{if not .Enabled}} disabled{{end}}>Обновить все</button></p>
     </form>
 
     <h3>Режим блокировки</h3>
@@ -178,6 +249,22 @@
             {{range .Strategies}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
           </select>
         </label>
+        <label class="field"><span>Часовой пояс</span>
+          <input class="ctl" type="text" name="timezone" value="{{.FormTimezone}}" list="tz-zones" placeholder="Europe/Moscow" spellcheck="false" autocomplete="off">
+          <span class="hint">IANA-зона, пусто — системная</span>
+        </label>
+        <datalist id="tz-zones">
+          <option value="Europe/Moscow"></option>
+          <option value="Europe/London"></option>
+          <option value="Europe/Berlin"></option>
+          <option value="Europe/Kyiv"></option>
+          <option value="Asia/Almaty"></option>
+          <option value="Asia/Tbilisi"></option>
+          <option value="Asia/Yerevan"></option>
+          <option value="Asia/Dubai"></option>
+          <option value="America/New_York"></option>
+          <option value="UTC"></option>
+        </datalist>
         <label class="field"><span>Размер кеша, записей</span><input class="ctl" type="number" name="cache.size" value="{{.CacheSize}}" min="1"></label>
         <label class="field"><span>Кеш: min TTL, с</span><input class="ctl" type="number" name="cache.min_ttl" value="{{.CacheMinTTL}}" min="0"></label>
         <label class="field"><span>Кеш: max TTL, с</span><input class="ctl" type="number" name="cache.max_ttl" value="{{.CacheMaxTTL}}" min="0"></label>
@@ -205,7 +292,8 @@
       </p>
     </form>
 
-    <h3>Сменить пароль</h3>
+    <h3>Пароль веб-панели</h3>
+    <p class="hint">Пароль для входа в панель меняется здесь.</p>
     <form method="post" action="/panel/settings/password">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <div class="formgrid">

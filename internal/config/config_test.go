@@ -725,3 +725,88 @@ func TestPanelRoundTrip(t *testing.T) {
 		t.Errorf("panel after round-trip = %+v, want %+v", loaded.Panel, c.Panel)
 	}
 }
+
+// TestTimezoneValidation pins the configurable display zone: a loadable
+// IANA name is accepted, an unloadable one is rejected with an error that
+// names the field and the zone, and an empty value means "daemon local".
+func TestTimezoneValidation(t *testing.T) {
+	t.Run("Europe/Moscow is accepted", func(t *testing.T) {
+		c := validConfig()
+		c.Timezone = "Europe/Moscow"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil for Europe/Moscow", err)
+		}
+	})
+
+	t.Run("an unknown zone names the field and the zone", func(t *testing.T) {
+		c := validConfig()
+		c.Timezone = "Mars/Base"
+		err := c.Validate()
+		if err == nil {
+			t.Fatal("Validate() = nil, want an error for Mars/Base")
+		}
+		if !strings.Contains(err.Error(), "timezone") {
+			t.Errorf("error %q does not name the timezone field", err)
+		}
+		if !strings.Contains(err.Error(), "Mars/Base") {
+			t.Errorf("error %q does not name the rejected zone", err)
+		}
+	})
+
+	t.Run("empty means the daemon local zone", func(t *testing.T) {
+		c := validConfig()
+		if c.Timezone != "" {
+			t.Fatalf("Default().Timezone = %q, want empty", c.Timezone)
+		}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want nil with an empty timezone", err)
+		}
+	})
+
+	t.Run("an old config without the key still validates", func(t *testing.T) {
+		// A config written before the timezone field existed: no
+		// timezone, no data_dir, no filter section.
+		path := filepath.Join(t.TempDir(), "old.json")
+		old := `{
+  "version": 1,
+  "domain": "dns.example.com",
+  "tls": {"mode": "self-signed"},
+  "strategy": "fastest",
+  "cache": {"size": 100, "min_ttl": 0, "max_ttl": 3600},
+  "limits": {"plain_rps_per_ip": 10},
+  "log": {"memory_entries": 100}
+}`
+		if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load() = %v, want nil", err)
+		}
+		if c.Timezone != "" {
+			t.Errorf("Timezone = %q, want empty for an old config", c.Timezone)
+		}
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil (old configs must keep loading)", err)
+		}
+	})
+
+	t.Run("the zone round-trips through save and load", func(t *testing.T) {
+		c := validConfig()
+		c.Timezone = "Europe/Moscow"
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := c.Save(path); err != nil {
+			t.Fatalf("Save() = %v", err)
+		}
+		loaded, err := config.Load(path)
+		if err != nil {
+			t.Fatalf("Load() = %v", err)
+		}
+		if loaded.Timezone != "Europe/Moscow" {
+			t.Errorf("Timezone after round-trip = %q, want Europe/Moscow", loaded.Timezone)
+		}
+		if err := loaded.Validate(); err != nil {
+			t.Errorf("Validate() = %v, want nil", err)
+		}
+	})
+}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"mydns/internal/api"
@@ -56,6 +57,10 @@ type Controller interface {
 	Status(ctx context.Context) (api.Status, error)
 	// Stats returns the cumulative query statistics since start.
 	Stats() stats.Snapshot
+	// StatsRange returns the query statistics summed over the whole UTC
+	// days in [from, to] inclusive; a zero bound is open. The status
+	// page builds the period diagrams from it.
+	StatsRange(from, to time.Time) stats.Snapshot
 	// Started is when the daemon was constructed; the maintenance page
 	// renders its uptime.
 	Started() time.Time
@@ -150,6 +155,15 @@ type Panel struct {
 	// POST returns at once and the download runs in the background, so
 	// the DoH listener's write timeout cannot truncate it.
 	refresh filterRefresh
+
+	// streams is closed when the runtime generation behind the panel
+	// stops, so /panel/events handlers return instead of holding the
+	// listeners open. http.Server.Shutdown does not cancel a handler's
+	// request context, so the stream would otherwise block it until the
+	// stop timeout. EndStreams replaces the channel with a fresh one so
+	// a later generation's connections get a live signal.
+	streamsMu sync.Mutex
+	streams   chan struct{}
 }
 
 // New builds a Panel. A nil Sessions or Throttle is replaced with the
@@ -190,9 +204,38 @@ func New(opts Options) *Panel {
 		pingInterval: ping,
 		feed:         newFeed(feedSize),
 		bus:          opts.Bus,
+		streams:      make(chan struct{}),
 	}
 	p.startFeed()
 	return p
+}
+
+// EndStreams closes the signal every live /panel/events handler is
+// watching, so those handlers return instead of holding the listeners
+// open: http.Server.Shutdown does not cancel a handler's request
+// context, so a stream would otherwise keep the stop waiting until its
+// timeout. The channel is replaced at once, so connections from the
+// next runtime generation (the panel outlives them) get a live signal.
+func (p *Panel) EndStreams() {
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+
+	select {
+	case <-p.streams:
+		// Already closed by an earlier EndStreams.
+	default:
+		close(p.streams)
+	}
+	p.streams = make(chan struct{})
+}
+
+// streamDone returns the current stream-end signal. A handler captures
+// it once at start so EndStreams ends this connection, while a later
+// generation's connection captures the fresh channel.
+func (p *Panel) streamDone() <-chan struct{} {
+	p.streamsMu.Lock()
+	defer p.streamsMu.Unlock()
+	return p.streams
 }
 
 // startFeed seeds the live feed with the recent queries the daemon
@@ -226,6 +269,24 @@ func (p *Panel) auth() (enabled bool, hash string) {
 	return p.authFn()
 }
 
+// location is the zone the panel renders query times in: the configured
+// IANA zone, the daemon's local zone when none is set, and local again
+// for a value the time database cannot load (an invalid stored zone must
+// never panic a page). It reads the live config on every call, so a
+// timezone change applies without a restart; only the display changes,
+// the stored timestamps stay as they are.
+func (p *Panel) location() *time.Location {
+	cfg := p.currentConfig()
+	if cfg == nil || cfg.Timezone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // Mount registers every panel route on mux. The DoH listener shares one
 // mux with /dns-query, so the patterns here never collide with it. A
 // disabled panel still registers the routes but answers 404 on all of
@@ -254,10 +315,16 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/upstreams", p.requireSession(http.HandlerFunc(p.handleUpstreams)))
 	mux.Handle("POST /panel/upstreams/toggle", p.requireSession(http.HandlerFunc(p.handleUpstreamToggle)))
 	mux.Handle("POST /panel/upstreams/priority", p.requireSession(http.HandlerFunc(p.handleUpstreamPriority)))
+	mux.Handle("POST /panel/upstreams/strategy", p.requireSession(http.HandlerFunc(p.handleUpstreamStrategy)))
+	mux.Handle("POST /panel/upstreams/add", p.requireSession(http.HandlerFunc(p.handleUpstreamAdd)))
+	mux.Handle("POST /panel/upstreams/custom", p.requireSession(http.HandlerFunc(p.handleUpstreamCustom)))
+	mux.Handle("POST /panel/upstreams/remove", p.requireSession(http.HandlerFunc(p.handleUpstreamRemove)))
 
 	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))
 	mux.Handle("POST /panel/filters/refresh", p.requireSession(http.HandlerFunc(p.handleFiltersRefresh)))
 	mux.Handle("POST /panel/filters/mode", p.requireSession(http.HandlerFunc(p.handleFilterMode)))
+	mux.Handle("POST /panel/filters/lists/add", p.requireSession(http.HandlerFunc(p.handleFilterListAdd)))
+	mux.Handle("POST /panel/filters/lists/remove", p.requireSession(http.HandlerFunc(p.handleFilterListRemove)))
 	mux.Handle("POST /panel/filters/rules/add", p.requireSession(http.HandlerFunc(p.handleFilterRuleAdd)))
 	mux.Handle("POST /panel/filters/rules/remove", p.requireSession(http.HandlerFunc(p.handleFilterRuleRemove)))
 

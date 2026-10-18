@@ -10,6 +10,7 @@ package stats
 import (
 	"sort"
 	"sync"
+	"time"
 
 	"mydns/internal/qlog"
 )
@@ -60,6 +61,19 @@ type Collector struct {
 	// overflow counts every observation of a client that is not
 	// tracked (see maxClients); Snapshot folds it into otherBucket.
 	overflow uint64
+
+	// days holds the per-UTC-day history (see history.go), keyed by the
+	// "2006-01-02" date. It is bounded to HistoryDays buckets.
+	days map[string]*dayStats
+	// now is the clock; nil means time.Now. Tests inject one to roll the
+	// day over.
+	now func() time.Time
+	// gen counts observations and savedGen is the value at the last
+	// successful Save, so a ticker can skip an unchanged collector
+	// instead of rewriting the file. The gen guard also tells a Save
+	// whether the counters moved while it wrote.
+	gen      uint64
+	savedGen uint64
 }
 
 // NewCollector returns an empty collector.
@@ -69,7 +83,18 @@ func NewCollector() *Collector {
 		protos:    make(map[string]uint64, 6),
 		upstreams: make(map[string]uint64, 4),
 		clients:   make(map[string]uint64, 64),
+		days:      make(map[string]*dayStats),
+		now:       time.Now,
 	}
+}
+
+// clock reads the injected clock, falling back to time.Now. A Collector
+// built by a struct literal has a nil now, which must not panic.
+func (c *Collector) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 // Observe folds one entry into the counters. It is the callback the
@@ -79,8 +104,12 @@ func (c *Collector) Observe(e qlog.Entry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.gen++
+
+	o := outcome(e)
+
 	c.total++
-	c.outcomes[outcome(e)]++
+	c.outcomes[o]++
 
 	// An empty field means "not applicable" (a malformed request has no
 	// question, a blocked or cached answer has no upstream), so it must
@@ -91,19 +120,17 @@ func (c *Collector) Observe(e qlog.Entry) {
 	if e.Upstream != "" {
 		c.upstreams[e.Upstream]++
 	}
-	if e.ClientIP == "" {
-		return
+	if e.ClientIP != "" {
+		if _, ok := c.clients[e.ClientIP]; ok {
+			c.clients[e.ClientIP]++
+		} else if len(c.clients) >= maxClients {
+			c.overflow++
+		} else {
+			c.clients[e.ClientIP] = 1
+		}
 	}
 
-	if _, ok := c.clients[e.ClientIP]; ok {
-		c.clients[e.ClientIP]++
-		return
-	}
-	if len(c.clients) >= maxClients {
-		c.overflow++
-		return
-	}
-	c.clients[e.ClientIP] = 1
+	c.observeDayLocked(c.clock().UTC().Format("2006-01-02"), e, o)
 }
 
 // Snapshot is a cumulative view of everything the collector has seen.

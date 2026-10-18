@@ -486,15 +486,20 @@ included, so a scan cannot tell that a panel exists.
 All pages are server-rendered; there is no framework — one small script
 drives the chart tooltip and the live feed.
 
-- **Статус** (`/panel/`) — four gauges (queries total, cache hit rate
-  and entries, blocked share, fastest healthy upstream), four donut
-  charts (outcomes, protocols, upstreams, clients), the device links and
-  the certificate state. Hovering a segment shows its label and share;
-  clicking it opens the history filtered by that segment. Folded slices
-  — «прочие» when a chart has more than six segments, and the clients'
-  «остальные» row — have no single value to filter on and are drawn
-  without a link. Below is the live feed of the last 30 queries, with
-  pause and clear buttons and a link to the full history.
+- **Статус** (`/panel/`) — four all-time gauges (queries total, cache
+  hit rate and entries, blocked share, fastest healthy upstream), a
+  period form, four donut charts (outcomes, protocols, upstreams,
+  clients), the device links and the certificate state. The period form
+  switches the charts and the «За период» totals to Месяц, 3 месяца,
+  6 месяцев, 12 месяцев or a custom date range (whole UTC days); the
+  gauges above stay all-time. Hovering a segment shows its label and
+  share; clicking it opens the history filtered by that segment. Folded
+  slices — «прочие» when a chart has more than six segments, and the
+  clients' «остальные» row — have no single value to filter on and are
+  drawn without a link. Below is the live feed of the last 30 queries,
+  with pause and clear buttons and a link to the full history; the feed
+  rows, the history table and the CSV export all use the timezone set
+  in Настройки.
 - **Запросы** (`/panel/history`) — «История запросов», deliberately not
   live (no auto-refresh): 100 rows per page, newest first, with a search
   box (case-insensitive substring of domain, client IP or upstream ID)
@@ -507,22 +512,35 @@ drives the chart tooltip and the live feed.
   UTF-8 with a byte-order mark and `;`-separated for the Russian Excel
   locale.
 - **Upstream'ы** — each upstream's state, latency and answered/error
-  share; enable or disable one, and edit the priority column, saved for
-  the whole list at once (the order `failover` walks).
-- **Фильтры** — per-list applied/skipped rules, update time and state;
-  refresh one list or every list; pick the block mode (`zero`,
-  `nxdomain`, `refused`); add and remove user allow/block rules (each
-  covers the domain and its subdomains).
+  share; add a provider endpoint from the built-in catalog (Cloudflare,
+  Google, Quad9, Яндекс DNS, AdGuard DNS, DNS.SB, Mullvad, Control D,
+  OpenDNS and the family variants), add a custom upstream (ID, transport
+  `plain`/`dot`/`doh`/`doq`, address, SNI for DoT/DoQ by IP, priority),
+  remove one, enable or disable one, and edit the priority column (the
+  order `failover` walks). The routing strategy (`fastest`, `failover`,
+  `round_robin`, `random`) is selectable on this page too. Upstream
+  hostnames are resolved through a bootstrap DNS list
+  (`1.1.1.1`/`8.8.8.8`/`9.9.9.9`), so the daemon keeps resolving when
+  the machine's own resolver points at mdns.
+- **Фильтры** — a catalog of ready public block lists (AdGuard DNS/Base,
+  uBlock Origin, EasyList, Peter Lowe, OISD Small/Full, HaGeZi Pro/Pro++,
+  Steven Black, 1Hosts Lite) with one-click add/remove, plus a custom
+  `https` list by ID and URL; per-list applied/skipped rules, update time
+  and state; refresh one list or every list; pick the block mode
+  (`zero`, `nxdomain`, `refused`); add and remove user allow/block rules
+  (each covers the domain and its subdomains).
 - **Сертификат** — read-only: state, issuer, expiry, last check and the
   TLS mode/ACME fields from the config. Issuance and renewal stay with
   the daemon; the ACME wizard (provider, EAB keys, custom directory)
   lives in the TUI and `mdns setup`, not in the panel.
 - **Настройки** — the key fields: domain, strategy, protocols and ports,
   cache size and TTL clamp, the plain-DNS rate limit, the filter on/off
-  and update interval. Applying revalidates the whole config; soft
-  changes land in place and structural ones rebuild the listeners. The
-  panel password change (8+ characters, typed twice) is on this page,
-  and open sessions stay valid after it.
+  and update interval, and the display timezone (an IANA name such as
+  `Europe/Moscow`; empty keeps the server's local zone). Applying
+  revalidates the whole config; soft changes land in place and
+  structural ones rebuild the listeners. The panel password («Пароль
+  веб-панели», 8+ characters, typed twice) is changed on this page, and
+  open sessions stay valid after it.
 - **Обслуживание** — version, uptime and start time; download the live
   config as JSON (it contains the panel password hash and the ACME EAB
   HMAC, and the page warns to treat it as a secret); apply the current
@@ -536,6 +554,13 @@ The query journal is an in-memory ring sized by `log.memory_entries`
 the oldest entries are overwritten as new queries arrive, and a restart
 starts the ring empty. Set `log.file` if you need an on-disk JSONL
 archive beyond the ring.
+
+The **Статус** page's period charts are a separate, smaller aggregate:
+one daily bucket per UTC day (totals, outcomes, protocols, upstreams and
+capped client counts) is kept for the last 400 days in
+`<data_dir>/stats.json` (mode 0600, written atomically every 30 seconds
+when something changed, and on shutdown). A restart therefore keeps the
+period windows and the all-time gauges; deleting that file resets both.
 
 ### Security
 

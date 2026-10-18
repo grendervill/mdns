@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 
@@ -19,6 +20,7 @@ import (
 type DoT struct {
 	addr      string
 	tlsConfig *tls.Config
+	resolver  *bootstrapResolver
 }
 
 // newDoT builds the DoT transport from cfg. The SNI comes from
@@ -39,19 +41,55 @@ func newDoT(cfg config.UpstreamConfig) *DoT {
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 			NextProtos:         []string{"dot"},
 		},
+		resolver: defaultResolver,
 	}
 }
 
 // Name implements Transport.
 func (d *DoT) Name() string { return "dot" }
 
-// Exchange implements Transport: it dials TLS, sends req as is and
-// returns the upstream's reply.
+// Exchange implements Transport: it resolves the upstream's hostname,
+// dials TLS to the resolved address, sends req as is and returns the
+// upstream's reply.
 func (d *DoT) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	c := &dns.Client{Net: "tcp-tls", Timeout: queryTimeout, TLSConfig: d.tlsConfig}
-	resp, _, err := c.ExchangeContext(ctx, req, d.addr)
+	addrs, err := d.resolver.resolveAddr(ctx, d.addr)
 	if err != nil {
-		return nil, fmt.Errorf("dot %s: %w", d.addr, err)
+		return nil, fmt.Errorf("dot resolve %s: %w", d.addr, err)
+	}
+
+	var errs []error
+	for _, addr := range addrs {
+		resp, err := d.exchangeAddr(ctx, req, addr)
+		if err == nil {
+			return resp, nil
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("no addresses resolved"))
+	}
+	return nil, fmt.Errorf("dot %s: %w", d.addr, errors.Join(errs...))
+}
+
+// exchangeAddr performs one TLS handshake and one DNS exchange against
+// an already resolved address.
+func (d *DoT) exchangeAddr(ctx context.Context, req *dns.Msg, addr string) (*dns.Msg, error) {
+	raw, err := (&net.Dialer{Timeout: queryTimeout}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	conn := tls.Client(raw, d.tlsConfig)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	defer conn.Close()
+
+	client := &dns.Client{Net: "tcp", Timeout: queryTimeout}
+	resp, _, err := client.ExchangeWithConnContext(ctx, req, &dns.Conn{Conn: conn})
+	if err != nil {
+		return nil, err
 	}
 	return resp, nil
 }

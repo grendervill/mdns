@@ -52,6 +52,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -272,6 +273,127 @@ def panel_flow(page, context):
         )
         check("no JavaScript error on %s" % name, not page_errors, page_errors)
         check("no CSP violation on %s" % name, not csp_errors, csp_errors)
+
+    # --- the new management surfaces ------------------------------------
+    # The catalog, the upstream editor and the timezone are part of the
+    # follow-up iteration; they are exercised here through the rendered
+    # forms, so a template or handler regression fails in the browser.
+    page.goto(BASE_URL + "/panel/filters")
+    cards = page.locator(".cards .card")
+    check("the filters page offers the ready-made catalog", cards.count() >= 10, cards.count())
+    add_card = page.locator(".cards .card").filter(
+        has=page.get_by_role("button", name="Добавить")
+    ).first
+    first_id = add_card.locator('input[name="id"]').get_attribute("value")
+    need("the first addable catalog card carries its list id", bool(first_id), first_id)
+    with page.expect_navigation():
+        add_card.get_by_role("button", name="Добавить").click()
+    check(
+        "adding a catalog list returns to the filters page",
+        page.url.startswith(BASE_URL + "/panel/filters"),
+        page.url,
+    )
+    check(
+        "the added catalog list appears in the status table",
+        first_id in page.locator(".tablewrap").inner_text(),
+        page.locator(".tablewrap").inner_text()[:200],
+    )
+    card_now = page.locator(".cards .card").filter(
+        has=page.locator('input[name="id"][value="%s"]' % first_id)
+    )
+    check(
+        "the card flips to «Убрать»",
+        card_now.get_by_role("button", name="Убрать").count() == 1,
+    )
+    with page.expect_navigation():
+        card_now.get_by_role("button", name="Убрать").click()
+    card_back = page.locator(".cards .card").filter(
+        has=page.locator('input[name="id"][value="%s"]' % first_id)
+    )
+    check(
+        "removing the list flips its card back to «Добавить»",
+        card_back.get_by_role("button", name="Добавить").count() == 1,
+    )
+    page.screenshot(path=str(SHOTS / "filters.png"), full_page=True)
+
+    page.goto(BASE_URL + "/panel/upstreams")
+    check(
+        "the upstreams page offers the four strategies",
+        page.locator('select[name="strategy"] option').count() == 4,
+    )
+    check(
+        "the provider picker is populated from the catalog",
+        page.locator('select[name="provider"] option').count() >= 20,
+        page.locator('select[name="provider"] option').count(),
+    )
+    custom = 'form[action="/panel/upstreams/custom"]'
+    page.fill(custom + ' input[name="id"]', "e2e-custom")
+    page.fill(custom + ' input[name="name"]', "E2E custom")
+    page.select_option(custom + ' select[name="transport"]', "plain")
+    page.fill(custom + ' input[name="address"]', "127.0.0.1:5399")
+    with page.expect_navigation():
+        page.locator(custom + ' button[type="submit"]').click()
+    custom_remove = page.locator(
+        'button[formaction="/panel/upstreams/remove"][value="e2e-custom"]'
+    )
+    check("a custom upstream can be added", custom_remove.count() == 1)
+    with page.expect_navigation():
+        custom_remove.click()
+    check(
+        "the custom upstream can be removed again",
+        page.locator(
+            'button[formaction="/panel/upstreams/remove"][value="e2e-custom"]'
+        ).count() == 0,
+    )
+
+    page.goto(BASE_URL + "/panel/settings")
+    tz = page.locator('input[name="timezone"]')
+    need("the settings page has the timezone field", tz.is_visible())
+    check(
+        "the timezone field carries the IANA datalist",
+        page.locator("#tz-zones option").count() >= 5,
+        page.locator("#tz-zones option").count(),
+    )
+    tz.fill("Europe/Moscow")
+    with page.expect_navigation():
+        page.locator('form[action="/panel/settings"] button[type="submit"]').click()
+    page.goto(BASE_URL + "/panel/settings")
+    check(
+        "the timezone survives a reload",
+        page.locator('input[name="timezone"]').input_value() == "Europe/Moscow",
+        page.locator('input[name="timezone"]').input_value(),
+    )
+
+    page.goto(BASE_URL + "/panel/")
+    boxes = page.locator(".piefold .pie svg").evaluate_all(
+        "els => els.map(e => e.getAttribute('viewBox'))"
+    )
+    check(
+        "all four donuts use the unclipped viewBox",
+        boxes == ["0 0 48 48"] * 4,
+        boxes,
+    )
+    period_labels = page.locator('select[name="period"] option').all_inner_texts()
+    check(
+        "the period selector offers the five windows",
+        period_labels == ["Месяц", "3 месяца", "6 месяцев", "12 месяцев", "Своё"],
+        period_labels,
+    )
+    page.select_option('select[name="period"]', "365")
+    with page.expect_navigation():
+        page.get_by_role("button", name="Показать").click()
+    check(
+        "the 12-month window is reflected in the page",
+        "period=365" in page.url and "12 месяцев" in page.locator("body").inner_text(),
+        page.url,
+    )
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    page.goto(BASE_URL + "/panel/?period=custom&from=%s&to=%s" % (today, today))
+    check(
+        "the custom window renders its own label",
+        "Своё" in page.locator("body").inner_text(),
+    )
+    page.screenshot(path=str(SHOTS / "status-period.png"), full_page=True)
 
     # Back to the status page for the chart interaction below.
     with page.expect_navigation() as nav:

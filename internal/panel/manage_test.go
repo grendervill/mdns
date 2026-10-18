@@ -106,6 +106,8 @@ func (c *manageCtrl) UpdateConfig(_ context.Context, next *config.Config) error 
 
 func (c *manageCtrl) Stats() stats.Snapshot { return stats.Snapshot{} }
 
+func (c *manageCtrl) StatsRange(time.Time, time.Time) stats.Snapshot { return stats.Snapshot{} }
+
 func (c *manageCtrl) Requests(int) []qlog.Entry { return nil }
 
 func (c *manageCtrl) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) { return nil, 0 }
@@ -365,6 +367,38 @@ func TestUpstreamToggleFailure(t *testing.T) {
 	}
 }
 
+// TestUpstreamToggleLastEnabled refuses to disable the only enabled
+// upstream, and allows the flip once a second one is enabled.
+func TestUpstreamToggleLastEnabled(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg) // cloudflare enabled, quad9 disabled
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"cloudflare"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("disabling the last enabled upstream = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "нельзя выключить последний включённый upstream") {
+		t.Errorf("the last-upstream message is missing:\n%s", body)
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a refused toggle reached UpdateConfig")
+	}
+	if !cfg.Upstreams[0].Enabled {
+		t.Error("the refused toggle changed the live config")
+	}
+
+	// With two enabled upstreams the same flip is allowed.
+	cfg.Upstreams[1].Enabled = true
+	resp, body = managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"cloudflare"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	sent := ctrl.sent()
+	if len(sent) != 1 || sent[0].Upstreams[0].Enabled {
+		t.Errorf("the allowed toggle did not disable cloudflare: %+v\n%s", sent, body)
+	}
+}
+
 // TestUpstreamPriority saves the whole priority column at once.
 func TestUpstreamPriority(t *testing.T) {
 	cfg := manageConfig(t)
@@ -393,6 +427,242 @@ func TestUpstreamPriority(t *testing.T) {
 	}
 }
 
+// TestUpstreamStrategy saves each of the four strategies and rejects an
+// unknown one.
+func TestUpstreamStrategy(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	for i, strategy := range []string{"fastest", "failover", "round_robin", "random"} {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/strategy", url.Values{"strategy": {strategy}})
+		wantRedirect(t, resp, "/panel/upstreams?ok=strategy")
+		if got := ctrl.sent(); len(got) != i+1 {
+			t.Fatalf("UpdateConfig called %d times, want %d\n%s", len(got), i+1, body)
+		}
+	}
+	sent := ctrl.sent()
+	if sent[3].Strategy != "random" {
+		t.Errorf("strategy = %q, want random", sent[3].Strategy)
+	}
+	if len(sent[3].Upstreams) != 2 {
+		t.Error("the strategy save dropped the upstreams")
+	}
+
+	t.Run("unknown strategy", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/strategy", url.Values{"strategy": {"bogus"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "bogus") {
+			t.Error("the page does not name the rejected strategy")
+		}
+		if len(ctrl.sent()) != 4 {
+			t.Error("an unknown strategy reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamAddCatalog adds provider endpoints from the catalog,
+// picks a unique ID and rejects a duplicate address.
+func TestUpstreamAddCatalog(t *testing.T) {
+	cfg := manageConfig(t) // no upstreams yet
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|doh"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0].Upstreams
+	if len(got) != 1 {
+		t.Fatalf("upstreams = %d, want 1", len(got))
+	}
+	u := got[0]
+	if u.ID != "cloudflare" || u.Transport != "doh" || u.Address != "https://cloudflare-dns.com/dns-query" {
+		t.Errorf("added upstream = %+v, want Cloudflare DoH", u)
+	}
+	if !u.Enabled || u.Priority != 0 {
+		t.Errorf("added upstream enabled/priority = %v/%d, want true/0", u.Enabled, u.Priority)
+	}
+
+	// A second transport of the same provider gets a suffixed, unique ID.
+	resp, _ = managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|plain"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+	sent = ctrl.sent()
+	if len(sent) != 2 || len(sent[1].Upstreams) != 2 {
+		t.Fatalf("second add: %d configs, %d upstreams", len(sent), len(sent[1].Upstreams))
+	}
+	if second := sent[1].Upstreams[1]; second.ID != "cloudflare-plain" || second.Priority != 1 {
+		t.Errorf("second upstream = %+v, want id cloudflare-plain with priority 1", second)
+	}
+
+	t.Run("duplicate endpoint", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|doh"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "уже добавлен") {
+			t.Errorf("the duplicate message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate endpoint reached UpdateConfig")
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"nope|doh"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an unknown provider reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamCustom stores a hand-written upstream and validates its
+// fields.
+func TestUpstreamCustom(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+		"id": {"my-dns"}, "name": {"My DNS"}, "transport": {"dot"},
+		"address": {"10.0.0.1:853"}, "server_name": {"dns.internal"}, "priority": {"5"},
+	})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+
+	sent := ctrl.sent()
+	if len(sent) != 1 || len(sent[0].Upstreams) != 1 {
+		t.Fatalf("UpdateConfig calls/upstreams = %d/%v\n%s", len(sent), sent, body)
+	}
+	u := sent[0].Upstreams[0]
+	if u.ID != "my-dns" || u.Name != "My DNS" || u.Transport != "dot" || u.Address != "10.0.0.1:853" ||
+		u.ServerName != "dns.internal" || u.Priority != 5 || !u.Enabled {
+		t.Errorf("custom upstream = %+v", u)
+	}
+
+	t.Run("derived id and default priority", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"transport": {"plain"}, "address": {"1.1.1.1:53"},
+		})
+		wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+		got := ctrl.sent()
+		if len(got) != 2 || len(got[1].Upstreams) != 2 {
+			t.Fatalf("second custom: %d configs", len(got))
+		}
+		second := got[1].Upstreams[1]
+		if second.ID != "1-1-1-1" {
+			t.Errorf("derived id = %q, want 1-1-1-1", second.ID)
+		}
+		if second.Priority != 6 {
+			t.Errorf("default priority = %d, want max+1 = 6", second.Priority)
+		}
+		if second.Name != "1-1-1-1" {
+			t.Errorf("default name = %q, want the id", second.Name)
+		}
+	})
+
+	t.Run("empty address", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"x"}, "transport": {"plain"}, "address": {"  "},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "адрес") {
+			t.Error("the missing-address message is absent")
+		}
+	})
+
+	t.Run("unknown transport", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"x"}, "transport": {"bogus"}, "address": {"1.1.1.1:53"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("duplicate id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
+			"id": {"my-dns"}, "transport": {"plain"}, "address": {"2.2.2.2:53"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate id reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamRemove refuses to remove the last enabled upstream and
+// removes any other.
+func TestUpstreamRemove(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg) // cloudflare enabled, quad9 disabled
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"cloudflare"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("removing the last enabled upstream = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "последн") {
+		t.Errorf("the last-upstream message is missing:\n%s", body)
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a refused removal reached UpdateConfig")
+	}
+
+	resp, _ = managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"quad9"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-removed")
+	sent := ctrl.sent()
+	if len(sent) != 1 || len(sent[0].Upstreams) != 1 || sent[0].Upstreams[0].ID != "cloudflare" {
+		t.Errorf("after removing quad9: %v", sent)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"nope"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+}
+
+// TestEndpointOptions checks the catalog picker: non-empty, unique
+// values, and a Cloudflare DoH entry.
+func TestEndpointOptions(t *testing.T) {
+	opts := endpointOptions()
+	if len(opts) == 0 {
+		t.Fatal("endpointOptions is empty")
+	}
+	seen := make(map[string]bool, len(opts))
+	foundCloudflare := false
+	for _, o := range opts {
+		if seen[o.Value] {
+			t.Errorf("duplicate endpoint option %q", o.Value)
+		}
+		seen[o.Value] = true
+		if o.Value == "cloudflare|doh" &&
+			strings.Contains(o.Label, "Cloudflare") &&
+			strings.Contains(o.Label, "DoH") &&
+			strings.Contains(o.Label, "https://cloudflare-dns.com/dns-query") {
+			foundCloudflare = true
+		}
+	}
+	if !foundCloudflare {
+		t.Error("the Cloudflare DoH entry is missing")
+	}
+}
+
 // ---- filters -----------------------------------------------------
 
 // manageFilterConfig is a config with the filter engine on. It carries
@@ -410,6 +680,10 @@ func manageFilters(cfg *config.Config) {
 func TestFiltersPage(t *testing.T) {
 	cfg := manageConfig(t)
 	manageFilters(cfg)
+	cfg.Timezone = "Europe/Moscow"
+	// The table is driven by the config, so both lists the status reports
+	// are also configured; their state columns come from the status.
+	cfg.Filter.Lists = []config.FilterList{{ID: "oisd"}, {ID: "user"}}
 	ctrl := &manageCtrl{
 		cfg: cfg,
 		st:  api.Status{Filter: api.FilterSnapshot{Enabled: true, Mode: "nxdomain", TotalBlocked: 12481}},
@@ -429,7 +703,7 @@ func TestFiltersPage(t *testing.T) {
 		"Фильтры",
 		"Списки", "oisd", "user",
 		"101 000", "42",
-		"18.10 09:30:00",
+		"18.10 12:30:00",
 		"ок", "ошибка",
 		`action="/panel/filters/refresh"`,
 		"Обновить", "Обновить все",
@@ -465,7 +739,52 @@ func TestFiltersPage(t *testing.T) {
 		if !strings.Contains(body, "Списки не заданы") {
 			t.Error("the empty-lists note is missing")
 		}
+		if !strings.Contains(body, `disabled>Обновить все`) {
+			t.Error("the refresh-all button is not disabled while filtering is off")
+		}
 	})
+}
+
+// TestFiltersListsTable checks the lists table is built from the config,
+// not only from the updater's live status: a just-configured list the
+// updater has not reported yet still renders with a placeholder state and
+// its refresh control, a status the config carries wins over the
+// placeholder, and a status the config no longer carries is not shown.
+func TestFiltersListsTable(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Timezone = "Europe/Moscow"
+	cfg.Filter.Lists = []config.FilterList{{ID: "adguard-base"}, {ID: "oisd"}}
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		lists: []filter.ListStatus{
+			{ID: "oisd", URL: "https://example.test/oisd.txt", UpdatedAt: time.Date(2026, 10, 18, 9, 30, 0, 0, time.UTC), Applied: 101_000, Skipped: 42},
+			{ID: "stale-list", URL: "https://example.test/gone.txt"},
+		},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/filters")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters = %d, want 200\n%s", code, body)
+	}
+	wants := []string{
+		"adguard-base",
+		"не загружен",
+		`name="id" value="adguard-base">Обновить`,
+		"101 000", "18.10 12:30:00",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("filters page is missing %q", want)
+		}
+	}
+	if strings.Contains(body, "stale-list") {
+		t.Error("the table shows a status entry the config no longer carries")
+	}
+	if strings.Contains(body, "Списки не заданы") {
+		t.Error("the empty-lists note is shown while lists are configured")
+	}
 }
 
 // TestFiltersRefresh checks the single-flight asynchronous refresh: the
@@ -540,6 +859,28 @@ func TestFiltersRefresh(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("the second background FilterUpdate did not start")
+	}
+}
+
+// TestFiltersRefreshDisabled refuses a refresh while filtering is off
+// instead of claiming one started.
+func TestFiltersRefreshDisabled(t *testing.T) {
+	cfg := manageConfig(t) // filtering off by default
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("refresh with filtering off = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "фильтрация выключена") {
+		t.Errorf("the disabled message is missing:\n%s", body)
+	}
+	if strings.Contains(body, "обновление запущено") {
+		t.Error("the page claims a refresh started with filtering off")
+	}
+	if len(ctrl.refreshed()) != 0 {
+		t.Error("a refresh ran with filtering off")
 	}
 }
 
@@ -700,6 +1041,182 @@ func TestFilterRules(t *testing.T) {
 	})
 }
 
+// TestFilterListAdd covers the catalog add and the custom list add,
+// including the rejected forms.
+func TestFilterListAdd(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg) // filter on, no lists
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	// A ready-made catalog list is stored with an empty URL.
+	resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"oisd-small"}})
+	wantRedirect(t, resp, "/panel/filters?ok=list-added")
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	if got := sent[0].Filter.Lists; len(got) != 1 || got[0].ID != "oisd-small" || got[0].URL != "" {
+		t.Errorf("lists = %+v, want [{oisd-small }]", got)
+	}
+	if !sent[0].Filter.Enabled {
+		t.Error("adding a list silently changed the filter enabled flag")
+	}
+
+	// A custom list is stored with its slug and URL.
+	resp, _ = managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+		"custom_id": {"my-list"}, "custom_url": {"https://example.test/hosts.txt"},
+	})
+	wantRedirect(t, resp, "/panel/filters?ok=list-added")
+	sent = ctrl.sent()
+	if len(sent) != 2 {
+		t.Fatalf("UpdateConfig called %d times, want 2", len(sent))
+	}
+	if got := sent[1].Filter.Lists; len(got) != 2 || got[1].ID != "my-list" || got[1].URL != "https://example.test/hosts.txt" {
+		t.Errorf("lists = %+v, want the custom list appended", got)
+	}
+
+	t.Run("duplicate catalog add", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"oisd-small"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "уже добавлен") {
+			t.Errorf("the duplicate message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a duplicate catalog list reached UpdateConfig")
+		}
+	})
+
+	t.Run("unknown catalog id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"no-such-list"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an unknown catalog id reached UpdateConfig")
+		}
+	})
+
+	t.Run("http url rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"plain-http"}, "custom_url": {"http://example.test/hosts.txt"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "https") {
+			t.Error("the https-required message is missing")
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("an http list reach UpdateConfig")
+		}
+	})
+
+	t.Run("empty url rejected", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"no-url"}, "custom_url": {""},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("bad slug rejected", func(t *testing.T) {
+		resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
+			"custom_id": {"Bad_Slug"}, "custom_url": {"https://example.test/hosts.txt"},
+		})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "ID списка") {
+			t.Error("the slug message is missing")
+		}
+		if len(ctrl.sent()) != 2 {
+			t.Error("a bad slug reached UpdateConfig")
+		}
+	})
+}
+
+// TestFilterListRemove drops one list only.
+func TestFilterListRemove(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Filter.Lists = []config.FilterList{
+		{ID: "oisd-small"},
+		{ID: "hagezi-pro"},
+		{ID: "my-list", URL: "https://example.test/hosts.txt"},
+	}
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/filters/lists/remove", url.Values{"id": {"hagezi-pro"}})
+	wantRedirect(t, resp, "/panel/filters?ok=list-removed")
+	sent := ctrl.sent()
+	if len(sent) != 1 {
+		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+	}
+	got := sent[0].Filter.Lists
+	if len(got) != 2 || got[0].ID != "oisd-small" || got[1].ID != "my-list" {
+		t.Errorf("lists = %+v, want oisd-small and my-list", got)
+	}
+
+	t.Run("unknown id", func(t *testing.T) {
+		resp, _ := managePOST(t, p, srv, "/panel/filters/lists/remove", url.Values{"id": {"no-such"}})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("an unknown list id reached UpdateConfig")
+		}
+	})
+}
+
+// TestFiltersCatalogPage checks the ready-made list section renders the
+// catalog with the Russian category and the added state.
+func TestFiltersCatalogPage(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Filter.Lists = []config.FilterList{{ID: "oisd-small"}}
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/filters")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters = %d, want 200\n%s", code, body)
+	}
+	wants := []string{
+		"Готовые списки",
+		"реклама и трекеры", "комбинированные",
+		`action="/panel/filters/lists/add"`,
+		`action="/panel/filters/lists/remove"`,
+		`value="adguard-dns-filter"`,
+		"OISD Small",
+		"Убрать", "Добавить",
+		"Свой список",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("filters page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+
+	t.Run("disabled disables the buttons", func(t *testing.T) {
+		off := manageConfig(t) // filter off
+		c := &manageCtrl{cfg: off}
+		p2, srv2 := managePanel(t, c)
+		_, body := authedGET(t, p2, srv2, "/panel/filters")
+		if !strings.Contains(body, " disabled") {
+			t.Error("the catalog buttons are not disabled while filtering is off")
+		}
+		if !strings.Contains(body, "Фильтрация выключена") {
+			t.Error("the disabled hint is missing")
+		}
+	})
+}
+
 // ---- settings ----------------------------------------------------
 
 // validSettingsForm is a complete, valid settings submission.
@@ -747,6 +1264,7 @@ func TestSettingsPage(t *testing.T) {
 		`name="doq.port" value="853"`,
 		`name="strategy"`,
 		`value="fastest" selected`,
+		`name="timezone" value=""`,
 		`name="cache.size" value="10000"`,
 		`name="cache.min_ttl" value="0"`,
 		`name="cache.max_ttl" value="86400"`,
@@ -765,6 +1283,78 @@ func TestSettingsPage(t *testing.T) {
 		}
 	}
 	assertNoInlineAssets(t, body)
+}
+
+// TestSettingsTimezone checks the settings form's «Часовой пояс» field: a
+// valid IANA zone persists, the form shows the stored zone and its
+// datalist, and a bad zone re-renders with the error while the live
+// config stays unchanged.
+func TestSettingsTimezone(t *testing.T) {
+	t.Run("a valid zone is saved", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("timezone", "Europe/Moscow")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		wantRedirect(t, resp, "/panel/settings?ok=settings")
+
+		sent := ctrl.sent()
+		if len(sent) != 1 {
+			t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+		}
+		if sent[0].Timezone != "Europe/Moscow" {
+			t.Errorf("saved Timezone = %q, want Europe/Moscow", sent[0].Timezone)
+		}
+	})
+
+	t.Run("the form shows the stored zone and datalist", func(t *testing.T) {
+		cfg := manageConfig(t)
+		cfg.Timezone = "Asia/Almaty"
+		p, srv := managePanel(t, &manageCtrl{cfg: cfg})
+
+		code, body := authedGET(t, p, srv, "/panel/settings")
+		if code != http.StatusOK {
+			t.Fatalf("GET /panel/settings = %d, want 200", code)
+		}
+		for _, want := range []string{
+			`name="timezone" value="Asia/Almaty"`,
+			`id="tz-zones"`,
+			`value="Europe/Moscow"`,
+			`value="UTC"`,
+			"IANA-зона, пусто — системная",
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the settings page is missing %q", want)
+			}
+		}
+	})
+
+	t.Run("an unknown zone is rejected and changes nothing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("timezone", "Mars/Base")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "timezone") || !strings.Contains(body, "Mars/Base") {
+			t.Errorf("the re-rendered page does not report the bad zone:\n%s", body)
+		}
+		if !strings.Contains(body, `name="timezone" value="Mars/Base"`) {
+			t.Error("the form does not echo the rejected value")
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("UpdateConfig ran for a config Validate rejects")
+		}
+		if ctrl.cfg.Timezone != "" {
+			t.Errorf("live config timezone = %q, want it unchanged", ctrl.cfg.Timezone)
+		}
+	})
 }
 
 // TestSettingsApply sends the edited values in the full config.
@@ -1186,5 +1776,28 @@ func assertNoInlineAssets(t *testing.T, body string) {
 	}
 	if strings.Contains(body, "<script>") {
 		t.Error("page carries an inline <script> element (forbidden by the CSP)")
+	}
+}
+
+// TestStylesheetHoverRingWidth pins the hover stroke of the donut ring:
+// app.css must widen it to 16, so a refactor cannot silently re-clip the
+// hover growth against the neighbouring slices.
+func TestStylesheetHoverRingWidth(t *testing.T) {
+	data, err := staticFS.ReadFile("static/app.css")
+	if err != nil {
+		t.Fatalf("reading the embedded app.css: %v", err)
+	}
+	css := string(data)
+
+	i := strings.Index(css, ".pie .ring:hover")
+	if i < 0 {
+		t.Fatal("app.css has no .pie .ring:hover rule")
+	}
+	rule := css[i:]
+	if end := strings.IndexByte(rule, '}'); end >= 0 {
+		rule = rule[:end+1]
+	}
+	if !strings.Contains(rule, "stroke-width: 16") {
+		t.Errorf("the .pie .ring hover rule does not use stroke-width: 16:\n%s", rule)
 	}
 }

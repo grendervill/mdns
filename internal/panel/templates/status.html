@@ -23,7 +23,28 @@
       <div class="g"><div class="k">Лучший upstream</div><div class="v">{{.BestLatency}}{{if .BestName}}<small>{{.BestName}}</small>{{end}}</div></div>
     </div>
 
-    <h3>Куда идут запросы <span class="sub">— наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <h3>Куда идут запросы <span class="sub">— период: {{.PeriodLabel}}; наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <form class="periodrow" method="get" action="/panel/" role="search">
+      <label class="field">
+        <span>Период</span>
+        <select class="ctl" name="period">
+          {{range .PeriodOptions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </label>
+      <label class="field">
+        <span>С</span>
+        <input class="ctl" type="date" name="from" value="{{.PeriodFrom}}">
+      </label>
+      <label class="field">
+        <span>По</span>
+        <input class="ctl" type="date" name="to" value="{{.PeriodTo}}">
+      </label>
+      <div class="row-actions">
+        <button class="btn" type="submit">Показать</button>
+      </div>
+    </form>
+    {{if .PeriodNotice}}<p class="alert" role="alert">{{.PeriodNotice}}</p>{{end}}
+    <p class="note">За период ({{.PeriodLabel}}): {{.PeriodSummary}}</p>
     <div class="piefold">
       {{range .Donuts}}{{template "donut" .}}{{end}}
     </div>
@@ -64,8 +85,8 @@
 {{define "donut"}}
 <div class="pie">
   <div class="t">{{.Title}}</div>
-  <svg viewBox="0 0 42 42" role="img" aria-label="{{.Title}}">
-    <circle class="track" cx="21" cy="21" r="15.9"></circle>
+  <svg viewBox="0 0 48 48" role="img" aria-label="{{.Title}}">
+    <circle class="track" cx="24" cy="24" r="15.9"></circle>
     {{range .Segments}}{{template "segment" .}}{{end}}
   </svg>
   <div class="legend">
@@ -73,4 +94,4 @@
   </div>
 </div>
 {{end}}
-{{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="21" cy="21" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}
+{{define "segment"}}{{if .Href}}<a class="seg" href="{{.Href}}" aria-label="{{.Label}}: {{.ValueText}}"><circle class="ring c-{{.Slot}}" cx="24" cy="24" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}" data-click="1"></circle></a>{{else}}<circle class="ring c-{{.Slot}}" cx="24" cy="24" r="15.9" stroke-dasharray="{{.Dash}} {{.Gap}}" stroke-dashoffset="{{.Offset}}" data-label="{{.Label}}" data-value="{{.ValueText}}"></circle>{{end}}{{end}}

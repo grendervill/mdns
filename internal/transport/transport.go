@@ -30,7 +30,7 @@ type Transport interface {
 func New(cfg config.UpstreamConfig) (Transport, error) {
 	switch cfg.Transport {
 	case "plain":
-		return &Plain{addr: cfg.Address}, nil
+		return newPlainWithResolver(cfg, defaultResolver), nil
 	case "dot":
 		return newDoT(cfg), nil
 	case "doh":
