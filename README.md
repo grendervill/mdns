@@ -559,8 +559,8 @@ The **Статус** page's period charts are a separate, smaller aggregate:
 one daily bucket per UTC day (totals, outcomes, protocols, upstreams and
 capped client counts) is kept for the last 400 days in
 `<data_dir>/stats.json` (mode 0600, written atomically every 30 seconds
-and on shutdown). A restart therefore keeps the period windows and the
-all-time gauges; deleting that file resets both.
+when something changed, and on shutdown). A restart therefore keeps the
+period windows and the all-time gauges; deleting that file resets both.
 
 ### Security
 

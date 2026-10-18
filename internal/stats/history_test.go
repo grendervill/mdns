@@ -298,3 +298,80 @@ func TestCollectorConcurrentObserveAndRange(t *testing.T) {
 		t.Errorf("total after the concurrent run = %d, want 1000", got)
 	}
 }
+
+// TestCollectorSaveSkipsUnchanged checks the ticker guard: an unchanged
+// collector is a no-op, and a new observation makes Save write again.
+func TestCollectorSaveSkipsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stats.json")
+
+	c := NewCollector()
+	c.Observe(qlog.Entry{Upstream: "u", Proto: "udp"})
+	if err := c.Save(path); err != nil {
+		t.Fatalf("first Save() = %v, want nil", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("removing the saved file: %v", err)
+	}
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save() of an unchanged collector = %v, want nil", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Save() rewrote an unchanged collector: %v", err)
+	}
+
+	c.Observe(qlog.Entry{Blocked: true, Proto: "tcp"})
+	if err := c.Save(path); err != nil {
+		t.Fatalf("Save() after a new observation = %v, want nil", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("Save() did not write after a new observation: %v", err)
+	}
+}
+
+// TestCollectorConcurrentSave checks that two Saves racing on one path
+// use distinct temp files: neither fails with ENOENT and no temp file is
+// left behind.
+func TestCollectorConcurrentSave(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stats.json")
+
+	first := NewCollector()
+	first.Observe(qlog.Entry{Upstream: "u1", Proto: "udp"})
+	second := NewCollector()
+	second.Observe(qlog.Entry{CacheHit: true, Proto: "doh"})
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, c := range []*Collector{first, second} {
+		wg.Add(1)
+		go func(c *Collector) {
+			defer wg.Done()
+			errs <- c.Save(path)
+		}(c)
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Save() = %v, want nil", err)
+		}
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dir, err)
+	}
+	for _, e := range entries {
+		if e.Name() != "stats.json" {
+			t.Errorf("leftover file after concurrent Save: %s", e.Name())
+		}
+	}
+
+	loaded := NewCollector()
+	if err := loaded.Load(path); err != nil {
+		t.Errorf("Load() of the racing file = %v, want nil", err)
+	}
+}

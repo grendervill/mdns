@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -234,16 +235,22 @@ func (c *Collector) cumulativeLocked() dayStats {
 }
 
 // Save writes the cumulative counters and the daily history to path as
-// JSON. An empty path is a no-op. The write is atomic: a temp file in
-// the same directory, then a rename. The data directory is never
-// created here — the installer owns it — so a missing directory is an
-// error the caller logs and survives.
+// JSON. An empty path is a no-op, as is an unchanged collector: the
+// 30 s ticker must not rewrite a file nothing has touched. The write is
+// atomic: a uniquely named temp file in the same directory, synced,
+// then renamed. The data directory is never created here — the
+// installer owns it — so a missing directory is an error the caller logs
+// and survives.
 func (c *Collector) Save(path string) error {
 	if path == "" {
 		return nil
 	}
 
 	c.mu.Lock()
+	if c.gen == c.savedGen {
+		c.mu.Unlock()
+		return nil
+	}
 	file := statsFile{
 		Version:    statsFileVersion,
 		SavedAt:    c.clock().UTC(),
@@ -263,19 +270,39 @@ func (c *Collector) Save(path string) error {
 		return fmt.Errorf("stats: encoding history: %w", err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("stats: writing history: %w", err)
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("stats: creating the history temp file: %w", err)
+	}
+	tmp := f.Name()
+	fail := func(op string, err error) error {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("stats: %s: %w", op, err)
+	}
+
+	if _, err := f.Write(data); err != nil {
+		return fail("writing history", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail("syncing history", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("stats: closing history: %w", err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("stats: replacing history: %w", err)
 	}
 
-	// Clear dirty only when nothing was observed while we wrote, so a
-	// ticker that skips an unchanged collector cannot lose an update.
+	// Record the generation only when nothing was observed while we
+	// wrote, so a ticker that skips an unchanged collector cannot lose
+	// an update.
 	c.mu.Lock()
 	if c.gen == gen {
-		c.dirty = false
+		c.savedGen = gen
 	}
 	c.mu.Unlock()
 	return nil

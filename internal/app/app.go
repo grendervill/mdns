@@ -265,6 +265,9 @@ type App struct {
 	// statsPath is where the collector's history is persisted (under
 	// DataDir); empty disables persistence.
 	statsPath string
+	// statsDone is closed by saveStatsLoop when it returns, so Stop can
+	// join the periodic writer before its own final Save.
+	statsDone chan struct{}
 
 	// started is the time the app was constructed, reported as the
 	// stats "since". New is where a daemon run begins.
@@ -367,7 +370,8 @@ func (a *App) Start(ctx context.Context) error {
 	}
 
 	go a.publishUpstreams(appCtx)
-	go a.saveStatsLoop(appCtx)
+	a.statsDone = make(chan struct{})
+	go a.saveStatsLoop(appCtx, a.statsDone)
 	return nil
 }
 
@@ -388,6 +392,17 @@ func (a *App) Stop(ctx context.Context) error {
 	// runtime, but its streams must end with it.
 	a.panel.EndStreams()
 	err := a.rt.stop(ctx)
+
+	// Join the periodic saver before saving for the last time: the two
+	// writers would otherwise race on the same file, and the final Save
+	// must be the last word.
+	if a.statsDone != nil {
+		select {
+		case <-a.statsDone:
+		case <-ctx.Done():
+		}
+		a.statsDone = nil
+	}
 
 	// Persist the statistics history once on the way out. A failure is
 	// logged, never returned: the daemon must stop regardless.

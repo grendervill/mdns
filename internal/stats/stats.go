@@ -68,11 +68,12 @@ type Collector struct {
 	// now is the clock; nil means time.Now. Tests inject one to roll the
 	// day over.
 	now func() time.Time
-	// dirty marks that Observe ran since the last successful Save; the
-	// app's saver empties the map on a tick. gen counts observations so
-	// a Save can tell whether the counters moved while it wrote.
-	dirty bool
-	gen   uint64
+	// gen counts observations and savedGen is the value at the last
+	// successful Save, so a ticker can skip an unchanged collector
+	// instead of rewriting the file. The gen guard also tells a Save
+	// whether the counters moved while it wrote.
+	gen      uint64
+	savedGen uint64
 }
 
 // NewCollector returns an empty collector.
@@ -104,7 +105,6 @@ func (c *Collector) Observe(e qlog.Entry) {
 	defer c.mu.Unlock()
 
 	c.gen++
-	c.dirty = true
 
 	o := outcome(e)
 

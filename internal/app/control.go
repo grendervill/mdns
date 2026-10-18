@@ -220,8 +220,11 @@ const statsSaveInterval = 30 * time.Second
 // saveStatsLoop persists the cumulative counters and the daily history
 // on a ticker until ctx ends. A failed write is logged and the loop
 // keeps going: persistence is a convenience, not a correctness
-// requirement for the live daemon.
-func (a *App) saveStatsLoop(ctx context.Context) {
+// requirement for the live daemon. It closes done on the way out, so
+// Stop can join it before the final Save.
+func (a *App) saveStatsLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+
 	ticker := time.NewTicker(statsSaveInterval)
 	defer ticker.Stop()
 
