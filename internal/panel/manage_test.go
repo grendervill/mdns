@@ -648,6 +648,9 @@ func manageFilters(cfg *config.Config) {
 func TestFiltersPage(t *testing.T) {
 	cfg := manageConfig(t)
 	manageFilters(cfg)
+	// The table is driven by the config, so both lists the status reports
+	// are also configured; their state columns come from the status.
+	cfg.Filter.Lists = []config.FilterList{{ID: "oisd"}, {ID: "user"}}
 	ctrl := &manageCtrl{
 		cfg: cfg,
 		st:  api.Status{Filter: api.FilterSnapshot{Enabled: true, Mode: "nxdomain", TotalBlocked: 12481}},
@@ -704,6 +707,47 @@ func TestFiltersPage(t *testing.T) {
 			t.Error("the empty-lists note is missing")
 		}
 	})
+}
+
+// TestFiltersListsTable checks the lists table is built from the config,
+// not only from the updater's live status: a just-configured list the
+// updater has not reported yet still renders with a placeholder state and
+// its refresh control, a status the config carries wins over the
+// placeholder, and a status the config no longer carries is not shown.
+func TestFiltersListsTable(t *testing.T) {
+	cfg := manageConfig(t)
+	manageFilters(cfg)
+	cfg.Filter.Lists = []config.FilterList{{ID: "adguard-base"}, {ID: "oisd"}}
+	ctrl := &manageCtrl{
+		cfg: cfg,
+		lists: []filter.ListStatus{
+			{ID: "oisd", URL: "https://example.test/oisd.txt", UpdatedAt: time.Date(2026, 10, 18, 9, 30, 0, 0, time.UTC), Applied: 101_000, Skipped: 42},
+			{ID: "stale-list", URL: "https://example.test/gone.txt"},
+		},
+	}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/filters")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/filters = %d, want 200\n%s", code, body)
+	}
+	wants := []string{
+		"adguard-base",
+		"не загружен",
+		`name="id" value="adguard-base">Обновить`,
+		"101 000", "18.10 09:30:00",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("filters page is missing %q", want)
+		}
+	}
+	if strings.Contains(body, "stale-list") {
+		t.Error("the table shows a status entry the config no longer carries")
+	}
+	if strings.Contains(body, "Списки не заданы") {
+		t.Error("the empty-lists note is shown while lists are configured")
+	}
 }
 
 // TestFiltersRefresh checks the single-flight asynchronous refresh: the

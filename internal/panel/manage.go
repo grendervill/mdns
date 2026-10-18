@@ -813,9 +813,10 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		CustomURL:    form.CustomURL,
 	}
 
+	cfg := p.currentConfig()
 	mode := "zero"
 	added := make(map[string]bool)
-	if cfg := p.currentConfig(); cfg != nil {
+	if cfg != nil {
 		view.Enabled = cfg.Filter.Enabled
 		mode = cfg.Filter.Mode
 		view.Allow = cfg.Filter.UserAllow
@@ -836,12 +837,35 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		})
 	}
 
+	// The table shows the configured lists, in config order, so a list the
+	// updater has not reported yet (a fresh addition, or a daemon that is
+	// not there) still appears with a placeholder state and its refresh
+	// control. A status entry the config no longer carries is stale and is
+	// dropped, and a status the config does carry wins over the placeholder.
+	live := make(map[string]filter.ListStatus)
 	if p.ctrl != nil {
 		if st := p.statusSnapshot(r); st.Filter.TotalBlocked > 0 {
 			view.TotalBlocked = formatCount(st.Filter.TotalBlocked)
 		}
 		for _, l := range p.ctrl.FilterStatus() {
-			view.Lists = append(view.Lists, filterListRowFor(l))
+			live[l.ID] = l
+		}
+	}
+	if cfg != nil {
+		view.Lists = make([]filterListRow, 0, len(cfg.Filter.Lists))
+		for _, l := range cfg.Filter.Lists {
+			if st, ok := live[l.ID]; ok {
+				view.Lists = append(view.Lists, filterListRowFor(st))
+				continue
+			}
+			view.Lists = append(view.Lists, filterListRow{
+				ID:         l.ID,
+				Rules:      formatCount(0),
+				Skipped:    formatCount(0),
+				Updated:    "—",
+				StateClass: "warn",
+				StateText:  "не загружен",
+			})
 		}
 	}
 
