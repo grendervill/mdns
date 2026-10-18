@@ -24,8 +24,10 @@ What it covers (the task's non-negotiables):
   * the live feed receives a query issued from inside the container over
     SSE (the feed is cleared first, so the grow is unambiguous);
   * 390x844 renders the status page without horizontal overflow;
-  * --disabled: with the panel off, /panel/ and /login answer 404 (the
-    second run of the harness installs without --password).
+  * --disabled: with the panel off, /panel/, the slash-less /panel and
+    /panel/static, /panel/static/app.css and /login all answer 404 with
+    no Location header (the second run of the harness installs without
+    --password).
 
 Screenshots go to PANEL_SHOTS (e2e/panel/shots by default) and are
 committed with the test.
@@ -482,7 +484,13 @@ def panel_flow(page, context):
 
 def disabled_flow(context):
     """The panel-off run: the routes must not reveal themselves."""
-    for path in ("/panel/", "/login", "/panel/static/app.css"):
+    for path in (
+        "/panel/",
+        "/panel",
+        "/panel/static",
+        "/panel/static/app.css",
+        "/login",
+    ):
         # No redirect following: a 404 that had to be discovered after a
         # hop would still leave the route visible on the wire.
         resp = context.request.get(BASE_URL + path, max_redirects=0)

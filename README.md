@@ -423,7 +423,9 @@ curl -s --unix-socket /run/mdns/mdns.sock http://localhost/api/v1/status
 | `/api/v1/config` | PUT | validate, apply and persist a full configuration |
 | `/api/v1/providers` | GET | the resolver catalog (with all endpoints) |
 | `/api/v1/probe` | POST | measure endpoints: `{"endpoints": [...]}` |
-| `/api/v1/requests` | GET | the query journal: `?n=100` |
+| `/api/v1/stats` | GET | cumulative counters by outcome, protocol, upstream and client |
+| `/api/v1/requests` | GET | the query journal: `?n=100` (newest first) |
+| `/api/v1/requests` | GET | paged and filtered: `?page=&per=&q=&outcome=&proto=&client=&upstream=` |
 | `/api/v1/filter/status` | GET | per-list state (rules, errors, timestamps) |
 | `/api/v1/filter/update` | POST | refresh one list (`{"id": "oisd-small"}`) or all (`{"id": ""}`) |
 | `/api/v1/events` | GET | SSE stream: `requests`, `upstreams`, `filter`, `ping` |
@@ -553,8 +555,8 @@ archive beyond the ring.
   `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; the
   embedded static assets under `/panel/static/` are sent with
   `Cache-Control: max-age=3600` instead.
-- CSS, JS and the vendored htmx are embedded in the binary: no CDN and
-  no external font or asset request, so the panel works on an isolated
+- CSS and JS are embedded in the binary: no framework, no CDN and no
+  external font or asset request, so the panel works on an isolated
   network.
 
 ### Layout and screenshots

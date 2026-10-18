@@ -22,7 +22,8 @@
 #   * `mdns status` under load <= 250 ms
 #   * TUI key response <= 2 s
 #   * authenticated panel page under load <= 1 s and it renders the feed
-#   * RSS after the run <= 200 MB (warning) / <= 400 MB (hard failure)
+#   * physical footprint after the run <= 200 MB (hard failure;
+#     `ps` RSS is printed for reference only, it counts shared pages)
 #   * counters converge: blocked ~20%, upstream ~10%, hits+misses+blocked
 #     ~ all sent queries (see docs/perf-results.md)
 #
@@ -82,13 +83,15 @@ note() { printf '%s\n' "$1" | sed 's/^/        /'; }
 phase() { printf '\n--- %s ---\n' "$1"; }
 
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'; }
+is_num() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 rss_mb() { ps -o rss= -p "$1" 2>/dev/null | awk '{printf "%.0f", $1 / 1024}'; }
 # ps RSS counts shared pages too (dyld cache, shared libraries), so it
 # overstates the daemon's own memory. vmmap's "physical footprint" is the
-# accurate number; it is best-effort and macOS-only.
+# accurate number and the one the 200 MB gate uses; it is best-effort and
+# macOS-only, so a missing value prints nothing and the caller warns
+# instead of silently passing.
 footprint_mb() {
   if ! command -v vmmap >/dev/null 2>&1; then
-    echo 0
     return
   fi
   local out
@@ -100,7 +103,7 @@ footprint_mb() {
       else { sub(/M$/, "", v); printf "%.0f", v }
       exit
     }')
-  echo "${out:-0}"
+  echo "$out"
 }
 json_get() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[sys.argv[2]])' "$1" "$2"; }
 
@@ -271,7 +274,7 @@ fi
 pass "daemon and panel are up (status + /login)"
 RSS_BASE=$(rss_mb "$MDNS_PID")
 FP_BASE=$(footprint_mb "$MDNS_PID")
-note "RSS at start: ${RSS_BASE} MB (physical footprint ${FP_BASE} MB)"
+note "RSS at start: ${RSS_BASE:-?} MB (physical footprint ${FP_BASE:-?} MB)"
 
 # --- load helper ----------------------------------------------------------
 # load_once runs one generator invocation. Results are globals so the
@@ -524,18 +527,24 @@ phase post
 sleep 2
 RSS_AFTER=$(rss_mb "$MDNS_PID")
 FP_AFTER=$(footprint_mb "$MDNS_PID")
-if [ "$FP_AFTER" -gt 0 ]; then
-  note "physical footprint after the run: ${FP_AFTER} MB (ps RSS ${RSS_AFTER} MB includes shared pages)"
-fi
-if [ "$RSS_AFTER" -gt 400 ]; then
-  fail "RSS after the run: ${RSS_AFTER} MB > 400 MB"
-elif [ "$RSS_AFTER" -gt 200 ]; then
-  note "WARNING: RSS after the run ${RSS_AFTER} MB is above the 200 MB target (hard limit 400 MB)"
-  pass "RSS after the run: ${RSS_AFTER} MB <= 400 MB"
+# The memory gate is the process's own physical footprint (ruling R4/R15):
+# ps RSS includes shared pages and would fail a healthy daemon. A missing
+# metric is a loud WARNING, never a silent pass.
+if is_num "$FP_AFTER"; then
+  if [ "$FP_AFTER" -gt 200 ]; then
+    fail "physical footprint after the run: ${FP_AFTER} MB > 200 MB"
+  else
+    pass "physical footprint after the run: ${FP_AFTER} MB <= 200 MB"
+  fi
 else
-  pass "RSS after the run: ${RSS_AFTER} MB <= 200 MB"
+  note "WARNING: vmmap physical footprint is unavailable (vmmap missing or unparsable) — memory gate skipped"
 fi
-note "RSS: start ${RSS_BASE} MB -> under load ${RSS_LOAD:-?} MB -> after ${RSS_AFTER} MB"
+if is_num "$RSS_AFTER"; then
+  note "ps RSS after the run: ${RSS_AFTER} MB (informational only; includes shared pages)"
+else
+  note "WARNING: ps RSS after the run is unavailable"
+fi
+note "RSS: start ${RSS_BASE:-?} MB -> under load ${RSS_LOAD:-?} MB -> after ${RSS_AFTER:-?} MB"
 
 "$REPO/bin/mdns" status --socket "$SOCKET" --json >"$TMP/status.json"
 HITS=0
