@@ -367,6 +367,38 @@ func TestUpstreamToggleFailure(t *testing.T) {
 	}
 }
 
+// TestUpstreamToggleLastEnabled refuses to disable the only enabled
+// upstream, and allows the flip once a second one is enabled.
+func TestUpstreamToggleLastEnabled(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg) // cloudflare enabled, quad9 disabled
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"cloudflare"}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("disabling the last enabled upstream = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "нельзя выключить последний включённый upstream") {
+		t.Errorf("the last-upstream message is missing:\n%s", body)
+	}
+	if len(ctrl.sent()) != 0 {
+		t.Error("a refused toggle reached UpdateConfig")
+	}
+	if !cfg.Upstreams[0].Enabled {
+		t.Error("the refused toggle changed the live config")
+	}
+
+	// With two enabled upstreams the same flip is allowed.
+	cfg.Upstreams[1].Enabled = true
+	resp, body = managePOST(t, p, srv, "/panel/upstreams/toggle", url.Values{"id": {"cloudflare"}})
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	sent := ctrl.sent()
+	if len(sent) != 1 || sent[0].Upstreams[0].Enabled {
+		t.Errorf("the allowed toggle did not disable cloudflare: %+v\n%s", sent, body)
+	}
+}
+
 // TestUpstreamPriority saves the whole priority column at once.
 func TestUpstreamPriority(t *testing.T) {
 	cfg := manageConfig(t)
@@ -440,7 +472,7 @@ func TestUpstreamAddCatalog(t *testing.T) {
 	p, srv := managePanel(t, ctrl)
 
 	resp, body := managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|doh"}})
-	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
 
 	sent := ctrl.sent()
 	if len(sent) != 1 {
@@ -460,7 +492,7 @@ func TestUpstreamAddCatalog(t *testing.T) {
 
 	// A second transport of the same provider gets a suffixed, unique ID.
 	resp, _ = managePOST(t, p, srv, "/panel/upstreams/add", url.Values{"provider": {"cloudflare|plain"}})
-	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
 	sent = ctrl.sent()
 	if len(sent) != 2 || len(sent[1].Upstreams) != 2 {
 		t.Fatalf("second add: %d configs, %d upstreams", len(sent), len(sent[1].Upstreams))
@@ -504,7 +536,7 @@ func TestUpstreamCustom(t *testing.T) {
 		"id": {"my-dns"}, "name": {"My DNS"}, "transport": {"dot"},
 		"address": {"10.0.0.1:853"}, "server_name": {"dns.internal"}, "priority": {"5"},
 	})
-	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
 
 	sent := ctrl.sent()
 	if len(sent) != 1 || len(sent[0].Upstreams) != 1 {
@@ -520,7 +552,7 @@ func TestUpstreamCustom(t *testing.T) {
 		resp, _ := managePOST(t, p, srv, "/panel/upstreams/custom", url.Values{
 			"transport": {"plain"}, "address": {"1.1.1.1:53"},
 		})
-		wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+		wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
 		got := ctrl.sent()
 		if len(got) != 2 || len(got[1].Upstreams) != 2 {
 			t.Fatalf("second custom: %d configs", len(got))
@@ -591,7 +623,7 @@ func TestUpstreamRemove(t *testing.T) {
 	}
 
 	resp, _ = managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"quad9"}})
-	wantRedirect(t, resp, "/panel/upstreams?ok=upstream")
+	wantRedirect(t, resp, "/panel/upstreams?ok=upstream-removed")
 	sent := ctrl.sent()
 	if len(sent) != 1 || len(sent[0].Upstreams) != 1 || sent[0].Upstreams[0].ID != "cloudflare" {
 		t.Errorf("after removing quad9: %v", sent)
@@ -648,6 +680,7 @@ func manageFilters(cfg *config.Config) {
 func TestFiltersPage(t *testing.T) {
 	cfg := manageConfig(t)
 	manageFilters(cfg)
+	cfg.Timezone = "Europe/Moscow"
 	// The table is driven by the config, so both lists the status reports
 	// are also configured; their state columns come from the status.
 	cfg.Filter.Lists = []config.FilterList{{ID: "oisd"}, {ID: "user"}}
@@ -670,7 +703,7 @@ func TestFiltersPage(t *testing.T) {
 		"Фильтры",
 		"Списки", "oisd", "user",
 		"101 000", "42",
-		"18.10 09:30:00",
+		"18.10 12:30:00",
 		"ок", "ошибка",
 		`action="/panel/filters/refresh"`,
 		"Обновить", "Обновить все",
@@ -706,6 +739,9 @@ func TestFiltersPage(t *testing.T) {
 		if !strings.Contains(body, "Списки не заданы") {
 			t.Error("the empty-lists note is missing")
 		}
+		if !strings.Contains(body, `disabled>Обновить все`) {
+			t.Error("the refresh-all button is not disabled while filtering is off")
+		}
 	})
 }
 
@@ -717,6 +753,7 @@ func TestFiltersPage(t *testing.T) {
 func TestFiltersListsTable(t *testing.T) {
 	cfg := manageConfig(t)
 	manageFilters(cfg)
+	cfg.Timezone = "Europe/Moscow"
 	cfg.Filter.Lists = []config.FilterList{{ID: "adguard-base"}, {ID: "oisd"}}
 	ctrl := &manageCtrl{
 		cfg: cfg,
@@ -735,7 +772,7 @@ func TestFiltersListsTable(t *testing.T) {
 		"adguard-base",
 		"не загружен",
 		`name="id" value="adguard-base">Обновить`,
-		"101 000", "18.10 09:30:00",
+		"101 000", "18.10 12:30:00",
 	}
 	for _, want := range wants {
 		if !strings.Contains(body, want) {
@@ -822,6 +859,28 @@ func TestFiltersRefresh(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Error("the second background FilterUpdate did not start")
+	}
+}
+
+// TestFiltersRefreshDisabled refuses a refresh while filtering is off
+// instead of claiming one started.
+func TestFiltersRefreshDisabled(t *testing.T) {
+	cfg := manageConfig(t) // filtering off by default
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/filters/refresh", url.Values{"id": {""}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("refresh with filtering off = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "фильтрация выключена") {
+		t.Errorf("the disabled message is missing:\n%s", body)
+	}
+	if strings.Contains(body, "обновление запущено") {
+		t.Error("the page claims a refresh started with filtering off")
+	}
+	if len(ctrl.refreshed()) != 0 {
+		t.Error("a refresh ran with filtering off")
 	}
 }
 
@@ -992,7 +1051,7 @@ func TestFilterListAdd(t *testing.T) {
 
 	// A ready-made catalog list is stored with an empty URL.
 	resp, body := managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{"id": {"oisd-small"}})
-	wantRedirect(t, resp, "/panel/filters?ok=list")
+	wantRedirect(t, resp, "/panel/filters?ok=list-added")
 	sent := ctrl.sent()
 	if len(sent) != 1 {
 		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
@@ -1008,7 +1067,7 @@ func TestFilterListAdd(t *testing.T) {
 	resp, _ = managePOST(t, p, srv, "/panel/filters/lists/add", url.Values{
 		"custom_id": {"my-list"}, "custom_url": {"https://example.test/hosts.txt"},
 	})
-	wantRedirect(t, resp, "/panel/filters?ok=list")
+	wantRedirect(t, resp, "/panel/filters?ok=list-added")
 	sent = ctrl.sent()
 	if len(sent) != 2 {
 		t.Fatalf("UpdateConfig called %d times, want 2", len(sent))
@@ -1093,7 +1152,7 @@ func TestFilterListRemove(t *testing.T) {
 	p, srv := managePanel(t, ctrl)
 
 	resp, body := managePOST(t, p, srv, "/panel/filters/lists/remove", url.Values{"id": {"hagezi-pro"}})
-	wantRedirect(t, resp, "/panel/filters?ok=list")
+	wantRedirect(t, resp, "/panel/filters?ok=list-removed")
 	sent := ctrl.sent()
 	if len(sent) != 1 {
 		t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
@@ -1717,5 +1776,28 @@ func assertNoInlineAssets(t *testing.T, body string) {
 	}
 	if strings.Contains(body, "<script>") {
 		t.Error("page carries an inline <script> element (forbidden by the CSP)")
+	}
+}
+
+// TestStylesheetHoverRingWidth pins the hover stroke of the donut ring:
+// app.css must widen it to 16, so a refactor cannot silently re-clip the
+// hover growth against the neighbouring slices.
+func TestStylesheetHoverRingWidth(t *testing.T) {
+	data, err := staticFS.ReadFile("static/app.css")
+	if err != nil {
+		t.Fatalf("reading the embedded app.css: %v", err)
+	}
+	css := string(data)
+
+	i := strings.Index(css, ".pie .ring:hover")
+	if i < 0 {
+		t.Fatal("app.css has no .pie .ring:hover rule")
+	}
+	rule := css[i:]
+	if end := strings.IndexByte(rule, '}'); end >= 0 {
+		rule = rule[:end+1]
+	}
+	if !strings.Contains(rule, "stroke-width: 16") {
+		t.Errorf("the .pie .ring hover rule does not use stroke-width: 16:\n%s", rule)
 	}
 }

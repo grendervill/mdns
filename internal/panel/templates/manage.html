@@ -168,7 +168,7 @@
               <td class="num">{{.Skipped}}</td>
               <td class="num">{{.Updated}}</td>
               <td>{{if .Title}}<span class="tag {{.StateClass}}" title="{{.Title}}">{{.StateText}}</span>{{else}}<span class="tag {{.StateClass}}">{{.StateText}}</span>{{end}}</td>
-              <td><button class="btn small" type="submit" name="id" value="{{.ID}}">Обновить</button></td>
+              <td><button class="btn small" type="submit" name="id" value="{{.ID}}"{{if not $.Enabled}} disabled{{end}}>Обновить</button></td>
             </tr>
             {{end}}
             {{if not .Lists}}
@@ -177,7 +177,7 @@
           </tbody>
         </table>
       </div>
-      <p class="row-actions"><button class="btn" type="submit" name="id" value="">Обновить все</button></p>
+      <p class="row-actions"><button class="btn" type="submit" name="id" value=""{{if not .Enabled}} disabled{{end}}>Обновить все</button></p>
     </form>
 
     <h3>Режим блокировки</h3>

@@ -576,7 +576,10 @@ func parsePeriod(r *http.Request, now time.Time) periodSelection {
 		if from.After(to) {
 			return periodFallback(now, "Начало периода позже конца — показан месяц")
 		}
-		cutoff := now.AddDate(0, 0, -(stats.HistoryDays - 1))
+		// The retention window is 400 days; a range exactly that long is
+		// allowed, and only a longer one falls back (the notice says
+		// «длиннее 400 дней»).
+		cutoff := now.Add(-stats.HistoryDays * 24 * time.Hour)
 		if from.Before(cutoff) {
 			return periodFallback(now, "Период длиннее 400 дней — показан месяц")
 		}

@@ -233,12 +233,16 @@ func TestDisabledPanelIs404(t *testing.T) {
 	getPaths := []string{
 		"/", "/login", "/panel", "/panel/", "/panel/events",
 		"/panel/static", "/panel/static/app.css",
+		"/panel/upstreams", "/panel/filters", "/panel/settings",
 	}
 	for _, path := range getPaths {
 		resp, body := do(t, client, http.MethodGet, srv.URL+path, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Errorf("GET %s = %d, want 404 (disabled panel must not reveal itself)\n%s",
 				path, resp.StatusCode, body)
+		}
+		if got := resp.Header.Get("Location"); got != "" {
+			t.Errorf("GET %s on a disabled panel set Location = %q, want none", path, got)
 		}
 	}
 

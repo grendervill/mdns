@@ -101,14 +101,20 @@ func okMessage(key string) string {
 	switch key {
 	case "upstream":
 		return "upstream переключён"
+	case "upstream-added":
+		return "upstream добавлен"
+	case "upstream-removed":
+		return "upstream удалён"
 	case "strategy":
 		return "стратегия сохранена"
 	case "priority":
 		return "порядок сохранён"
 	case "lists":
 		return "обновление запущено"
-	case "list":
-		return "список сохранён"
+	case "list-added":
+		return "список добавлен"
+	case "list-removed":
+		return "список удалён"
 	case "mode":
 		return "режим применён"
 	case "rule":
@@ -457,19 +463,36 @@ func (p *Panel) handleUpstreamToggle(w http.ResponseWriter, r *http.Request) {
 
 	id := strings.TrimSpace(r.PostFormValue("id"))
 	next := cloneConfig(cfg)
-	found := false
+	idx := -1
 	for i := range next.Upstreams {
 		if next.Upstreams[i].ID != id {
 			continue
 		}
-		next.Upstreams[i].Enabled = !next.Upstreams[i].Enabled
-		found = true
+		idx = i
 		break
 	}
-	if !found {
+	if idx < 0 {
 		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: "upstream не найден: " + id})
 		return
 	}
+
+	// Disabling the last enabled upstream would leave the daemon with
+	// nothing to forward to, exactly like removing it.
+	if next.Upstreams[idx].Enabled {
+		enabled := 0
+		for _, u := range next.Upstreams {
+			if u.Enabled {
+				enabled++
+			}
+		}
+		if enabled <= 1 {
+			p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{
+				Error: "нельзя выключить последний включённый upstream — демону будет некуда пересылать запросы",
+			})
+			return
+		}
+	}
+	next.Upstreams[idx].Enabled = !next.Upstreams[idx].Enabled
 
 	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
@@ -574,7 +597,7 @@ func (p *Panel) handleUpstreamAdd(w http.ResponseWriter, r *http.Request) {
 	up.Priority = nextPriority(next.Upstreams)
 	next.Upstreams = append(next.Upstreams, up)
 
-	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
 }
@@ -642,7 +665,7 @@ func (p *Panel) handleUpstreamCustom(w http.ResponseWriter, r *http.Request) {
 		Enabled:    true,
 	})
 
-	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
 }
@@ -684,7 +707,7 @@ func (p *Panel) handleUpstreamRemove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	next.Upstreams = append(next.Upstreams[:idx], next.Upstreams[idx+1:]...)
-	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream", func(status int, n manageNotice) {
+	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-removed", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
 }
@@ -813,6 +836,7 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		CustomURL:    form.CustomURL,
 	}
 
+	loc := p.location()
 	cfg := p.currentConfig()
 	mode := "zero"
 	added := make(map[string]bool)
@@ -855,7 +879,7 @@ func (p *Panel) renderFilters(w http.ResponseWriter, r *http.Request, status int
 		view.Lists = make([]filterListRow, 0, len(cfg.Filter.Lists))
 		for _, l := range cfg.Filter.Lists {
 			if st, ok := live[l.ID]; ok {
-				view.Lists = append(view.Lists, filterListRowFor(st))
+				view.Lists = append(view.Lists, filterListRowFor(st, loc))
 				continue
 			}
 			view.Lists = append(view.Lists, filterListRow{
@@ -960,7 +984,7 @@ func (p *Panel) handleFilterListAdd(w http.ResponseWriter, r *http.Request) {
 	}
 
 	next.Filter.Lists = append(next.Filter.Lists, list)
-	p.finishApply(w, r, next, filtersPath+"?ok=list", func(status int, n manageNotice) {
+	p.finishApply(w, r, next, filtersPath+"?ok=list-added", func(status int, n manageNotice) {
 		p.renderFilters(w, r, status, n, form)
 	})
 }
@@ -987,13 +1011,14 @@ func (p *Panel) handleFilterListRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	next.Filter.Lists = kept
 
-	p.finishApply(w, r, next, filtersPath+"?ok=list", func(status int, n manageNotice) {
+	p.finishApply(w, r, next, filtersPath+"?ok=list-removed", func(status int, n manageNotice) {
 		p.renderFilters(w, r, status, n, filtersForm{Kind: "block"})
 	})
 }
 
-// filterListRowFor renders one list's live state.
-func filterListRowFor(l filter.ListStatus) filterListRow {
+// filterListRowFor renders one list's live state. The update time is
+// shown in loc, the panel's configured zone, like every other time.
+func filterListRowFor(l filter.ListStatus, loc *time.Location) filterListRow {
 	row := filterListRow{
 		ID:      l.ID,
 		Rules:   formatCount(uint64(l.Applied)),
@@ -1001,7 +1026,7 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 		Updated: "—",
 	}
 	if !l.UpdatedAt.IsZero() {
-		row.Updated = l.UpdatedAt.Format("02.01 15:04:05")
+		row.Updated = l.UpdatedAt.In(loc).Format("02.01 15:04:05")
 	}
 
 	switch {
@@ -1024,6 +1049,12 @@ func filterListRowFor(l filter.ListStatus) filterListRow {
 func (p *Panel) handleFiltersRefresh(w http.ResponseWriter, r *http.Request) {
 	if p.ctrl == nil {
 		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()}, filtersForm{Kind: "block"})
+		return
+	}
+	// With filtering off there is no engine to update: claiming a refresh
+	// started would be a lie the next page load contradicts.
+	if cfg := p.currentConfig(); cfg == nil || !cfg.Filter.Enabled {
+		p.renderFilters(w, r, http.StatusBadRequest, manageNotice{Error: "фильтрация выключена"}, filtersForm{Kind: "block"})
 		return
 	}
 
@@ -1594,7 +1625,7 @@ func (p *Panel) renderMaintenance(w http.ResponseWriter, r *http.Request, status
 	}
 	if p.ctrl != nil {
 		if started := p.ctrl.Started(); !started.IsZero() {
-			view.Started = started.Format("02.01.2006 15:04:05")
+			view.Started = started.In(p.location()).Format("02.01.2006 15:04:05")
 			view.Uptime = formatUptime(time.Since(started))
 		}
 	}

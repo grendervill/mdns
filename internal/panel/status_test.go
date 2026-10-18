@@ -880,3 +880,27 @@ func TestStatusPeriodForm(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusPeriodCustomBoundary checks the retention cutoff: a range of
+// exactly 400 whole days is accepted, one day longer falls back to the
+// month with the «длиннее 400 дней» notice.
+func TestStatusPeriodCustomBoundary(t *testing.T) {
+	now := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	day := func(d time.Time) string { return d.UTC().Format("2006-01-02") }
+
+	boundary := now.Add(-stats.HistoryDays * 24 * time.Hour)
+	req := httptest.NewRequest(http.MethodGet,
+		"/panel/?period=custom&from="+day(boundary)+"&to="+day(now), nil)
+	sel := parsePeriod(req, now)
+	if sel.Period != "custom" || sel.Notice != "" {
+		t.Errorf("a 400-day window = %q/%q, want an accepted custom range", sel.Period, sel.Notice)
+	}
+
+	older := boundary.AddDate(0, 0, -1)
+	req = httptest.NewRequest(http.MethodGet,
+		"/panel/?period=custom&from="+day(older)+"&to="+day(now), nil)
+	sel = parsePeriod(req, now)
+	if sel.Period != defaultPeriod || !strings.Contains(sel.Notice, "длиннее 400 дней") {
+		t.Errorf("a 401-day window = %q/%q, want the month fallback", sel.Period, sel.Notice)
+	}
+}
