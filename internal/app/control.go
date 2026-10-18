@@ -125,8 +125,14 @@ func (a *App) FilterUpdate(ctx context.Context, id string) error {
 	return err
 }
 
-// wireEvents connects one runtime generation to the event bus.
+// wireEvents connects one runtime generation to the event bus and to
+// the cumulative statistics. The collector is owned by the App: it is
+// deliberately not recreated per generation, so the counters stay
+// "since start" across a configuration rebuild.
 func (a *App) wireEvents(rt *runtime) {
+	if rt.core != nil {
+		rt.core.SetObserver(a.collector)
+	}
 	if rt.queryLog == nil {
 		return
 	}

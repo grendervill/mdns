@@ -27,6 +27,7 @@ import (
 	"mydns/internal/qlog"
 	"mydns/internal/ratelimit"
 	"mydns/internal/routing"
+	"mydns/internal/stats"
 	"mydns/internal/tlscert"
 	"mydns/internal/upstream"
 )
@@ -252,6 +253,13 @@ type App struct {
 	cfg *config.Config
 	rt  *runtime
 
+	// collector holds the cumulative query statistics. It belongs to
+	// the App, not to a runtime generation: the counters cover the
+	// whole run of the daemon, so a structural rebuild must not reset
+	// them. Every generation's core is pointed at this one collector by
+	// wireEvents.
+	collector *stats.Collector
+
 	bus     *api.Bus
 	apiLn   net.Listener
 	apiDone chan struct{}
@@ -278,11 +286,12 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 
 	cfgCopy := *cfg
 	a := &App{
-		logger: logger,
-		opts:   opts,
-		cfg:    &cfgCopy,
-		rt:     rt,
-		bus:    bus,
+		logger:    logger,
+		opts:      opts,
+		cfg:       &cfgCopy,
+		rt:        rt,
+		bus:       bus,
+		collector: stats.NewCollector(),
 	}
 	a.wireEvents(rt)
 	return a, nil
