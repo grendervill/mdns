@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,7 +19,8 @@ const queryTimeout = 2 * time.Second
 // does not apply. It keeps no state between queries, so Exchange is
 // safe for concurrent use and Close is a no-op.
 type Plain struct {
-	addr string
+	addr     string
+	resolver *bootstrapResolver
 }
 
 // Name implements Transport.
@@ -26,21 +28,46 @@ func (p *Plain) Name() string { return "plain" }
 
 // Exchange implements Transport: it sends req as is over UDP and, when
 // the reply has the TC bit set, repeats the same request over TCP and
-// returns the full reply.
+// returns the full reply. A hostname address is resolved through the
+// bootstrap resolver once per exchange, before the UDP query, and the
+// same IP is reused for the TCP fallback.
 func (p *Plain) Exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
-	udp := &dns.Client{Net: "udp", Timeout: queryTimeout}
-	resp, _, err := udp.ExchangeContext(ctx, req, p.addr)
+	addrs, err := p.resolver.resolveAddr(ctx, p.addr)
 	if err != nil {
-		return nil, fmt.Errorf("plain udp %s: %w", p.addr, err)
+		return nil, fmt.Errorf("plain resolve %s: %w", p.addr, err)
+	}
+
+	var errs []error
+	for _, addr := range addrs {
+		resp, err := p.exchangeAddr(ctx, req, addr)
+		if err == nil {
+			return resp, nil
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("no addresses resolved"))
+	}
+	return nil, fmt.Errorf("plain %s: %w", p.addr, errors.Join(errs...))
+}
+
+// exchangeAddr sends one query to an already resolved address and
+// performs the TCP fallback on the same address when the UDP reply is
+// truncated.
+func (p *Plain) exchangeAddr(ctx context.Context, req *dns.Msg, addr string) (*dns.Msg, error) {
+	udp := &dns.Client{Net: "udp", Timeout: queryTimeout}
+	resp, _, err := udp.ExchangeContext(ctx, req, addr)
+	if err != nil {
+		return nil, err
 	}
 	if !resp.Truncated {
 		return resp, nil
 	}
 
 	tcp := &dns.Client{Net: "tcp", Timeout: queryTimeout}
-	resp, _, err = tcp.ExchangeContext(ctx, req, p.addr)
+	resp, _, err = tcp.ExchangeContext(ctx, req, addr)
 	if err != nil {
-		return nil, fmt.Errorf("plain tcp fallback %s: %w", p.addr, err)
+		return nil, err
 	}
 	return resp, nil
 }

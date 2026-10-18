@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -21,6 +22,7 @@ import (
 type DoQ struct {
 	addr      string
 	tlsConfig *tls.Config
+	resolver  *bootstrapResolver
 
 	mu   sync.Mutex
 	conn *quic.Conn
@@ -42,6 +44,7 @@ func newDoQ(cfg config.UpstreamConfig) *DoQ {
 			InsecureSkipVerify: cfg.InsecureSkipVerify,
 			NextProtos:         []string{"doq"},
 		},
+		resolver: defaultResolver,
 	}
 }
 
@@ -116,12 +119,35 @@ func (q *DoQ) connection(ctx context.Context) (*quic.Conn, error) {
 		q.conn = nil
 	}
 
-	conn, err := quic.DialAddr(ctx, q.addr, q.tlsConfig, nil)
+	conn, err := q.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	q.conn = conn
 	return conn, nil
+}
+
+// dial opens a QUIC connection to addr, resolving a hostname through the
+// bootstrap resolver first. The TLS config keeps the original hostname
+// as the SNI, so the certificate check still names the upstream.
+func (q *DoQ) dial(ctx context.Context) (*quic.Conn, error) {
+	addrs, err := q.resolver.resolveAddr(ctx, q.addr)
+	if err != nil {
+		return nil, fmt.Errorf("doq resolve %s: %w", q.addr, err)
+	}
+
+	var errs []error
+	for _, addr := range addrs {
+		conn, err := quic.DialAddr(ctx, addr, q.tlsConfig, nil)
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+	}
+	if len(errs) == 0 {
+		errs = append(errs, errors.New("no addresses resolved"))
+	}
+	return nil, errors.Join(errs...)
 }
 
 // connDead reports whether the shared connection is gone, which is the
