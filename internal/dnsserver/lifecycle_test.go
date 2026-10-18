@@ -619,6 +619,55 @@ func TestStartTLSPartialFailureRollsBack(t *testing.T) {
 	}
 }
 
+// TestShutdownAfterStartNeverLeaksPort pins the dns.Server lifecycle
+// race deterministically: Start must return only once the listener is
+// actually serving, so an immediate Shutdown cannot see "server not
+// started" and leave the listener — and its port — bound. On the old
+// code (go s.serve) the serve goroutine often had not set miekg/dns's
+// started flag yet, Shutdown refused to close the listener, and the
+// next iteration's bind failed with "address already in use".
+func TestShutdownAfterStartNeverLeaksPort(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		Plain: config.Protocol{Enabled: true, Port: port},
+	}
+
+	const iterations = 100
+	for i := 0; i < iterations; i++ {
+		srv, _ := pipeline(t, cfg, newFakeSource(t, true), nil)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := srv.Start(ctx); err != nil {
+			cancel()
+			t.Fatalf("iteration %d: Start() = %v, want nil", i, err)
+		}
+
+		sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := srv.Shutdown(sctx)
+		scancel()
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d: Shutdown() = %v, want nil (a race leaves the listener open)", i, err)
+		}
+
+		// Both listeners must be gone: rebind the port right away.
+		addr := fmt.Sprintf(":%d", port)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Fatalf("iteration %d: rebind tcp %s = %v, want nil (a listener leaked)", i, addr, err)
+		}
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			_ = ln.Close()
+			t.Fatalf("iteration %d: rebind udp %s = %v, want nil (a listener leaked)", i, addr, err)
+		}
+		_ = pc.Close()
+		_ = ln.Close()
+	}
+}
+
 // quietStdLog mutes the standard logger for a test that deliberately
 // provokes an HTTPS handshake error: net/http reports those through
 // log.Default, not through the test's slog logger.

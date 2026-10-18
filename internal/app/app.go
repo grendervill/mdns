@@ -87,20 +87,26 @@ type runtime struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	// wg tracks the background loops start launches, so stop can wait
-	// for them: the ACME manager and the filter updater write under the
-	// data directory.
-	wg sync.WaitGroup
+	// wg tracks the background loops the current generation's start
+	// launched, so stop can wait for them: the ACME manager and the
+	// filter updater write under the data directory. start replaces it
+	// with a fresh group on every generation, so a stop that times out
+	// (leaving a parked Wait) can never race a later generation's Add
+	// on the same group — the same runtime is restarted on the
+	// UpdateConfig rollback paths.
+	wg *sync.WaitGroup
 }
 
 // goRun starts a tracked background loop. stop waits for every loop
 // this way, so a caller that removes the data directory right after
 // Stop cannot race the ACME manager or the filter updater writing into
-// it.
+// it. The group is captured at launch so a later generation replacing
+// rt.wg cannot complete the wrong group.
 func (rt *runtime) goRun(fn func()) {
-	rt.wg.Add(1)
+	wg := rt.wg
+	wg.Add(1)
 	go func() {
-		defer rt.wg.Done()
+		defer wg.Done()
 		fn()
 	}()
 }
@@ -108,6 +114,7 @@ func (rt *runtime) goRun(fn func()) {
 // start binds the listeners and starts the background loops.
 func (rt *runtime) start(parent context.Context) error {
 	rt.ctx, rt.cancel = context.WithCancel(parent)
+	rt.wg = new(sync.WaitGroup)
 
 	rt.goRun(func() { rt.monitor.Run(rt.ctx) })
 	if rt.updater != nil {
@@ -203,18 +210,23 @@ func (rt *runtime) stop(ctx context.Context) error {
 	}
 	err := rt.server.Shutdown(ctx)
 
-	// Wait for the background loops. The ACME manager and the filter
-	// updater write into the data directory, so a caller that removes
-	// it right after Stop (as the tests do) must not race those writes.
-	// The wait honours ctx so a stuck loop cannot hang shutdown forever.
-	done := make(chan struct{})
-	go func() {
-		rt.wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-ctx.Done():
+	// Wait for the background loops of this generation. The ACME
+	// manager and the filter updater write into the data directory, so a
+	// caller that removes it right after Stop (as the tests do) must not
+	// race those writes. The wait honours ctx so a stuck loop cannot
+	// hang shutdown forever. Wait on the snapshot: start may replace
+	// rt.wg for a later generation while this Wait is still parked.
+	wg := rt.wg
+	if wg != nil {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 	}
 	return err
 }
