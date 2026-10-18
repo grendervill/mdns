@@ -407,6 +407,45 @@ func TestStaticServedWithoutAuth(t *testing.T) {
 	}
 }
 
+// checkPageHeaders asserts the anti-framing, CSP and cache headers the
+// render path must set on every HTML page.
+func checkPageHeaders(t *testing.T, what string, resp *http.Response) {
+	t.Helper()
+
+	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("%s: X-Frame-Options = %q, want DENY", what, got)
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); got != "frame-ancestors 'none'; default-src 'self'" {
+		t.Errorf("%s: Content-Security-Policy = %q, want frame-ancestors 'none'; default-src 'self'", what, got)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("%s: Cache-Control = %q, want no-store (the page carries a CSRF token)", what, got)
+	}
+}
+
+// TestPageSecurityHeaders checks that both the login page and the
+// authenticated page refuse framing and caching: a framed same-origin
+// page would keep a valid CSRF token, and a cached page would keep the
+// token around.
+func TestPageSecurityHeaders(t *testing.T) {
+	srv, client := newTestServer(t, true, hashPassword(t, testPassword))
+
+	loginResp, _ := do(t, client, http.MethodGet, srv.URL+"/login", nil)
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /login = %d, want 200", loginResp.StatusCode)
+	}
+	checkPageHeaders(t, "GET /login", loginResp)
+
+	if resp := login(t, srv, client, testPassword); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("login = %d, want 303", resp.StatusCode)
+	}
+	panelResp, _ := do(t, client, http.MethodGet, srv.URL+"/panel/", nil)
+	if panelResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /panel/ = %d, want 200", panelResp.StatusCode)
+	}
+	checkPageHeaders(t, "GET /panel/", panelResp)
+}
+
 // TestEventsStream checks the placeholder event stream: with a session
 // it answers 200 text/event-stream and sends an immediate ping, so the
 // status page can tell "connected" from "waiting for an event".

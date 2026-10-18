@@ -28,11 +28,22 @@ var templates = map[string]*template.Template{
 	"index": template.Must(template.New("index").Parse(indexPage)),
 }
 
-// render writes one page. The content type and nosniff are set before
-// the status so a caller's headers cannot be overwritten.
+// render writes one page. Every header is set before the status so a
+// caller's headers cannot be overwritten.
+//
+// The framing and CSP headers matter for the whole render path: a
+// clickjacked page keeps its same-origin CSRF token, so framing would
+// defeat CSRF. default-src 'self' also means pages may not carry
+// inline <style>/style="…" or inline scripts — styles go in
+// /panel/static/app.css and behaviour in /panel/static/*.js.
 func (p *Panel) render(w http.ResponseWriter, status int, name string, data any) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'; default-src 'self'")
+	// The pages carry a CSRF token in the HTML; no browser or proxy may
+	// keep a copy of them.
+	w.Header().Set("Cache-Control", "no-store")
 	if status != http.StatusOK {
 		w.WriteHeader(status)
 	}
