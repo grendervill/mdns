@@ -13,6 +13,7 @@ import (
 	"mydns/internal/probe"
 	"mydns/internal/providers"
 	"mydns/internal/qlog"
+	"mydns/internal/stats"
 	"mydns/internal/upstream"
 	"mydns/internal/version"
 )
@@ -103,6 +104,32 @@ func (a *App) Requests(n int) []qlog.Entry {
 	queryLog := a.rt.queryLog
 	a.mu.Unlock()
 	return queryLog.Recent(n)
+}
+
+// Stats implements api.Controller: the cumulative query statistics. The
+// collector outlives every runtime generation, so the counters cover the
+// whole run of the daemon.
+func (a *App) Stats() stats.Snapshot { return a.collector.Snapshot() }
+
+// Started implements api.Controller: the time the app was constructed,
+// which the API reports as the stats "since".
+func (a *App) Started() time.Time { return a.started }
+
+// RequestsQuery implements api.Controller: one page of filtered history,
+// newest first. page is 1-based and per is the page size; both are
+// clamped defensively (the API clamps per to [1,500] before calling).
+func (a *App) RequestsQuery(q qlog.Query, page, per int) ([]qlog.Entry, int) {
+	if page < 1 {
+		page = 1
+	}
+	if per < 1 {
+		per = 1
+	}
+
+	a.mu.Lock()
+	queryLog := a.rt.queryLog
+	a.mu.Unlock()
+	return queryLog.Query(q, (page-1)*per, per)
 }
 
 // FilterUpdate implements api.Controller: a manual list refresh.

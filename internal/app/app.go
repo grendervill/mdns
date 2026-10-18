@@ -260,6 +260,10 @@ type App struct {
 	// wireEvents.
 	collector *stats.Collector
 
+	// started is the time the app was constructed, reported as the
+	// stats "since". New is where a daemon run begins.
+	started time.Time
+
 	bus     *api.Bus
 	apiLn   net.Listener
 	apiDone chan struct{}
@@ -292,6 +296,7 @@ func New(cfg *config.Config, opts Options, logger *slog.Logger) (*App, error) {
 		rt:        rt,
 		bus:       bus,
 		collector: stats.NewCollector(),
+		started:   time.Now(),
 	}
 	a.wireEvents(rt)
 	return a, nil

@@ -30,7 +30,7 @@ func TestAppCollectsStats(t *testing.T) {
 	ask("one.example.com") // ...then served from the cache
 	ask("two.example.com") // forwarded
 
-	snap := a.CollectorForTests().Snapshot()
+	snap := a.Stats()
 	if snap.Total != 3 {
 		t.Fatalf("Total before the update = %d, want 3", snap.Total)
 	}
@@ -54,7 +54,7 @@ func TestAppCollectsStats(t *testing.T) {
 
 	ask("one.example.com") // the rebuilt cache is cold: forwarded again
 
-	snap = a.CollectorForTests().Snapshot()
+	snap = a.Stats()
 	if snap.Total != 4 {
 		t.Errorf("Total after the update = %d, want 4 (counters survive a rebuild)", snap.Total)
 	}
