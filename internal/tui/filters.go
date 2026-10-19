@@ -23,6 +23,11 @@ const (
 	inputRequestsFilter
 	inputFilterListID
 	inputFilterListURL
+	// inputUpstreamFormField edits the focused field of the custom
+	// upstream form.
+	inputUpstreamFormField
+	// inputUpstreamPriority edits the priority of the selected upstream.
+	inputUpstreamPriority
 )
 
 // nextBlockMode cycles the block mode.

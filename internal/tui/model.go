@@ -28,6 +28,12 @@ const (
 	// screenFilterCatalog is the list picker opened from the filters
 	// screen; it is not a tab.
 	screenFilterCatalog
+	// screenUpstreamCatalog is the provider-endpoint picker opened from
+	// the upstreams screen; it is not a tab.
+	screenUpstreamCatalog
+	// screenUpstreamForm is the custom-upstream form opened from the
+	// upstreams screen; it is not a tab.
+	screenUpstreamForm
 	// screenHelp is not a tab: the ? key opens it as an overlay and
 	// Esc (or any digit) leaves it.
 	screenHelp
@@ -93,6 +99,27 @@ type Model struct {
 	settingsCfg    *config.Config
 	settingsCursor int
 	settingsErr    error
+
+	// upstreamCfg is the live configuration the upstream edits work on;
+	// it is reloaded whenever the upstreams screens are entered.
+	upstreamCfg    *config.Config
+	upstreamCursor int
+	upstreamErr    error
+
+	// upstreamCatalogCursor is the highlighted row of the provider
+	// endpoint picker.
+	upstreamCatalogCursor int
+
+	// upstreamForm is the state of the custom-upstream form, carrying
+	// every typed field until ctrl+s applies it.
+	upstreamForm      upstreamFormState
+	upstreamFormField int
+	upstreamFormErr   error
+
+	// probeUpstream/probeResult hold the last probe's target and its
+	// rendered outcome, shown under the table.
+	probeUpstream string
+	probeResult   string
 
 	inputActive bool
 	inputMode   inputMode
@@ -165,6 +192,17 @@ type (
 		err error
 	}
 	configAppliedMsg struct{ err error }
+
+	// upstreamConfigLoadedMsg carries the live config for upstream edits.
+	upstreamConfigLoadedMsg struct {
+		cfg *config.Config
+		err error
+	}
+	// upstreamProbedMsg carries one upstream probe's rendered outcome.
+	upstreamProbedMsg struct {
+		id     string
+		result string
+	}
 
 	requestsLoadedMsg struct {
 		entries []qlog.Entry
@@ -328,20 +366,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.settingsErr = msg.err
 			m.filterErr = msg.err
+			m.upstreamErr = msg.err
+			m.upstreamFormErr = msg.err
 			// The daemon refused the change: reload the live config so
 			// the filter screens never edit a rejected copy.
 			if m.screen == screenFilters || m.screen == screenFilterCatalog {
 				return m, loadFilterConfig(m.client)
 			}
+			if isUpstreamScreen(m.screen) {
+				return m, loadUpstreamConfig(m.client)
+			}
 			return m, nil
 		}
 		m.settingsErr = nil
 		m.filterErr = nil
+		m.upstreamErr = nil
+		m.upstreamFormErr = nil
 		cmds := []tea.Cmd{fetchStatus(m.client)}
 		if m.screen == screenFilters || m.screen == screenFilterCatalog {
 			cmds = append(cmds, filterConfigLoadCmd(m.client))
 		}
+		if isUpstreamScreen(m.screen) {
+			cmds = append(cmds, loadUpstreamConfig(m.client))
+		}
 		return m, tea.Batch(cmds...)
+
+	case upstreamConfigLoadedMsg:
+		if msg.err != nil {
+			m.upstreamErr = msg.err
+			return m, nil
+		}
+		m.upstreamCfg = msg.cfg
+		m.upstreamErr = nil
+		if m.upstreamCursor >= len(m.upstreamRows()) && m.upstreamCursor > 0 {
+			m.upstreamCursor = len(m.upstreamRows()) - 1
+		}
+		return m, nil
+
+	case upstreamProbedMsg:
+		m.probeUpstream = msg.id
+		m.probeResult = msg.result
+		return m, nil
 
 	case requestsLoadedMsg:
 		if msg.err == nil {
@@ -372,6 +437,8 @@ func (m Model) refreshCmd() tea.Cmd {
 		cmds = append(cmds, loadFilterStatus(m.client), loadFilterConfig(m.client))
 	case screenFilterCatalog:
 		cmds = append(cmds, loadFilterConfig(m.client))
+	case screenUpstreams, screenUpstreamCatalog:
+		cmds = append(cmds, loadUpstreamConfig(m.client))
 	case screenSettings:
 		cmds = append(cmds, loadConfig(m.client))
 	case screenRequests:
@@ -393,6 +460,10 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 		if m.settingsCfg == nil {
 			return loadConfig(m.client)
 		}
+	case screenUpstreams, screenUpstreamCatalog:
+		// Always reload the live config: the edits must never work on a
+		// stale copy.
+		return loadUpstreamConfig(m.client)
 	case screenRequests:
 		if m.requests == nil {
 			return loadRequests(m.client)
@@ -516,6 +587,88 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.screen = screenFilters
 			m.filterErr = nil
+		}
+
+	case screenUpstreams:
+		switch msg.String() {
+		case "j", "down":
+			if m.upstreamCursor < len(m.upstreamRows())-1 {
+				m.upstreamCursor++
+			}
+		case "k", "up":
+			if m.upstreamCursor > 0 {
+				m.upstreamCursor--
+			}
+		case " ", "space":
+			return m.toggleSelectedUpstream()
+		case "d":
+			return m.removeSelectedUpstream()
+		case "p":
+			return m.startUpstreamPriority()
+		case "s":
+			return m.cycleUpstreamStrategy()
+		case "t":
+			return m.probeSelectedUpstream()
+		case "a":
+			m.screen = screenUpstreamCatalog
+			m.upstreamCatalogCursor = 0
+			m.upstreamErr = nil
+			return m, loadUpstreamConfig(m.client)
+		case "c":
+			return m.startUpstreamForm()
+		}
+
+	case screenUpstreamCatalog:
+		entries := upstreamCatalogEntries()
+		switch msg.String() {
+		case "j", "down":
+			if m.upstreamCatalogCursor < len(entries)-1 {
+				m.upstreamCatalogCursor++
+			}
+		case "k", "up":
+			if m.upstreamCatalogCursor > 0 {
+				m.upstreamCatalogCursor--
+			}
+		case "enter":
+			return m.addCatalogEndpoint()
+		case "esc":
+			m.screen = screenUpstreams
+			m.upstreamErr = nil
+		}
+
+	case screenUpstreamForm:
+		switch msg.String() {
+		case "j", "down":
+			if m.upstreamFormField < len(upstreamFormFields)-1 {
+				m.upstreamFormField++
+			}
+		case "k", "up":
+			if m.upstreamFormField > 0 {
+				m.upstreamFormField--
+			}
+		case "enter":
+			if m.upstreamFormField == upstreamFormTransport {
+				m.upstreamForm.Transport = nextUpstreamTransport(m.upstreamForm.Transport)
+				return m, nil
+			}
+			m.inputActive = true
+			m.inputMode = inputUpstreamFormField
+			m.inputField = m.upstreamFormField
+			m.input = ""
+		case "left", "right":
+			if m.upstreamFormField == upstreamFormTransport {
+				if msg.String() == "left" {
+					m.upstreamForm.Transport = prevUpstreamTransport(m.upstreamForm.Transport)
+				} else {
+					m.upstreamForm.Transport = nextUpstreamTransport(m.upstreamForm.Transport)
+				}
+			}
+		case "ctrl+s":
+			return m.applyUpstreamForm()
+		case "esc":
+			m.screen = screenUpstreams
+			m.upstreamFormErr = nil
+			m.upstreamErr = nil
 		}
 
 	case screenSettings:
@@ -646,6 +799,10 @@ func (m Model) commitInput() (tea.Model, tea.Cmd) {
 		return m.commitFilterListID()
 	case inputFilterListURL:
 		return m.commitFilterListURL()
+	case inputUpstreamFormField:
+		return m.commitUpstreamFormField()
+	case inputUpstreamPriority:
+		return m.commitUpstreamPriority()
 	}
 	m.inputActive = false
 	return m, nil
@@ -693,6 +850,10 @@ func (m Model) View() string {
 		b.WriteString(m.requestsView())
 	case screenUpstreams:
 		b.WriteString(m.upstreamsView())
+	case screenUpstreamCatalog:
+		b.WriteString(m.upstreamCatalogView())
+	case screenUpstreamForm:
+		b.WriteString(m.upstreamFormView())
 	case screenFilters:
 		b.WriteString(m.filtersView())
 	case screenFilterCatalog:
@@ -754,6 +915,13 @@ func (m *Model) helpView() string {
 		"  e     включить или выключить фильтрацию",
 		"  r     добавить правило (block домен / allow домен)",
 		"  u     обновить все списки · enter — выбранный",
+		"",
+		titleStyle.Render("Upstream'ы (экран 4)"),
+		"  a     каталог провайдеров (enter — добавить, esc — назад)",
+		"  c     свой upstream: ID, название, транспорт, адрес, SNI, приоритет",
+		"  пробел включить/выключить выбранный (последний включённый не выключается)",
+		"  d     удалить выбранный upstream · p — приоритет · s — стратегия",
+		"  t     проверить выбранный upstream (probe)",
 		"",
 		titleStyle.Render("Настройки (экран 6)"),
 		"  enter — изменить поле, ctrl+s — применить",
