@@ -3,8 +3,8 @@ package filter
 import "slices"
 
 // CatalogEntry is one known block list. Category is "ads"
-// (advertising/tracking) or "combined" (combined security/privacy
-// lists).
+// (advertising/tracking), "combined" (combined security/privacy lists)
+// or "regional" (lists scoped to one country or language).
 type CatalogEntry struct {
 	ID          string
 	Name        string
@@ -92,6 +92,105 @@ var catalogEntries = []CatalogEntry{
 		URL:         "https://raw.githubusercontent.com/badmojr/1Hosts/master/Lite/hosts.txt",
 		Category:    "combined",
 		Description: "Lightweight, family-suitable combined list.",
+	},
+
+	{
+		ID:          "ruadlist",
+		Name:        "RU AdList",
+		URL:         "https://easylist-downloads.adblockplus.org/advblock.txt",
+		Category:    "regional",
+		Description: "Ads and trackers for RU, UA, UZ, KZ; the proper list (an include-only uBO variant exists and must not be used).",
+	},
+	{
+		ID:          "adguard-ukrainian",
+		Name:        "AdGuard Ukrainian",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/23.txt",
+		Category:    "regional",
+		Description: "AdGuard's Ukrainian list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "easylist-germany",
+		Name:        "EasyList Germany",
+		URL:         "https://easylist.to/easylistgermany/easylistgermany.txt",
+		Category:    "regional",
+		Description: "EasyList's German supplement; only its domain rules apply to DNS.",
+	},
+	{
+		ID:          "adguard-french",
+		Name:        "AdGuard Français",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/16.txt",
+		Category:    "regional",
+		Description: "AdGuard's French list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "easylist-italy",
+		Name:        "EasyList Italy",
+		URL:         "https://easylist-downloads.adblockplus.org/easylistitaly.txt",
+		Category:    "regional",
+		Description: "EasyList's Italian supplement; only its domain rules apply to DNS.",
+	},
+	{
+		ID:          "adguard-dutch",
+		Name:        "AdGuard Dutch",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/8.txt",
+		Category:    "regional",
+		Description: "AdGuard's Dutch list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "polish-filters",
+		Name:        "Oficjalne Polskie Filtry (uBO)",
+		URL:         "https://raw.githubusercontent.com/MajkiIT/polish-ads-filter/master/polish-adblock-filters/adblock.txt",
+		Category:    "regional",
+		Description: "The official Polish ad and tracker filters for uBlock Origin.",
+	},
+	{
+		ID:          "certpl-warning",
+		Name:        "CERT.PL Warning List",
+		URL:         "https://hole.cert.pl/domains/v2/domains_ublock.txt",
+		Category:    "regional",
+		Description: "Polish CERT phishing/malware domains; domain-only rules.",
+	},
+	{
+		ID:          "adguard-turkish",
+		Name:        "AdGuard Turkish",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/13.txt",
+		Category:    "regional",
+		Description: "AdGuard's Turkish list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "adguard-chinese",
+		Name:        "AdGuard Chinese (中文)",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/224.txt",
+		Category:    "regional",
+		Description: "AdGuard's Chinese list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "adguard-japanese",
+		Name:        "AdGuard Japanese",
+		URL:         "https://filters.adtidy.org/extension/ublock/filters/7.txt",
+		Category:    "regional",
+		Description: "AdGuard's Japanese list; ads and trackers on regional sites.",
+	},
+	{
+		ID:          "easylist-hebrew",
+		Name:        "EasyList Hebrew",
+		URL:         "https://raw.githubusercontent.com/easylist/EasyListHebrew/master/EasyListHebrew.txt",
+		Category:    "regional",
+		Description: "EasyList's Hebrew list; only its domain rules apply to DNS.",
+	},
+	{
+		ID:          "abpindo",
+		Name:        "ABPindo",
+		URL:         "https://raw.githubusercontent.com/ABPindo/indonesianadblockrules/master/subscriptions/abpindo.txt",
+		Category:    "regional",
+		Description: "Indonesian ad-blocking rules from the ABPindo project.",
+	},
+	{
+		ID:          "indianlist",
+		Name:        "IndianList",
+		URL:         "https://easylist-downloads.adblockplus.org/indianlist.txt",
+		Category:    "regional",
+		Description: "EasyList's Indian supplement; only its domain rules apply to DNS.",
 	},
 }
 

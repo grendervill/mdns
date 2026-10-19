@@ -52,6 +52,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -281,9 +282,12 @@ def panel_flow(page, context):
     page.goto(BASE_URL + "/panel/filters")
     cards = page.locator(".cards .card")
     check("the filters page offers the ready-made catalog", cards.count() >= 10, cards.count())
-    add_card = page.locator(".cards .card").filter(
-        has=page.get_by_role("button", name="Добавить")
-    ).first
+    check(
+        "the catalog labels the regional lists",
+        "региональные" in page.locator(".cards").inner_text(),
+    )
+    add_card = page.locator(".cards .card").filter(has_text="RU AdList").first
+    need("the regional RU AdList card is present", add_card.count() == 1)
     first_id = add_card.locator('input[name="id"]').get_attribute("value")
     need("the first addable catalog card carries its list id", bool(first_id), first_id)
     with page.expect_navigation():
@@ -326,13 +330,36 @@ def panel_flow(page, context):
         page.locator('select[name="provider"] option').count() >= 20,
         page.locator('select[name="provider"] option').count(),
     )
+    trust_text = page.locator("body").inner_text()
+    check(
+        "the trust table cites Privacy Guides",
+        "privacyguides.org" in page.locator(".main").inner_html(),
+    )
+    recommended = page.locator(".tag.ok", has_text="рекомендован")
+    check(
+        "at least five providers carry the recommended badge",
+        recommended.count() >= 5,
+        recommended.count(),
+    )
+    check(
+        "the trust section carries its disclaimer",
+        "Публичные источники" in trust_text,
+        trust_text[-200:],
+    )
     custom = 'form[action="/panel/upstreams/custom"]'
     page.fill(custom + ' input[name="id"]', "e2e-custom")
     page.fill(custom + ' input[name="name"]', "E2E custom")
     page.select_option(custom + ' select[name="transport"]', "plain")
     page.fill(custom + ' input[name="address"]', "127.0.0.1:5399")
+    started = time.monotonic()
     with page.expect_navigation():
         page.locator(custom + ' button[type="submit"]').click()
+    elapsed = time.monotonic() - started
+    check(
+        "the upstream add returns promptly (the runtime swap is async)",
+        elapsed < 4.0,
+        "%.2f s" % elapsed,
+    )
     custom_remove = page.locator(
         'button[formaction="/panel/upstreams/remove"][value="e2e-custom"]'
     )

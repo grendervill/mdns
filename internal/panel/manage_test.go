@@ -302,6 +302,40 @@ func TestUpstreamsPage(t *testing.T) {
 	assertNoInlineAssets(t, body)
 }
 
+// TestUpstreamsTrust checks the provider trust table and the per-row
+// badge: the table carries every provider with the Privacy Guides link
+// and the disclaimer, and a configured catalog upstream shows its badge.
+func TestUpstreamsTrust(t *testing.T) {
+	cfg := manageConfig(t)
+	manageUpstreams(cfg) // cloudflare (catalog) and quad9 (catalog)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/upstreams")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/upstreams = %d, want 200\n%s", code, body)
+	}
+
+	for _, want := range []string{
+		"Доверие провайдерам",
+		"Публичные источники; проект не связан с провайдерами и не даёт гарантий.",
+		"privacyguides.org",
+		`target="_blank" rel="noopener"`,
+		"Обезличенные данные запросов, до 25 часов; без PII.",
+		"Cloudflare <span class=\"tag ok\">рекомендован Privacy Guides</span>",
+		"Cloudflare Family",
+		"Google Public DNS",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("upstreams page is missing %q", want)
+		}
+	}
+	if n := strings.Count(body, "рекомендован Privacy Guides"); n < 5 {
+		t.Errorf("the trust table shows %d «рекомендован Privacy Guides» badges, want at least 5", n)
+	}
+	assertNoInlineAssets(t, body)
+}
+
 // TestUpstreamToggle checks the soft flip: the whole config goes to
 // UpdateConfig with exactly one flag changed.
 func TestUpstreamToggle(t *testing.T) {
@@ -630,9 +664,15 @@ func TestUpstreamRemove(t *testing.T) {
 	}
 
 	t.Run("unknown id", func(t *testing.T) {
-		resp, _ := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"nope"}})
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/remove", url.Values{"id": {"nope"}})
 		if resp.StatusCode != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400", resp.StatusCode)
+			t.Fatalf("status = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "upstream не найден: nope") {
+			t.Errorf("the unknown-id message is missing:\n%s", body)
+		}
+		if len(ctrl.sent()) != 1 {
+			t.Error("an unknown id reached UpdateConfig")
 		}
 	})
 }
@@ -1188,7 +1228,8 @@ func TestFiltersCatalogPage(t *testing.T) {
 	}
 	wants := []string{
 		"Готовые списки",
-		"реклама и трекеры", "комбинированные",
+		"реклама и трекеры", "комбинированные", "региональные",
+		"RU AdList", "CERT.PL Warning List",
 		`action="/panel/filters/lists/add"`,
 		`action="/panel/filters/lists/remove"`,
 		`value="adguard-dns-filter"`,

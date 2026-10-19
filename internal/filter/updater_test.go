@@ -1,9 +1,11 @@
 package filter_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -134,6 +136,66 @@ func TestUpdateFailureKeepsOldData(t *testing.T) {
 	}
 	if st := u.Status()[0]; st.Error == "" {
 		t.Errorf("Status().Error = empty, want the fetch error")
+	}
+}
+
+// TestUpdateCancelledFetchIsNotAnError checks that a fetch aborted by a
+// cancelled context — a shutdown or a runtime swap quiescing the
+// updater before the next generation starts — is neither recorded as a
+// list failure nor warned about: the spurious "context canceled" would
+// otherwise leak into the next generation's status.
+func TestUpdateCancelledFetchIsNotAnError(t *testing.T) {
+	fetching := make(chan struct{}, 1)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case fetching <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done() // hold the fetch open until the client gives up
+	}))
+	defer srv.Close()
+
+	var logs bytes.Buffer
+	e := filter.NewEngine(filter.EngineOptions{})
+	u := filter.NewUpdater(filter.UpdaterOptions{
+		Engine:  e,
+		Specs:   []filter.ListSpec{{ID: "t1", URL: srv.URL + "/list.txt"}},
+		DataDir: t.TempDir(),
+		Client: &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+		},
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		u.Update(ctx)
+	}()
+
+	select {
+	case <-fetching:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the list server never saw the fetch")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Update did not return after the context was cancelled")
+	}
+
+	st := u.Status()
+	if len(st) != 1 {
+		t.Fatalf("len(Status()) = %d, want 1", len(st))
+	}
+	if st[0].Error != "" {
+		t.Errorf("Status().Error = %q, want empty (a cancelled fetch is not a list failure)", st[0].Error)
+	}
+	if got := logs.String(); strings.Contains(got, "level=WARN") {
+		t.Errorf("log = %q, want no WARN record for a cancelled fetch", got)
 	}
 }
 

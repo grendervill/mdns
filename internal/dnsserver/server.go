@@ -51,19 +51,31 @@ type Server struct {
 	// can be exercised on an unprivileged port.
 	alpnPort int
 
-	mu        sync.Mutex
-	started   bool
-	dotUp     bool
-	dohUp     bool
-	doqUp     bool
-	plainSrv  []*dns.Server
-	tlsSrv    []*dns.Server
-	httpSrv   *http.Server
-	h3Srv     *http3.Server
+	mu       sync.Mutex
+	started  bool
+	dotUp    bool
+	dohUp    bool
+	doqUp    bool
+	plainSrv []*dns.Server
+	tlsSrv   []*dns.Server
+	dohLn    net.Listener
+	httpSrv  *http.Server
+	h3Srv    *http3.Server
+	// quicLn, quicTr and quicUDP are the DoQ endpoint: the listener, its
+	// transport, and the UDP socket the server bound for it. The
+	// transport only closes a socket it created itself, so the server
+	// closes quicUDP explicitly to free the DoQ port for the next
+	// generation.
 	quicLn    *quic.Listener
+	quicTr    *quic.Transport
+	quicUDP   net.PacketConn
 	challenge *http.Server
-	baseCtx   context.Context
-	cancel    context.CancelFunc
+	// challengeLn is the socket behind the ACME HTTP-01 responder. It
+	// is kept so ReleaseListeners can free the port on a runtime swap
+	// while the HTTP server stays up to finish in-flight responses.
+	challengeLn net.Listener
+	baseCtx     context.Context
+	cancel      context.CancelFunc
 }
 
 // New builds the server; a nil logger falls back to slog.Default.
@@ -270,9 +282,10 @@ func (s *Server) StartChallengeHTTP(handler http.Handler, port int) error {
 		MaxHeaderBytes:    dohMaxHeaderBytes,
 	}
 	s.challenge = srv
+	s.challengeLn = ln
 
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			s.logger.Warn("challenge HTTP listener stopped", "port", port, "error", err)
 		}
 	}()
@@ -302,6 +315,90 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.started = false
 	return err
+}
+
+// ReleaseListeners frees every listening socket without cancelling
+// s.baseCtx and without calling httpSrv.Shutdown. The HTTP server stays
+// up so the management POST that triggered a runtime swap — in flight on
+// the very listener being released — can still write its response; only
+// the sockets go, so the next generation can bind the same ports. The
+// accepted connections keep being served by the old HTTP server until
+// the retirement goroutine stops it. A second call is a no-op.
+func (s *Server) ReleaseListeners() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, srv := range s.plainSrv {
+		if srv.PacketConn != nil {
+			_ = srv.PacketConn.Close()
+		}
+		if srv.Listener != nil {
+			_ = srv.Listener.Close()
+		}
+	}
+	s.plainSrv = nil
+
+	for _, srv := range s.tlsSrv {
+		if srv.Listener != nil {
+			_ = srv.Listener.Close()
+		}
+	}
+	s.tlsSrv = nil
+
+	if s.dohLn != nil {
+		_ = s.dohLn.Close()
+		s.dohLn = nil
+	}
+	// The HTTPS (HTTP/1.1 + HTTP/2) server above stays up for in-flight
+	// responses; only its socket is freed. HTTP/3 cannot be kept that
+	// way — its connections share the QUIC socket — so they are closed
+	// outright. We never emit an Alt-Svc header for the panel and
+	// browsers only learn about HTTP/3 from one, so clients fall back to
+	// HTTPS without noticing.
+	if s.h3Srv != nil {
+		_ = s.h3Srv.Close()
+		s.h3Srv = nil
+	}
+	// DoQ cannot be kept alive either: its connections share the QUIC
+	// socket, and a live connection would hold the UDP port open and
+	// stop the next generation from rebinding it, so the endpoint is
+	// closed outright. DoQ queries are short-lived, and RFC 9250
+	// clients retry on a new connection.
+	s.closeDoQLocked()
+	// The challenge listener goes too so the port is free for the next
+	// generation, but s.challenge stays up: the in-flight challenge
+	// response must remain writable. The retirement stop calls Shutdown
+	// on the already-closed listener and finishes it.
+	if s.challengeLn != nil {
+		_ = s.challengeLn.Close()
+		s.challengeLn = nil
+	}
+}
+
+// ForceClose closes the remaining HTTP and HTTP/3 servers outright
+// (Close, not Shutdown). It is the retirement goroutine's fallback when
+// the graceful stop times out because a handler — the management POST
+// that triggered the swap — is still writing on an accepted connection.
+func (s *Server) ForceClose() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.httpSrv != nil {
+		_ = s.httpSrv.Close()
+		s.httpSrv = nil
+	}
+	if s.h3Srv != nil {
+		_ = s.h3Srv.Close()
+		s.h3Srv = nil
+	}
+	// A stale challenge responder must not outlive a timed-out retire:
+	// Close it outright and drop the reference, so its goroutine cannot
+	// keep serving after the drain gave up on it.
+	if s.challenge != nil {
+		_ = s.challenge.Close()
+		s.challenge = nil
+		s.challengeLn = nil
+	}
 }
 
 // stopLocked cancels the base context and stops all listeners,
@@ -390,21 +487,39 @@ func (s *Server) stopDoHLocked(ctx context.Context) error {
 		}
 		s.h3Srv = nil
 	}
+	s.dohLn = nil
 	s.dohUp = false
 	return firstErr
 }
 
 // stopDoQLocked stops the DoQ endpoint. The caller must hold s.mu.
 func (s *Server) stopDoQLocked(ctx context.Context) error {
-	var firstErr error
+	s.closeDoQLocked()
+	s.doqUp = false
+	return nil
+}
+
+// closeDoQLocked closes the DoQ endpoint and drops its live connections.
+// The listener goes first, so a pending Accept returns quic.ErrServerClosed
+// instead of the transport's close error; then the transport, which drops
+// every live connection; and finally the UDP socket, which the transport
+// does not own because the server bound it. Every Close tolerates an
+// already-closed endpoint, so the call is idempotent: ReleaseListeners
+// releases the socket on a swap and the retirement Shutdown finds nothing
+// left, without a warning. The caller must hold s.mu.
+func (s *Server) closeDoQLocked() {
 	if s.quicLn != nil {
-		if err := s.quicLn.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		_ = s.quicLn.Close()
 		s.quicLn = nil
 	}
-	s.doqUp = false
-	return firstErr
+	if s.quicTr != nil {
+		_ = s.quicTr.Close()
+		s.quicTr = nil
+	}
+	if s.quicUDP != nil {
+		_ = s.quicUDP.Close()
+		s.quicUDP = nil
+	}
 }
 
 // stopChallengeLocked stops the ACME HTTP-01 responder if one runs.
@@ -415,6 +530,7 @@ func (s *Server) stopChallengeLocked(ctx context.Context) error {
 	}
 	err := s.challenge.Shutdown(ctx)
 	s.challenge = nil
+	s.challengeLn = nil
 	return err
 }
 
@@ -433,7 +549,8 @@ func (s *Server) trackTLS(srv *dns.Server) {
 // ActivateAndServe, so a Shutdown racing the goroutine would otherwise
 // see "server not started" and leak the listener, leaving the port
 // bound. NotifyStartedFunc fires after that flag is set, so waiting on
-// it closes the race.
+// it closes the race. A listener released by ReleaseListeners makes the
+// loop return net.ErrClosed, which is a normal swap and not a warning.
 func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	started := make(chan struct{})
 	srv.NotifyStartedFunc = func() { close(started) }
@@ -441,7 +558,7 @@ func (s *Server) serve(srv *dns.Server, proto string, port int) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := srv.ActivateAndServe(); err != nil {
+		if err := srv.ActivateAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.logger.Warn("listener stopped", "proto", proto, "port", port, "error", err)
 		}
 	}()

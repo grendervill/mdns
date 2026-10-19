@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 
 	"github.com/miekg/dns"
@@ -19,11 +20,23 @@ const maxDoQStreams = 128
 // startDoQ binds the DNS-over-QUIC listener (RFC 9250): one QUIC
 // endpoint on the configured UDP port, the "doq" ALPN protocol, one
 // query per stream. The caller must hold s.mu and have set s.baseCtx.
+//
+// The UDP socket is bound and wrapped in an explicit Transport instead
+// of calling quic.ListenAddr: the implicit transport behind ListenAddr
+// owns the socket, and closing only the listener leaves a live
+// connection holding it, so the next runtime generation could not
+// rebind the port. An explicit transport can be closed to drop live
+// connections and free the socket.
 func (s *Server) startDoQ() error {
 	port := s.cfg.Protocols.DoQ.Port
 
-	ln, err := quic.ListenAddr(
-		fmt.Sprintf(":%d", port),
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: port})
+	if err != nil {
+		return fmt.Errorf("doq udp :%d: %w", port, err)
+	}
+
+	tr := &quic.Transport{Conn: udpConn}
+	ln, err := tr.Listen(
 		&tls.Config{
 			GetCertificate: s.certs.GetCertificate,
 			NextProtos:     []string{"doq"},
@@ -31,8 +44,13 @@ func (s *Server) startDoQ() error {
 		&quic.Config{MaxIncomingStreams: maxDoQStreams},
 	)
 	if err != nil {
+		_ = tr.Close()
+		_ = udpConn.Close()
 		return fmt.Errorf("doq udp :%d: %w", port, err)
 	}
+
+	s.quicUDP = udpConn
+	s.quicTr = tr
 	s.quicLn = ln
 	go s.serveDoQ(ln)
 

@@ -518,17 +518,25 @@ drives the chart tooltip and the live feed.
   `plain`/`dot`/`doh`/`doq`, address, SNI for DoT/DoQ by IP, priority),
   remove one, enable or disable one, and edit the priority column (the
   order `failover` walks). The routing strategy (`fastest`, `failover`,
-  `round_robin`, `random`) is selectable on this page too. Upstream
-  hostnames are resolved through a bootstrap DNS list
+  `round_robin`, `random`) is selectable on this page too. A «Доверие
+  провайдерам» table lists each provider's public-source rating
+  (Privacy Guides recommendations and the providers' privacy policies)
+  with links, and configured rows carry the matching badge. Structural
+  changes apply asynchronously: the management request returns at once
+  and the new listeners are already serving when the page reloads.
+  Upstream hostnames are resolved through a bootstrap DNS list
   (`1.1.1.1`/`8.8.8.8`/`9.9.9.9`), so the daemon keeps resolving when
   the machine's own resolver points at mdns.
 - **Фильтры** — a catalog of ready public block lists (AdGuard DNS/Base,
   uBlock Origin, EasyList, Peter Lowe, OISD Small/Full, HaGeZi Pro/Pro++,
-  Steven Black, 1Hosts Lite) with one-click add/remove, plus a custom
-  `https` list by ID and URL; per-list applied/skipped rules, update time
-  and state; refresh one list or every list; pick the block mode
-  (`zero`, `nxdomain`, `refused`); add and remove user allow/block rules
-  (each covers the domain and its subdomains).
+  Steven Black, 1Hosts Lite) plus 14 regional lists (RU AdList, AdGuard
+  Ukrainian/French/Dutch/Turkish/Chinese/Japanese, EasyList
+  Germany/Italy/Hebrew, Polskie Filtry, CERT.PL's Warning List,
+  ABPindo, IndianList) with one-click add/remove, plus a custom `https`
+  list by ID and URL; per-list applied/skipped rules, update time and
+  state; refresh one list or every list; pick the block mode (`zero`,
+  `nxdomain`, `refused`); add and remove user allow/block rules (each
+  covers the domain and its subdomains).
 - **Сертификат** — read-only: state, issuer, expiry, last check and the
   TLS mode/ACME fields from the config. Issuance and renewal stay with
   the daemon; the ACME wizard (provider, EAB keys, custom directory)
@@ -594,6 +602,10 @@ readable.
 ![Status page of the web panel](docs/img/panel-status.png)
 
 ![History filtered to blocked queries](docs/img/panel-history.png)
+
+![Upstreams with the provider trust table](docs/img/panel-upstreams.png)
+
+![Filters with the regional list catalog](docs/img/panel-filters.png)
 
 ![The panel at 390 px wide](docs/img/panel-mobile.png)
 

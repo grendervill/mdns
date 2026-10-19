@@ -106,3 +106,62 @@ func TestByIDMissing(t *testing.T) {
 		t.Errorf("ByID(nope) = true, want false")
 	}
 }
+
+// TestTrustShape checks every provider carries a complete, honest trust
+// rating: filled fields, a known level and an https source link.
+func TestTrustShape(t *testing.T) {
+	levels := map[string]bool{
+		providers.TrustRecommended: true,
+		providers.TrustLimited:     true,
+		providers.TrustUnknown:     true,
+	}
+
+	recommended := 0
+	for _, p := range providers.List() {
+		tr := p.Trust
+		if tr.Level == "" || tr.Label == "" || tr.Note == "" || tr.SourceName == "" || tr.SourceURL == "" {
+			t.Errorf("provider %q has an incomplete trust rating: %+v", p.ID, tr)
+		}
+		if !levels[tr.Level] {
+			t.Errorf("provider %q trust level = %q, want recommended, limited or unknown", p.ID, tr.Level)
+		}
+		u, err := url.Parse(tr.SourceURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			t.Errorf("provider %q trust source %q must be an https URL", p.ID, tr.SourceURL)
+		}
+		if tr.Level == providers.TrustRecommended {
+			recommended++
+		}
+	}
+	if recommended < 5 {
+		t.Errorf("catalog has %d recommended providers, want at least 5", recommended)
+	}
+}
+
+// TestTrustForUpstream checks the ID resolution: an exact provider ID, a
+// derived upstream ID (the provider prefix) and an unknown ID.
+func TestTrustForUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{"cloudflare", "cloudflare"},
+		{"cloudflare-doh", "cloudflare"},
+		{"cloudflare-family", "cloudflare-family"},
+		{"adguard-family", "adguard-family"},
+	} {
+		tr, ok := providers.TrustForUpstream(tc.id)
+		if !ok {
+			t.Errorf("TrustForUpstream(%q) = false, want a rating", tc.id)
+			continue
+		}
+		p, _ := providers.ByID(tc.want)
+		if tr != p.Trust {
+			t.Errorf("TrustForUpstream(%q) = %+v, want %+v", tc.id, tr, p.Trust)
+		}
+	}
+
+	if _, ok := providers.TrustForUpstream("unknown-1"); ok {
+		t.Errorf(`TrustForUpstream("unknown-1") = true, want false`)
+	}
+}

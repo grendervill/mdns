@@ -1,6 +1,7 @@
 package dnsserver
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -29,6 +30,7 @@ import (
 	"mydns/internal/routing"
 	"mydns/internal/testutil/dnsfake"
 	"mydns/internal/tlscert"
+	"mydns/internal/transport"
 	"mydns/internal/upstream"
 )
 
@@ -290,6 +292,25 @@ func dohClient() *http.Client {
 			ForceAttemptHTTP2: true,
 		},
 	}
+}
+
+// rawHTTPGet sends one HTTP/1.1 GET over an already-open connection and
+// reads the response, leaving the connection alive for the next call.
+func rawHTTPGet(t *testing.T, conn net.Conn, br *bufio.Reader, path string) *http.Response {
+	t.Helper()
+
+	if _, err := fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: mdns.test\r\n\r\n", path); err != nil {
+		t.Fatalf("write request %s = %v, want nil", path, err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "https://mdns.test"+path, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s) = %v, want nil", path, err)
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		t.Fatalf("ReadResponse(%s) = %v, want nil", path, err)
+	}
+	return resp
 }
 
 // wantClosed fails when port accepts a TCP connection.
@@ -857,5 +878,337 @@ func TestDoHACMETLSALPN(t *testing.T) {
 
 	if got := conn.ConnectionState().NegotiatedProtocol; got != "acme-tls/1" {
 		t.Errorf("NegotiatedProtocol = %q, want acme-tls/1", got)
+	}
+}
+
+// TestReleaseListenersFreesPortsKeepsResponses covers the async swap's
+// core promise: releasing the listeners frees every port for the next
+// generation while the old HTTP server keeps serving the connections it
+// already accepted, so the request that triggered the swap can still
+// write its response. Closing a listener directly must not warn.
+func TestReleaseListenersFreesPortsKeepsResponses(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoH: config.Protocol{Enabled: true, Port: port},
+	}
+
+	logs := &syncBuffer{}
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), slog.New(slog.NewTextHandler(logs, nil)))
+	start(t, srv)
+
+	// One keep-alive HTTP/1.1 connection completes a request first.
+	conn, err := tls.Dial("tcp", loopback(port), &tls.Config{
+		InsecureSkipVerify: true, // self-signed test certificate
+		NextProtos:         []string{"http/1.1"},
+	})
+	if err != nil {
+		t.Fatalf("tls.Dial(doh) = %v, want nil", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+
+	first := rawHTTPGet(t, conn, br, "/dns-query")
+	if first.StatusCode != http.StatusBadRequest {
+		t.Fatalf("first response status = %d, want 400 (GET without ?dns=)", first.StatusCode)
+	}
+	_ = first.Body.Close()
+
+	// Release the sockets: the ports must be free for the next generation.
+	srv.ReleaseListeners()
+
+	// A second server binds the same port and answers over it.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	start(t, srv2)
+
+	resp, err := dohClient().Get(fmt.Sprintf("https://127.0.0.1:%d/dns-query", port))
+	if err != nil {
+		t.Fatalf("DoH GET on the released port = %v, want nil (the next generation must bind it)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("second generation status = %d, want 400", resp.StatusCode)
+	}
+
+	// The first connection still gets a response from the released but
+	// not yet stopped HTTP server.
+	second := rawHTTPGet(t, conn, br, "/dns-query")
+	if second.StatusCode != http.StatusBadRequest {
+		t.Errorf("in-flight connection status = %d, want 400 (the old server must still write it)", second.StatusCode)
+	}
+	_ = second.Body.Close()
+
+	if got := logs.String(); strings.Contains(got, "listener stopped") {
+		t.Errorf("log = %q, want no \"listener stopped\" warning after ReleaseListeners", got)
+	}
+}
+
+// TestReleaseListenersAllProtocols covers ReleaseListeners across the
+// whole listener set: once the sockets are released, every port is free
+// again, so a second Server with the same config binds them and answers
+// on plain UDP/TCP, DoT, DoH and DoQ.
+func TestReleaseListenersAllProtocols(t *testing.T) {
+	plainPort, dotPort, dohPort, doqPort := freePort(t), freePort(t), freePort(t), freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		Plain: config.Protocol{Enabled: true, Port: plainPort},
+		DoT:   config.Protocol{Enabled: true, Port: dotPort},
+		DoH:   config.Protocol{Enabled: true, Port: dohPort},
+		DoQ:   config.Protocol{Enabled: true, Port: doqPort},
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv)
+
+	want := []string{
+		fmt.Sprintf("plain:%d", plainPort),
+		fmt.Sprintf("doh:%d", dohPort),
+		fmt.Sprintf("dot:%d", dotPort),
+		fmt.Sprintf("doq:%d", doqPort),
+	}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Fatalf("Listeners() = %v, want %v (every protocol must be up before the release)", got, want)
+	}
+
+	srv.ReleaseListeners()
+
+	// The same config binds the same ports again: every listener was
+	// really released, not merely marked stopped.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv2)
+	assertAllProtocolsAnswer(t, cfg, "after ReleaseListeners")
+}
+
+// TestReleaseListenersDropsLiveDoQConnections covers the DoQ side of the
+// async swap. A live QUIC connection shares the UDP socket, so closing
+// only the listener would leave the port bound and the next generation
+// could not start DoQ, which fails and rolls the swap back. The live
+// connection is dropped instead — DoQ queries are short-lived, and
+// RFC 9250 clients retry on a new connection — so the socket is freed and
+// a second server binds the same port and answers a fresh query on it.
+func TestReleaseListenersDropsLiveDoQConnections(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoQ: config.Protocol{Enabled: true, Port: port},
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := &syncBuffer{}
+	first := slog.New(slog.NewTextHandler(logs, nil))
+
+	// doqClient builds a DoQ client for the test port and closes it
+	// after the test.
+	doqClient := func() transport.Transport {
+		t.Helper()
+		tr, err := transport.New(config.UpstreamConfig{
+			ID:                 "probe",
+			Name:               "probe",
+			Transport:          "doq",
+			Address:            loopback(port),
+			ServerName:         cfg.Domain,
+			InsecureSkipVerify: true, // self-signed test certificate
+			Enabled:            true,
+		})
+		if err != nil {
+			t.Fatalf("transport.New(doq) = %v, want nil", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() })
+		return tr
+	}
+
+	// exchange sends one query and requires a NOERROR reply with one
+	// answer, tagging failures with when.
+	exchange := func(tr transport.Transport, when string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := tr.Exchange(ctx, queryMsg("example.com"))
+		if err != nil {
+			t.Fatalf("DoQ %s: Exchange() = %v, want nil", when, err)
+		}
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Fatalf("DoQ %s: reply rcode %d with %d answers, want NOERROR with 1",
+				when, resp.Rcode, len(resp.Answer))
+		}
+	}
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), first)
+	start(t, srv)
+
+	// One connection stays live in the first client across the swap.
+	exchange(doqClient(), "on the first generation")
+
+	srv.ReleaseListeners()
+
+	// The live connection no longer holds the socket: the same port
+	// binds again and answers a fresh connection.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv2)
+	exchange(doqClient(), "after ReleaseListeners")
+
+	// Dropping the live connection is a normal swap, not a failure.
+	if got := logs.String(); strings.Contains(got, "DoQ accept failed") {
+		t.Errorf("log = %q, want no \"DoQ accept failed\" warning after ReleaseListeners", got)
+	}
+}
+
+// assertAllProtocolsAnswer checks one NOERROR reply carrying one answer
+// on every protocol enabled in cfg, tagging failures with when.
+func assertAllProtocolsAnswer(t *testing.T, cfg *config.Config, when string) {
+	t.Helper()
+
+	for _, net_ := range []string{"udp", "tcp"} {
+		cl := &dns.Client{Net: net_, Timeout: 2 * time.Second}
+		resp, _, err := cl.Exchange(queryMsg("example.com"), loopback(cfg.Protocols.Plain.Port))
+		if err != nil {
+			t.Errorf("plain %s %s: Exchange() = %v, want nil", net_, when, err)
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Errorf("plain %s %s: reply rcode %d with %d answers, want NOERROR with 1",
+				net_, when, resp.Rcode, len(resp.Answer))
+		}
+	}
+
+	if resp := dotQuery(t, cfg.Protocols.DoT.Port); resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Errorf("DoT %s: reply rcode %d with %d answers, want NOERROR with 1", when, resp.Rcode, len(resp.Answer))
+	}
+
+	assertDoHAnswers(t, cfg.Protocols.DoH.Port, when)
+
+	tr, err := transport.New(config.UpstreamConfig{
+		ID:                 "probe",
+		Name:               "probe",
+		Transport:          "doq",
+		Address:            loopback(cfg.Protocols.DoQ.Port),
+		ServerName:         cfg.Domain,
+		InsecureSkipVerify: true, // self-signed test certificate
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("transport.New(doq) = %v, want nil", err)
+	}
+	defer func() { _ = tr.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := tr.Exchange(ctx, queryMsg("example.com"))
+	if err != nil {
+		t.Errorf("DoQ %s: Exchange() = %v, want nil", when, err)
+	} else if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Errorf("DoQ %s: reply rcode %d with %d answers, want NOERROR with 1", when, resp.Rcode, len(resp.Answer))
+	}
+}
+
+// assertDoHAnswers POSTs one query to the DoH endpoint and checks the
+// wire-format reply, tagging failures with when.
+func assertDoHAnswers(t *testing.T, port int, when string) {
+	t.Helper()
+
+	packed, err := queryMsg("example.com").Pack()
+	if err != nil {
+		t.Fatalf("Pack() = %v, want nil", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://127.0.0.1:%d/dns-query", port), bytes.NewReader(packed))
+	if err != nil {
+		t.Fatalf("NewRequest() = %v, want nil", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	resp, err := dohClient().Do(req)
+	if err != nil {
+		t.Errorf("DoH %s: Do() = %v, want nil", when, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("DoH %s: status = %d, want 200", when, resp.StatusCode)
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(body) = %v, want nil", err)
+	}
+	m := new(dns.Msg)
+	if err := m.Unpack(body); err != nil {
+		t.Fatalf("Unpack(body) = %v, want nil", err)
+	}
+	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 {
+		t.Errorf("DoH %s: reply rcode %d with %d answers, want NOERROR with 1", when, m.Rcode, len(m.Answer))
+	}
+}
+
+// TestReleaseListenersFreesChallengePort covers the ACME HTTP-01
+// responder in the same async swap: ReleaseListeners frees its port for
+// the next generation while the old HTTP server stays up, so an
+// in-flight challenge response can still be written.
+func TestReleaseListenersFreesChallengePort(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "challenge-token")
+	})
+	// The released listener makes Serve return net.ErrClosed; a quiet
+	// logger keeps the run from printing the deliberate release.
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, false), quiet)
+	if err := srv.StartChallengeHTTP(handler, port); err != nil {
+		t.Fatalf("StartChallengeHTTP() = %v, want nil", err)
+	}
+
+	// A keep-alive connection is already accepted by the old server.
+	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("Dial(challenge) = %v, want nil", err)
+	}
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	first := rawHTTPGet(t, conn, br, "/.well-known/acme-challenge/x")
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first challenge status = %d, want 200", first.StatusCode)
+	}
+	_ = first.Body.Close()
+
+	// Release the socket: the port must be free for the next generation.
+	srv.ReleaseListeners()
+
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, false), quiet)
+	if err := srv2.StartChallengeHTTP(handler, port); err != nil {
+		t.Fatalf("StartChallengeHTTP() on the released port = %v, want nil (the port must be free)", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv2.StopChallengeHTTP(ctx)
+		// The released listener is already closed, so the stop reports
+		// net.ErrClosed and only needs to finish the HTTP server.
+		_ = srv.StopChallengeHTTP(ctx)
+	})
+
+	// The in-flight connection still gets its response from the released
+	// but not yet stopped HTTP server.
+	second := rawHTTPGet(t, conn, br, "/.well-known/acme-challenge/x")
+	if second.StatusCode != http.StatusOK {
+		t.Errorf("in-flight challenge status = %d, want 200 (the old server must still write it)", second.StatusCode)
+	}
+	_ = second.Body.Close()
+
+	// The next generation answers on the same port.
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/.well-known/acme-challenge/x", port))
+	if err != nil {
+		t.Fatalf("GET challenge on the rebind = %v, want nil", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("rebound challenge status = %d, want 200", resp.StatusCode)
 	}
 }

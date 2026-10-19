@@ -241,6 +241,9 @@ func (u *Updater) Status() []ListStatus {
 
 // updateOne performs one conditional fetch and install for one list.
 func (u *Updater) updateOne(ctx context.Context, spec ListSpec) {
+	if ctx.Err() != nil {
+		return
+	}
 	if err := validateListID(spec.ID); err != nil {
 		u.fail(spec.ID, err)
 		return
@@ -270,6 +273,14 @@ func (u *Updater) updateOne(ctx context.Context, spec ListSpec) {
 
 	resp, err := u.client.Do(req)
 	if err != nil {
+		// A cancelled context means a shutdown or a runtime swap
+		// aborted the fetch; that is not a list failure, so never mark
+		// the list and never warn. A shared updater would otherwise
+		// carry a spurious "context canceled" error into the new
+		// generation's status.
+		if ctx.Err() != nil {
+			return
+		}
 		u.fail(spec.ID, fmt.Errorf("fetch: %w", err))
 		return
 	}
@@ -286,6 +297,9 @@ func (u *Updater) updateOne(ctx context.Context, spec ListSpec) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, u.maxBytes+1))
 	if err != nil {
+		if ctx.Err() != nil {
+			return // aborted mid-body, same as an aborted fetch
+		}
 		u.fail(spec.ID, fmt.Errorf("read body: %w", err))
 		return
 	}

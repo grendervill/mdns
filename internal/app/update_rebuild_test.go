@@ -2,7 +2,10 @@ package app_test
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -141,4 +144,102 @@ func TestUpdateConfigLogChangeRebuilds(t *testing.T) {
 	if got := len(a.Requests(50)); got != 1 {
 		t.Errorf("journal entries after the log change = %d, want 1 (the new memory cap)", got)
 	}
+}
+
+// TestUpdateConfigBindingFailureRestoresService checks that a structural
+// swap whose new listeners cannot bind restores the service: the error
+// reaches the caller, the old daemon keeps answering on its own port and
+// the live configuration is still the old one.
+func TestUpdateConfigBindingFailureRestoresService(t *testing.T) {
+	fake := newFakeUpstream(t)
+	oldPort := freePort(t)
+	cfg := testConfig(t, fake, oldPort)
+	a, _ := startApp(t, cfg)
+
+	// Occupy the port the new plain listener would need, on both UDP and
+	// TCP, so the fresh runtime cannot bind it.
+	busy := freePort(t)
+	pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", busy))
+	if err != nil {
+		t.Fatalf("ListenPacket(udp :%d) = %v, want nil", busy, err)
+	}
+	defer pc.Close()
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", busy))
+	if err != nil {
+		t.Fatalf("Listen(tcp :%d) = %v, want nil", busy, err)
+	}
+	defer ln.Close()
+
+	next := *cfg
+	next.Protocols.Plain.Port = busy // structural change
+
+	if err := a.UpdateConfig(context.Background(), &next); err == nil {
+		t.Fatalf("UpdateConfig(busy port) = nil, want an error")
+	}
+
+	// The old daemon still answers on its own port.
+	cl := &dns.Client{Net: "udp", Timeout: time.Second}
+	resp, _, err := cl.Exchange(query("example.com"), loopback(oldPort))
+	if err != nil {
+		t.Fatalf("Exchange on the old port = %v, want nil (the rollback must restore service)", err)
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Errorf("Rcode = %d, want NOERROR", resp.Rcode)
+	}
+
+	if got := a.Config().Protocols.Plain.Port; got != oldPort {
+		t.Errorf("Config().Plain.Port = %d, want the old %d", got, oldPort)
+	}
+}
+
+// TestUpdateConfigReturnsWhileHandlersInFlight pins the point of the
+// async swap: with a connection parked mid-request on the DoH listener —
+// exactly what a synchronous Shutdown would wait for — a structural
+// change that keeps the same ports must still return at once.
+func TestUpdateConfigReturnsWhileHandlersInFlight(t *testing.T) {
+	fake := newFakeUpstream(t)
+	plainPort, dohPort := freePort(t), freePort(t)
+
+	cfg := testConfig(t, fake, plainPort)
+	cfg.Protocols.DoH = config.Protocol{Enabled: true, Port: dohPort}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("cfg.Validate() = %v, want nil", err)
+	}
+	a, _ := startApp(t, cfg)
+
+	// Send only the first bytes of a request: net/http marks the
+	// connection active as soon as it read anything, so a Shutdown would
+	// wait for it until its deadline.
+	conn, err := tls.Dial("tcp", loopback(dohPort), &tls.Config{
+		InsecureSkipVerify: true, // self-signed test certificate
+		NextProtos:         []string{"http/1.1"},
+	})
+	if err != nil {
+		t.Fatalf("tls.Dial(doh) = %v, want nil", err)
+	}
+	defer conn.Close()
+	if _, err := io.WriteString(conn, "GET /dns-query HTTP/1.1\r\nHost: mdns.test\r\n"); err != nil {
+		t.Fatalf("partial request write = %v, want nil", err)
+	}
+	time.Sleep(100 * time.Millisecond) // let the server read the bytes
+
+	// A structural change that keeps every port: only the upstream list
+	// changes, so the new generation re-binds the same DoH port.
+	fake2 := newFakeUpstream(t)
+	next := *cfg
+	next.Upstreams = []config.UpstreamConfig{
+		cfg.Upstreams[0],
+		{ID: "fake2", Name: "fake2", Transport: "plain", Address: fake2.Addr(), Enabled: true},
+	}
+
+	begin := time.Now()
+	if err := a.UpdateConfig(context.Background(), &next); err != nil {
+		t.Fatalf("UpdateConfig() = %v, want nil", err)
+	}
+	if elapsed := time.Since(begin); elapsed >= 1500*time.Millisecond {
+		t.Errorf("UpdateConfig() took %v, want < 1.5s (it must not wait for the parked request)", elapsed)
+	}
+
+	// Close the parked connection so the retired generation drains.
+	_ = conn.Close()
 }
