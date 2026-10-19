@@ -21,9 +21,10 @@ func Links(cfg *config.Config) []Link {
 	var out []Link
 
 	if cfg.Protocols.DoH.Enabled {
-		uri := fmt.Sprintf("https://%s/dns-query", cfg.Domain)
+		path := cfg.DoHPath()
+		uri := fmt.Sprintf("https://%s%s", cfg.Domain, path)
 		if cfg.Protocols.DoH.Port != 443 {
-			uri = fmt.Sprintf("https://%s:%d/dns-query", cfg.Domain, cfg.Protocols.DoH.Port)
+			uri = fmt.Sprintf("https://%s:%d%s", cfg.Domain, cfg.Protocols.DoH.Port, path)
 		}
 		out = append(out, Link{Proto: "doh", Title: "DoH (DNS-over-HTTPS)", URI: uri})
 	}

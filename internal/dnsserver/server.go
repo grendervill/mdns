@@ -88,7 +88,7 @@ func New(cfg *config.Config, c *core.Core, certs tlscert.Source, lim *ratelimit.
 
 // SetPanel installs the optional admin web UI on the DoH listener. It
 // must be called before Start; a nil panel (the default) leaves the
-// listener with /dns-query only.
+// listener with the DoH endpoint only.
 func (s *Server) SetPanel(p Panel) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

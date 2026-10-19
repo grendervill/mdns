@@ -304,10 +304,15 @@
           </div>
         </div>
         {{end}}
+        <label class="field"><span>Путь DoH</span>
+          <input class="ctl" type="text" name="doh.path" value="{{.DoHPath}}" spellcheck="false">
+          <span class="hint">Путь не является паролем: он лишь убирает шум сканеров. По умолчанию /dns-query.</span>
+        </label>
       </div>
 
       <p class="row-actions">
         <button class="btn primary" type="submit">Применить</button>
+        <button class="btn" type="submit" name="generate" value="doh-path">Сгенерировать</button>
         <span class="hint">Домен, протоколы и порты пересобирают слушатели; остальное применяется на месте.</span>
       </p>
     </form>

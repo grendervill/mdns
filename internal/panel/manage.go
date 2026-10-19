@@ -10,6 +10,7 @@ package panel
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1325,6 +1326,7 @@ type settingsView struct {
 
 	FormDomain   string
 	FormTimezone string
+	DoHPath      string
 	Strategies   []strategyOption
 
 	Protocols []protocolRow
@@ -1342,6 +1344,7 @@ func settingsFromConfig(cfg *config.Config) settingsView {
 	view := settingsView{
 		FormDomain:     cfg.Domain,
 		FormTimezone:   cfg.Timezone,
+		DoHPath:        cfg.DoHPath(),
 		CacheSize:      strconv.Itoa(cfg.Cache.Size),
 		CacheMinTTL:    strconv.FormatUint(uint64(cfg.Cache.MinTTL), 10),
 		CacheMaxTTL:    strconv.FormatUint(uint64(cfg.Cache.MaxTTL), 10),
@@ -1371,6 +1374,7 @@ func settingsFromForm(r *http.Request) settingsView {
 	view := settingsView{
 		FormDomain:     r.PostFormValue("domain"),
 		FormTimezone:   strings.TrimSpace(r.PostFormValue("timezone")),
+		DoHPath:        strings.TrimSpace(r.PostFormValue("doh.path")),
 		Strategies:     strategyOptions(strings.TrimSpace(r.PostFormValue("strategy"))),
 		CacheSize:      strings.TrimSpace(r.PostFormValue("cache.size")),
 		CacheMinTTL:    strings.TrimSpace(r.PostFormValue("cache.min_ttl")),
@@ -1423,6 +1427,16 @@ func (p *Panel) handleSettingsApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// «Сгенерировать» only proposes a fresh path: it re-renders the form
+	// with a random value and touches no config. Only a later «Применить»
+	// saves it, so a generate cannot change the running daemon.
+	if r.PostFormValue("generate") == "doh-path" {
+		view := settingsFromForm(r)
+		view.DoHPath = generateDoHPath()
+		p.renderSettings(w, r, http.StatusOK, manageNotice{}, view)
+		return
+	}
+
 	view := settingsFromForm(r)
 	next := cloneConfig(cfg)
 	if err := applySettingsForm(next, r); err != nil {
@@ -1457,6 +1471,10 @@ func applySettingsForm(next *config.Config, r *http.Request) error {
 		}
 		setProtocol(next, f.field, r.PostFormValue(f.field+".enabled") != "", port)
 	}
+
+	// setProtocol rebuilds the DoH protocol value, so the path is set
+	// after the loop: an empty value means the default and is left as is.
+	next.Protocols.DoH.Path = strings.TrimSpace(r.PostFormValue("doh.path"))
 
 	next.Strategy = strings.TrimSpace(r.PostFormValue("strategy"))
 
@@ -1504,6 +1522,13 @@ func setProtocol(cfg *config.Config, field string, enabled bool, port int) {
 	case "doq":
 		cfg.Protocols.DoQ = p
 	}
+}
+
+// generateDoHPath returns a fresh random DoH path: "/" plus 12 lowercase
+// hex characters. It is obfuscation that sheds scanner noise, not a
+// secret, so hex is enough and stays easy to read out.
+func generateDoHPath() string {
+	return "/" + hex.EncodeToString(mustRandom(6))
 }
 
 // formInt parses a required integer form field.

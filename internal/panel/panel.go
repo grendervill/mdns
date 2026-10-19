@@ -1,5 +1,5 @@
 // Package panel serves the mdns admin web UI. It is mounted on the DoH
-// listener next to /dns-query: a small server-rendered HTML surface
+// listener next to the DoH endpoint: a small server-rendered HTML surface
 // with session login and CSRF-protected forms. Later tasks add the
 // status, history and management pages on top of this skeleton.
 package panel
@@ -288,7 +288,7 @@ func (p *Panel) location() *time.Location {
 }
 
 // Mount registers every panel route on mux. The DoH listener shares one
-// mux with /dns-query, so the patterns here never collide with it. A
+// mux with the DoH endpoint, so the patterns here never collide with it. A
 // disabled panel still registers the routes but answers 404 on all of
 // them, so it does not reveal that it exists.
 func (p *Panel) Mount(mux *http.ServeMux) {

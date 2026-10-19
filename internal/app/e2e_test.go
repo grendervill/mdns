@@ -77,7 +77,7 @@ func askAllProtocols(t *testing.T, cfg *config.Config, name string) []string {
 		address string
 	}{
 		{"dot", loopback(cfg.Protocols.DoT.Port)},
-		{"doh", "https://" + loopback(cfg.Protocols.DoH.Port) + "/dns-query"},
+		{"doh", "https://" + loopback(cfg.Protocols.DoH.Port) + cfg.DoHPath()},
 		{"doq", loopback(cfg.Protocols.DoQ.Port)},
 	} {
 		tr, err := transport.New(config.UpstreamConfig{

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -1303,6 +1304,10 @@ func TestSettingsPage(t *testing.T) {
 		`name="doh.port" value="443"`,
 		`name="dot.port" value="853"`,
 		`name="doq.port" value="853"`,
+		`name="doh.path" value="/dns-query"`,
+		"Путь DoH",
+		"Путь не является паролем: он лишь убирает шум сканеров. По умолчанию /dns-query.",
+		"Сгенерировать",
 		`name="strategy"`,
 		`value="fastest" selected`,
 		`name="timezone" value=""`,
@@ -1394,6 +1399,73 @@ func TestSettingsTimezone(t *testing.T) {
 		}
 		if ctrl.cfg.Timezone != "" {
 			t.Errorf("live config timezone = %q, want it unchanged", ctrl.cfg.Timezone)
+		}
+	})
+}
+
+// TestSettingsDoHPath covers the «Путь DoH» field: «Сгенерировать»
+// proposes a fresh path without applying anything, «Применить» persists
+// the typed value, and an invalid path is rejected before UpdateConfig.
+func TestSettingsDoHPath(t *testing.T) {
+	t.Run("generate pre-fills the form and changes nothing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("generate", "doh-path")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("generate = %d, want 200\n%s", resp.StatusCode, body)
+		}
+
+		m := regexp.MustCompile(`name="doh.path" value="(/[0-9a-f]{12})"`).FindStringSubmatch(body)
+		if m == nil {
+			t.Fatalf("the generated path was not echoed into the form:\n%s", body)
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("«Сгенерировать» applied the config instead of only proposing a path")
+		}
+		if cfg.Protocols.DoH.Path != config.DefaultDoHPath {
+			t.Errorf("live path = %q, want it unchanged", cfg.Protocols.DoH.Path)
+		}
+	})
+
+	t.Run("apply persists the typed path", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("doh.path", "/my-secret-doh")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		wantRedirect(t, resp, "/panel/settings?ok=settings")
+
+		sent := ctrl.sent()
+		if len(sent) != 1 {
+			t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+		}
+		if got := sent[0].Protocols.DoH.Path; got != "/my-secret-doh" {
+			t.Errorf("saved DoH path = %q, want /my-secret-doh", got)
+		}
+	})
+
+	t.Run("an invalid path is rejected", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("doh.path", "no-leading-slash")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid path = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "protocols.doh") || !strings.Contains(body, "no-leading-slash") {
+			t.Errorf("the rejected path is not reported:\n%s", body)
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("an invalid path reached UpdateConfig")
 		}
 	})
 }
