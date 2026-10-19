@@ -1206,7 +1206,7 @@ func (w WizardModel) View() string {
 
 	if w.inputActive {
 		b.WriteString("\n")
-		b.WriteString(titleStyle.Render(inputPrompt(w.inputTarget)) + " " + maskInput(w.inputTarget, w.input) + "▏")
+		b.WriteString(titleStyle.Render(inputPrompt(w.inputTarget)) + " " + maskInput(w.inputTarget, w.input, false) + "▏")
 		b.WriteString("\n")
 	}
 	if w.err != nil {
@@ -1222,9 +1222,10 @@ func (w WizardModel) View() string {
 
 // maskInput renders the open input line. The panel password and its
 // confirmation are secrets, so they are shown as bullets; every other
-// input is echoed verbatim.
-func maskInput(target, value string) string {
-	if target == inputPanelPassword || target == inputPanelConfirm {
+// input is echoed verbatim. The maintenance screen passes secret=true
+// for its own password pair, so the same rule covers both flows.
+func maskInput(target, value string, secret bool) string {
+	if secret || target == inputPanelPassword || target == inputPanelConfirm {
 		return strings.Repeat("•", utf8.RuneCountInString(value))
 	}
 	return value

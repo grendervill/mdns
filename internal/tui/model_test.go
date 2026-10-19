@@ -44,15 +44,40 @@ type stubClient struct {
 	probeResults []probe.Result
 	probeFn      func(context.Context, []providers.Endpoint) ([]probe.Result, error)
 
-	backups []BackupInfo
+	backups     []BackupInfo
+	backupsErr  error
+	backupErr   error
+	backupCalls int
+	created     []string
+	restored    []string
+	deleted     []string
 }
 
 func (s *stubClient) Backups(context.Context) ([]BackupInfo, error) {
-	return s.backups, nil
+	s.backupCalls++
+	return s.backups, s.backupsErr
 }
-func (s *stubClient) CreateBackup(context.Context, string) error  { return nil }
-func (s *stubClient) RestoreBackup(context.Context, string) error { return nil }
-func (s *stubClient) DeleteBackup(context.Context, string) error  { return nil }
+func (s *stubClient) CreateBackup(_ context.Context, label string) error {
+	if s.backupErr != nil {
+		return s.backupErr
+	}
+	s.created = append(s.created, label)
+	return nil
+}
+func (s *stubClient) RestoreBackup(_ context.Context, name string) error {
+	if s.backupErr != nil {
+		return s.backupErr
+	}
+	s.restored = append(s.restored, name)
+	return nil
+}
+func (s *stubClient) DeleteBackup(_ context.Context, name string) error {
+	if s.backupErr != nil {
+		return s.backupErr
+	}
+	s.deleted = append(s.deleted, name)
+	return nil
+}
 
 func (s *stubClient) Status(context.Context) (api.Status, error) {
 	s.statusCalls++
@@ -150,11 +175,11 @@ func TestStatusViewRenders(t *testing.T) {
 }
 
 // TestNavigation checks that number keys switch screens and that the
-// tab bar lists the seven screens with Диагностика as the seventh.
+// tab bar lists the eight screens with Обслуживание as the eighth.
 func TestNavigation(t *testing.T) {
 	m := New(&stubClient{}, Options{})
 
-	wantTabs := []string{"Статус", "Визард", "Запросы", "Upstream'ы", "Фильтры", "Настройки", "Диагностика"}
+	wantTabs := []string{"Статус", "Визард", "Запросы", "Upstream'ы", "Фильтры", "Настройки", "Диагностика", "Обслуживание"}
 	if len(screenTabs) != len(wantTabs) {
 		t.Fatalf("screenTabs has %d tabs, want %d", len(screenTabs), len(wantTabs))
 	}
@@ -180,6 +205,12 @@ func TestNavigation(t *testing.T) {
 	m = updated.(Model)
 	if m.screen != screenDiag {
 		t.Errorf("screen = %v, want diag", m.screen)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'8'}})
+	m = updated.(Model)
+	if m.screen != screenMaintenance {
+		t.Errorf("screen = %v, want maintenance", m.screen)
 	}
 }
 
