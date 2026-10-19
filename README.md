@@ -623,6 +623,8 @@ readable.
 
 ![Filters with the regional list catalog](docs/img/panel-filters.png)
 
+![The live request screen](docs/img/panel-live.png)
+
 ![The panel at 390 px wide](docs/img/panel-mobile.png)
 
 ## Performance
