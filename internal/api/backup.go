@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"net/http"
 	"strings"
 	"time"
@@ -132,8 +131,7 @@ func backupErrorStatus(err error) int {
 	switch {
 	case errors.Is(err, configbackup.ErrInvalidName),
 		errors.Is(err, configbackup.ErrInvalid),
-		errors.Is(err, configbackup.ErrNotFound),
-		errors.Is(err, fs.ErrNotExist):
+		errors.Is(err, configbackup.ErrNotFound):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

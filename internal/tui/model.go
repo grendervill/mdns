@@ -524,6 +524,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.passwordPending = false
+		if m.screen != screenMaintenance {
+			return m, nil
+		}
 		if msg.cfg == nil || !msg.cfg.Panel.Enabled {
 			m.maintenanceErr = errPanelDisabled
 			return m, nil
