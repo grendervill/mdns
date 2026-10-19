@@ -25,6 +25,9 @@ const (
 	screenFilters
 	screenSettings
 	screenDiag
+	// screenFilterCatalog is the list picker opened from the filters
+	// screen; it is not a tab.
+	screenFilterCatalog
 	// screenHelp is not a tab: the ? key opens it as an overlay and
 	// Esc (or any digit) leaves it.
 	screenHelp
@@ -79,6 +82,13 @@ type Model struct {
 	filterLists  []filter.ListStatus
 	filterCursor int
 	filterErr    error
+	// filterCfg is the live configuration the filter edits work on; it
+	// is reloaded whenever the screen is entered.
+	filterCfg     *config.Config
+	catalogCursor int
+	// filterNewID carries the custom-list ID from the first input step
+	// to the URL step.
+	filterNewID string
 
 	settingsCfg    *config.Config
 	settingsCursor int
@@ -144,6 +154,10 @@ type (
 		lists []filter.ListStatus
 		err   error
 	}
+	filterConfigLoadedMsg struct {
+		cfg *config.Config
+		err error
+	}
 	filterUpdatedMsg struct{ err error }
 
 	configLoadedMsg struct {
@@ -199,7 +213,7 @@ func resubscribe() tea.Cmd {
 
 // Init implements tea.Model.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(fetchStatus(m.client), subscribe(m.client, m.ctx))
+	return tea.Batch(fetchStatus(m.client), subscribe(m.client, m.ctx), m.lazyLoadCmd())
 }
 
 // Update implements tea.Model.
@@ -293,6 +307,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case filterConfigLoadedMsg:
+		if msg.err != nil {
+			m.filterErr = msg.err
+			return m, nil
+		}
+		m.filterCfg = msg.cfg
+		m.filterErr = nil
+		return m, nil
+
 	case filterUpdatedMsg:
 		return m.applyFilterUpdateResult(msg.err)
 
@@ -305,11 +328,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.settingsErr = msg.err
 			m.filterErr = msg.err
+			// The daemon refused the change: reload the live config so
+			// the filter screens never edit a rejected copy.
+			if m.screen == screenFilters || m.screen == screenFilterCatalog {
+				return m, loadFilterConfig(m.client)
+			}
 			return m, nil
 		}
 		m.settingsErr = nil
 		m.filterErr = nil
-		return m, fetchStatus(m.client)
+		cmds := []tea.Cmd{fetchStatus(m.client)}
+		if m.screen == screenFilters || m.screen == screenFilterCatalog {
+			cmds = append(cmds, filterConfigLoadCmd(m.client))
+		}
+		return m, tea.Batch(cmds...)
 
 	case requestsLoadedMsg:
 		if msg.err == nil {
@@ -337,7 +369,9 @@ func (m Model) refreshCmd() tea.Cmd {
 	cmds := []tea.Cmd{fetchStatus(m.client)}
 	switch m.screen {
 	case screenFilters:
-		cmds = append(cmds, loadFilterStatus(m.client))
+		cmds = append(cmds, loadFilterStatus(m.client), loadFilterConfig(m.client))
+	case screenFilterCatalog:
+		cmds = append(cmds, loadFilterConfig(m.client))
 	case screenSettings:
 		cmds = append(cmds, loadConfig(m.client))
 	case screenRequests:
@@ -352,9 +386,9 @@ func (m Model) refreshCmd() tea.Cmd {
 func (m Model) lazyLoadCmd() tea.Cmd {
 	switch m.screen {
 	case screenFilters:
-		if m.filterLists == nil {
-			return loadFilterStatus(m.client)
-		}
+		// Always reload the live config: the edits must never work on a
+		// stale copy.
+		return tea.Batch(loadFilterStatus(m.client), loadFilterConfig(m.client))
 	case screenSettings:
 		if m.settingsCfg == nil {
 			return loadConfig(m.client)
@@ -382,6 +416,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cancel()
 		return m, tea.Quit
 	case "r":
+		// On the filters screen r adds a user rule, mirroring the web
+		// panel; everywhere else it refreshes the screen.
+		if m.screen == screenFilters {
+			m.inputActive = true
+			m.inputMode = inputRule
+			m.input = ""
+			return m, nil
+		}
 		return m, m.refreshCmd()
 	case "?":
 		if m.screen != screenHelp {
@@ -447,9 +489,33 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status.Filter.Mode = next // optimistic until the reload lands
 			return m, applyModeCmd(m.client, next)
 		case "a":
-			m.inputActive = true
-			m.inputMode = inputRule
-			m.input = ""
+			m.screen = screenFilterCatalog
+			m.catalogCursor = 0
+			m.filterErr = nil
+			return m, loadFilterConfig(m.client)
+		case "c":
+			return m.startCustomList()
+		case "d":
+			return m.removeSelectedFilterList()
+		case "e":
+			return m.toggleFilterEnabled()
+		}
+
+	case screenFilterCatalog:
+		switch msg.String() {
+		case "j", "down":
+			if m.catalogCursor < len(filter.Catalog())-1 {
+				m.catalogCursor++
+			}
+		case "k", "up":
+			if m.catalogCursor > 0 {
+				m.catalogCursor--
+			}
+		case "enter":
+			return m.toggleCatalogList()
+		case "esc":
+			m.screen = screenFilters
+			m.filterErr = nil
 		}
 
 	case screenSettings:
@@ -534,6 +600,7 @@ func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		m.inputActive = false
 		m.input = ""
+		m.filterNewID = ""
 		return m, nil
 	case tea.KeyEnter:
 		return m.commitInput()
@@ -575,6 +642,10 @@ func (m Model) commitInput() (tea.Model, tea.Cmd) {
 			m.settingsErr = nil
 		}
 		return m, nil
+	case inputFilterListID:
+		return m.commitFilterListID()
+	case inputFilterListURL:
+		return m.commitFilterListURL()
 	}
 	m.inputActive = false
 	return m, nil
@@ -624,6 +695,8 @@ func (m Model) View() string {
 		b.WriteString(m.upstreamsView())
 	case screenFilters:
 		b.WriteString(m.filtersView())
+	case screenFilterCatalog:
+		b.WriteString(m.catalogView())
 	case screenSettings:
 		b.WriteString(m.settingsView())
 	case screenDiag:
@@ -673,6 +746,18 @@ func (m *Model) helpView() string {
 		"  пробел пауза ленты запросов",
 		"  x     очистить ленту запросов",
 		"  ↑↓    прокрутка ленты",
+		"",
+		titleStyle.Render("Фильтры (экран 5)"),
+		"  a     каталог списков (enter — добавить/удалить, esc — назад)",
+		"  c     свой список: ID, затем https-URL",
+		"  d     удалить выбранный список",
+		"  e     включить или выключить фильтрацию",
+		"  r     добавить правило (block домен / allow домен)",
+		"  u     обновить все списки · enter — выбранный",
+		"",
+		titleStyle.Render("Настройки (экран 6)"),
+		"  enter — изменить поле, ctrl+s — применить",
+		dimStyle.Render("  Часовой пояс: IANA-зона, напр. Europe/Moscow, Europe/London, UTC (пусто — системная)"),
 		"  ?     эта справка",
 		"  q     выход",
 		"",
