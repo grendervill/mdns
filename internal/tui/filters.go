@@ -152,6 +152,50 @@ func addUserRuleCmd(c Client, kind, domain string) tea.Cmd {
 	}
 }
 
+// filterRow is one visible line of the filters table: the live status
+// when the updater has reported, or just the configured list before the
+// first status arrives. Every key acts on the selected visible row, so
+// the screen can never delete a list it does not show.
+type filterRow struct {
+	id   string
+	url  string
+	live *filter.ListStatus
+}
+
+// filterRows returns the rows the screen renders: the statuses when
+// they exist, otherwise the lists from the live config (filtering may be
+// disabled, and then the updater reports none).
+func (m *Model) filterRows() []filterRow {
+	if len(m.filterLists) > 0 {
+		rows := make([]filterRow, len(m.filterLists))
+		for i := range m.filterLists {
+			rows[i] = filterRow{
+				id:   m.filterLists[i].ID,
+				url:  m.filterLists[i].URL,
+				live: &m.filterLists[i],
+			}
+		}
+		return rows
+	}
+	if m.filterCfg == nil {
+		return nil
+	}
+	rows := make([]filterRow, 0, len(m.filterCfg.Filter.Lists))
+	for _, l := range m.filterCfg.Filter.Lists {
+		rows = append(rows, filterRow{id: l.ID, url: l.URL})
+	}
+	return rows
+}
+
+// selectedFilterRow returns the row under the cursor, if any.
+func (m *Model) selectedFilterRow() (filterRow, bool) {
+	rows := m.filterRows()
+	if m.filterCursor < 0 || m.filterCursor >= len(rows) {
+		return filterRow{}, false
+	}
+	return rows[m.filterCursor], true
+}
+
 // filtersView renders the block-list screen.
 func (m *Model) filtersView() string {
 	var b strings.Builder
@@ -178,26 +222,41 @@ func (m *Model) filtersView() string {
 	}
 	b.WriteString("\n")
 
-	if len(m.filterLists) == 0 {
-		b.WriteString(dimStyle.Render("Списки не загружены (перезайдите на экран: 5)") + "\n")
+	rows := m.filterRows()
+	if len(rows) == 0 {
+		if m.filterCfg == nil && len(m.filterLists) == 0 {
+			b.WriteString(dimStyle.Render("Списки загружаются…") + "\n")
+		} else {
+			// An honest empty state: nothing is configured, and these
+			// are the keys that change that.
+			b.WriteString(dimStyle.Render("Списков нет — a откроет каталог, c добавит свой") + "\n")
+		}
 	} else {
 		b.WriteString(dimStyle.Render("  список                 правил      пропуск  обновлён          статус"))
 		b.WriteString("\n")
-		for i, l := range m.filterLists {
+		for i, row := range rows {
 			marker := "  "
 			if i == m.filterCursor {
 				marker = "> "
 			}
-			state := okStyle.Render("ок")
-			if l.Error != "" {
-				state = errStyle.Render("ошибка: " + truncate(l.Error, 44))
+			applied, skipped, updated := "—", "—", "—"
+			state := dimStyle.Render("не загружен")
+			if row.live != nil {
+				applied = fmt.Sprintf("%d", row.live.Applied)
+				skipped = fmt.Sprintf("%d", row.live.Skipped)
+				state = okStyle.Render("ок")
+				if row.live.Error != "" {
+					state = errStyle.Render("ошибка: " + truncate(row.live.Error, 44))
+				}
+				if !row.live.UpdatedAt.IsZero() {
+					updated = row.live.UpdatedAt.Format("02.01 15:04:05")
+				}
 			}
-			updated := "—"
-			if !l.UpdatedAt.IsZero() {
-				updated = l.UpdatedAt.Format("02.01 15:04:05")
+			b.WriteString(fmt.Sprintf("%s%-22s %-11s %-8s %-17s %s\n",
+				marker, truncate(row.id, 22), applied, skipped, updated, state))
+			if row.url != "" {
+				b.WriteString("   " + dimStyle.Render(truncate(row.url, 72)) + "\n")
 			}
-			b.WriteString(fmt.Sprintf("%s%-22s %-11d %-8d %-17s %s\n",
-				marker, truncate(l.ID, 22), l.Applied, l.Skipped, updated, state))
 		}
 	}
 
@@ -307,22 +366,20 @@ func (m Model) toggleCatalogList() (tea.Model, tea.Cmd) {
 	return m.applyFilterCfg(next)
 }
 
-// removeSelectedFilterList drops the list under the status cursor.
+// removeSelectedFilterList drops the list under the cursor. It refuses
+// when no row is visible: a delete must never resolve an invisible list
+// from the config by index.
 func (m Model) removeSelectedFilterList() (tea.Model, tea.Cmd) {
+	row, ok := m.selectedFilterRow()
+	if !ok {
+		m.filterErr = errors.New("список не выбран")
+		return m, nil
+	}
 	if m.filterCfg == nil {
 		m.filterErr = errors.New("конфигурация ещё не загружена")
 		return m, loadFilterConfig(m.client)
 	}
-	id := ""
-	if len(m.filterLists) > 0 && m.filterCursor < len(m.filterLists) {
-		id = m.filterLists[m.filterCursor].ID
-	} else if m.filterCursor < len(m.filterCfg.Filter.Lists) {
-		id = m.filterCfg.Filter.Lists[m.filterCursor].ID
-	}
-	if id == "" {
-		m.filterErr = errors.New("список не выбран")
-		return m, nil
-	}
+	id := row.id
 	next := cloneConfig(m.filterCfg)
 	i := filterListIndex(next.Filter.Lists, id)
 	if i < 0 {

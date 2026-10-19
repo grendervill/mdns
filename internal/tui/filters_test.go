@@ -283,6 +283,11 @@ func TestSettingsNewFieldRoundTrip(t *testing.T) {
 	if got := m.settingsCfg.Protocols.DoH.Path; got != "/doh" {
 		t.Errorf("doh path = %q, want /doh", got)
 	}
+	// An empty path is valid: the daemon falls back to /dns-query.
+	m = editSettingsField(t, m, "Путь DoH", "")
+	if got := m.settingsCfg.Protocols.DoH.Path; got != "" {
+		t.Errorf("doh path = %q, want it cleared to the /dns-query default", got)
+	}
 	m = editSettingsField(t, m, "Интервал обновления списков, ч", "6")
 	if got := m.settingsCfg.Filter.UpdateIntervalHours; got != 6 {
 		t.Errorf("interval = %d, want 6", got)
@@ -299,8 +304,8 @@ func TestSettingsNewFieldRoundTrip(t *testing.T) {
 	if got.Timezone != "" {
 		t.Errorf("sent timezone = %q, want empty", got.Timezone)
 	}
-	if got.Protocols.DoH.Path != "/doh" {
-		t.Errorf("sent doh path = %q, want /doh", got.Protocols.DoH.Path)
+	if got.Protocols.DoH.Path != "" {
+		t.Errorf("sent doh path = %q, want empty (the /dns-query default)", got.Protocols.DoH.Path)
 	}
 	if got.Filter.UpdateIntervalHours != 6 {
 		t.Errorf("sent interval = %d, want 6", got.Filter.UpdateIntervalHours)
@@ -499,6 +504,56 @@ func TestFilterListManagement(t *testing.T) {
 	}
 	if got := sc.updates[2].Filter.UserBlock; len(got) != 1 || got[0] != "ads.example.com" {
 		t.Errorf("user_block = %v, want [ads.example.com]", got)
+	}
+}
+
+// TestFilterListsVisibleWhenDisabled checks that the screen always shows
+// the configured lists, even with filtering off and no status entries,
+// and that d acts on the visible row (or refuses when there is none).
+func TestFilterListsVisibleWhenDisabled(t *testing.T) {
+	cfg := config.Default()
+	cfg.Filter.Enabled = false
+	cfg.Filter.Lists = []config.FilterList{{ID: "only-list"}}
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "filters"})
+	m = step(m, filterConfigLoadedMsg{cfg: cfg})
+
+	view := m.View()
+	for _, want := range []string{"only-list", "не загружен"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() misses %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "Списков нет") {
+		t.Errorf("the empty hint is shown while a list is configured:\n%s", view)
+	}
+
+	// d on the visible row removes exactly that list.
+	updated, cmd := m.Update(key('d'))
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 {
+		t.Fatalf("UpdateConfig calls = %d, want 1", len(sc.updates))
+	}
+	if got := sc.updates[0].Filter.Lists; len(got) != 0 {
+		t.Errorf("lists after d = %+v, want none", got)
+	}
+
+	// With no rows at all, d is refused and never touches the config.
+	empty := config.Default()
+	sc2 := &stubClient{cfg: empty}
+	m2 := New(sc2, Options{Initial: "filters"})
+	m2 = step(m2, filterConfigLoadedMsg{cfg: empty})
+	updated, cmd = m2.Update(key('d'))
+	m2 = updated.(Model)
+	if cmd != nil {
+		t.Errorf("d without rows returned a command")
+	}
+	if m2.filterErr == nil || !strings.Contains(m2.filterErr.Error(), "список не выбран") {
+		t.Errorf("d without rows gave err=%v, want «список не выбран»", m2.filterErr)
+	}
+	if len(sc2.updates) != 0 {
+		t.Errorf("d without rows called UpdateConfig %d times", len(sc2.updates))
 	}
 }
 

@@ -352,6 +352,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.filterCfg = msg.cfg
 		m.filterErr = nil
+		if rows := m.filterRows(); len(rows) > 0 && m.filterCursor >= len(rows) {
+			m.filterCursor = len(rows) - 1
+		}
 		return m, nil
 
 	case filterUpdatedMsg:
@@ -539,7 +542,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case screenFilters:
-		fields := m.filterLists
+		fields := m.filterRows()
 		switch msg.String() {
 		case "j", "down":
 			if m.filterCursor < len(fields)-1 {
@@ -550,8 +553,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.filterCursor--
 			}
 		case "enter":
-			if len(fields) > 0 {
-				return m, filterUpdateCmd(m.client, fields[m.filterCursor].ID)
+			if len(fields) > 0 && m.filterCursor < len(fields) {
+				return m, filterUpdateCmd(m.client, fields[m.filterCursor].id)
 			}
 		case "u":
 			return m, filterUpdateCmd(m.client, "")
@@ -876,13 +879,31 @@ func (m Model) View() string {
 
 	if m.width > 0 {
 		b.WriteString("\n")
-		footer := "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
-		if m.screen == screenFilters {
-			footer = "q — выход · r — правило · enter/u — обновить · ? — помощь · ↑↓ — прокрутка"
-		}
-		b.WriteString(dimStyle.Render(footer))
+		b.WriteString(dimStyle.Render(m.footerText()))
 	}
 	return b.String()
+}
+
+// footerText is the per-screen key reference. Each line names only keys
+// that actually work on that screen; the feed's space/x hints therefore
+// never leak onto another screen.
+func (m Model) footerText() string {
+	switch m.screen {
+	case screenRequests:
+		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
+	case screenFilters:
+		return "q — выход · r — правило · enter/u — обновить · ? — помощь · ↑↓ — прокрутка"
+	case screenUpstreams:
+		return "space — вкл/выкл · d — удалить · p — приоритет · s — стратегия · t — проверить · a — каталог · c — свой · j/k — выбор · ? — помощь"
+	case screenUpstreamForm:
+		return "j/k — поля · enter — изменить/сменить транспорт · ctrl+s — применить · esc — отмена"
+	case screenUpstreamCatalog, screenFilterCatalog:
+		return "j/k — выбор · enter — добавить/удалить · esc — назад · ? — помощь"
+	case screenSettings:
+		return "q — выход · r — обновить · enter — изменить · ctrl+s — применить · ? — помощь"
+	default:
+		return "q — выход · r — обновить · ? — помощь"
+	}
 }
 
 // tabsView renders the top navigation bar.

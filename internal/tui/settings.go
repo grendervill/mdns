@@ -35,7 +35,7 @@ func (m *Model) settingsFields() []settingField {
 		intField("Порт plain", func(c *config.Config) *int { return &c.Protocols.Plain.Port }),
 		protocolToggle("Plain включён", func(c *config.Config) *config.Protocol { return &c.Protocols.Plain }),
 		intField("Порт DoH", func(c *config.Config) *int { return &c.Protocols.DoH.Port }),
-		stringField("Путь DoH", func(c *config.Config) *string { return &c.Protocols.DoH.Path }),
+		stringAllowEmptyField("Путь DoH", func(c *config.Config) *string { return &c.Protocols.DoH.Path }),
 		protocolToggle("DoH включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoH }),
 		intField("Порт DoT", func(c *config.Config) *int { return &c.Protocols.DoT.Port }),
 		protocolToggle("DoT включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoT }),

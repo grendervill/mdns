@@ -383,12 +383,14 @@ func (m Model) removeSelectedUpstream() (tea.Model, tea.Cmd) {
 }
 
 // startUpstreamPriority opens the priority input on the selected row.
+// The input starts empty so typing appends; the current value is shown
+// in the prompt instead.
 func (m Model) startUpstreamPriority() (tea.Model, tea.Cmd) {
 	if m.upstreamCfg == nil {
 		m.upstreamErr = errors.New("конфигурация ещё не загружена")
 		return m, loadUpstreamConfig(m.client)
 	}
-	row, ok := m.selectedUpstreamRow()
+	_, ok := m.selectedUpstreamRow()
 	if !ok {
 		m.upstreamErr = errors.New("upstream не выбран")
 		return m, nil
@@ -396,15 +398,19 @@ func (m Model) startUpstreamPriority() (tea.Model, tea.Cmd) {
 	m.upstreamErr = nil
 	m.inputActive = true
 	m.inputMode = inputUpstreamPriority
-	m.input = strconv.Itoa(row.priority)
+	m.input = ""
 	return m, nil
 }
 
-// commitUpstreamPriority parses the typed priority and applies it.
+// commitUpstreamPriority parses the typed priority and applies it; an
+// empty submit cancels.
 func (m Model) commitUpstreamPriority() (tea.Model, tea.Cmd) {
 	raw := strings.TrimSpace(m.input)
 	m.inputActive = false
 	m.input = ""
+	if raw == "" {
+		return m, nil // cancelled
+	}
 	if m.upstreamCfg == nil {
 		m.upstreamErr = errors.New("конфигурация ещё не загружена")
 		return m, loadUpstreamConfig(m.client)
@@ -644,7 +650,12 @@ func (m Model) applyUpstreamForm() (tea.Model, tea.Cmd) {
 func (m *Model) upstreamsView() string {
 	rows := m.upstreamRows()
 	if len(rows) == 0 {
-		return dimStyle.Render("Данные об upstream'ах появятся после подключения к демону.") + "\n"
+		var b strings.Builder
+		b.WriteString(dimStyle.Render("Upstream'ы не настроены — a откроет каталог провайдеров, c добавит свой") + "\n")
+		if m.upstreamErr != nil {
+			b.WriteString("\n" + errStyle.Render(m.upstreamErr.Error()) + "\n")
+		}
+		return b.String()
 	}
 
 	var b strings.Builder
@@ -708,7 +719,11 @@ func (m *Model) upstreamsView() string {
 
 	if m.inputActive && m.inputMode == inputUpstreamPriority {
 		b.WriteString("\n")
-		b.WriteString(titleStyle.Render("Приоритет: ") + m.input + "▏")
+		hint := ""
+		if row, ok := m.selectedUpstreamRow(); ok {
+			hint = fmt.Sprintf(" (сейчас %d, пусто — отмена)", row.priority)
+		}
+		b.WriteString(titleStyle.Render("Приоритет"+hint+": ") + m.input + "▏")
 		b.WriteString("\n")
 	}
 	return b.String()

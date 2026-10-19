@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -303,12 +304,30 @@ func TestUpstreamPriorityAndStrategy(t *testing.T) {
 	if !m.inputActive || m.inputMode != inputUpstreamPriority {
 		t.Fatalf("p did not open the priority input")
 	}
-	m.input = "7"
+	if m.input != "" {
+		t.Errorf("priority input prefilled with %q, want empty", m.input)
+	}
+	if !strings.Contains(m.View(), "сейчас 2") {
+		t.Errorf("View() does not show the current priority in the prompt:\n%s", m.View())
+	}
+	m = typeText(m, "7")
 	updated, cmd = m.Update(enterKey())
 	m = updated.(Model)
 	m = drainCmd(t, m, cmd)
 	if len(sc.updates) != 1 || sc.updates[0].Upstreams[0].Priority != 7 {
 		t.Fatalf("priority update = %+v, want 7", sc.updates)
+	}
+
+	// An empty submit cancels without touching the config.
+	updated, cmd = m.Update(key('p'))
+	m = updated.(Model)
+	if !m.inputActive || m.input != "" {
+		t.Fatalf("reopened priority input is active=%v value=%q, want active and empty", m.inputActive, m.input)
+	}
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	if cmd != nil || len(sc.updates) != 1 {
+		t.Errorf("an empty priority submit applied a change (cmd=%v, updates=%d)", cmd != nil, len(sc.updates))
 	}
 
 	// The strategy starts as fastest and cycles forwards.
@@ -395,6 +414,7 @@ func TestUpstreamProbe(t *testing.T) {
 func TestUpstreamsFooterAndHelp(t *testing.T) {
 	cfg := upstreamCfgWith(config.UpstreamConfig{ID: "a", Enabled: true, Transport: "plain", Address: "1.1.1.1:53"})
 	m := upstreamModel(&stubClient{cfg: cfg}, cfg)
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
 
 	view := m.View()
 	for _, want := range []string{"Стратегия", "space — вкл/выкл", "d — удалить", "p — приоритет", "s — стратегия", "t — проверить", "a — каталог", "c — свой upstream"} {
@@ -402,12 +422,31 @@ func TestUpstreamsFooterAndHelp(t *testing.T) {
 			t.Errorf("upstreams View() misses %q:\n%s", want, view)
 		}
 	}
+	if strings.Contains(view, "пауза ленты") {
+		t.Errorf("the upstreams footer advertises the feed's pause key:\n%s", view)
+	}
 
 	m = step(m, key('?'))
 	help := m.View()
 	for _, want := range []string{"Upstream'ы (экран 4)", "каталог провайдеров", "свой upstream", "проверить выбранный"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help View() misses %q:\n%s", want, help)
+		}
+	}
+}
+
+// TestUpstreamsEmptyState checks that an empty upstream list still shows
+// the way out and an error instead of a silent blank screen.
+func TestUpstreamsEmptyState(t *testing.T) {
+	cfg := upstreamCfgWith()
+	sc := &stubClient{cfg: cfg}
+	m := upstreamModel(sc, cfg)
+	m.upstreamErr = errors.New("демон недоступен")
+
+	view := m.View()
+	for _, want := range []string{"a откроет каталог", "c добавит свой", "демон недоступен"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("empty upstreams View() misses %q:\n%s", want, view)
 		}
 	}
 }
