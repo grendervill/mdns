@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -25,6 +27,7 @@ const (
 	screenFilters
 	screenSettings
 	screenDiag
+	screenMaintenance
 	// screenFilterCatalog is the list picker opened from the filters
 	// screen; it is not a tab.
 	screenFilterCatalog
@@ -39,7 +42,7 @@ const (
 	screenHelp
 )
 
-// screenTabs is the navigation order; digits 1-7 select these.
+// screenTabs is the navigation order; digits 1-8 select these.
 var screenTabs = []struct {
 	name   string
 	screen screen
@@ -51,6 +54,7 @@ var screenTabs = []struct {
 	{"Фильтры", screenFilters},
 	{"Настройки", screenSettings},
 	{"Диагностика", screenDiag},
+	{"Обслуживание", screenMaintenance},
 }
 
 // Options configure the model.
@@ -121,6 +125,19 @@ type Model struct {
 	probeUpstream string
 	probeResult   string
 
+	// Backups screen state: the stored snapshots, the live config
+	// (needed for the display timezone and the panel password change)
+	// and the feedback lines.
+	backups         []BackupInfo
+	backupsLoaded   bool
+	backupsErr      error
+	backupCursor    int
+	maintenanceCfg  *config.Config
+	maintenanceNote string
+	maintenanceErr  error
+	passwordFirst   string
+	passwordPending bool
+
 	inputActive bool
 	inputMode   inputMode
 	inputField  int
@@ -157,6 +174,8 @@ func parseScreen(name string) screen {
 		return screenSettings
 	case "diag", "диагностика":
 		return screenDiag
+	case "maintenance", "обслуживание":
+		return screenMaintenance
 	case "help", "помощь":
 		return screenHelp
 	default:
@@ -211,6 +230,34 @@ type (
 
 	// eventsRetryMsg re-opens the event stream after eventsRetryDelay.
 	eventsRetryMsg struct{}
+
+	// backupsLoadedMsg carries the stored config snapshots.
+	backupsLoadedMsg struct {
+		backups []BackupInfo
+		err     error
+	}
+	// backupDoneMsg reports one create/restore/delete mutation.
+	backupDoneMsg struct {
+		action string
+		name   string
+		err    error
+	}
+	// maintenanceConfigMsg carries the live config for the display
+	// timezone and the panel password change.
+	maintenanceConfigMsg struct {
+		cfg *config.Config
+		err error
+	}
+	// passwordHashedMsg carries the result of the slow argon2 hash.
+	passwordHashedMsg struct {
+		hash string
+		err  error
+	}
+	// passwordChangedMsg reports the config write that stores the hash.
+	passwordChangedMsg struct {
+		cfg *config.Config
+		err error
+	}
 )
 
 // fetchStatus loads the status snapshot.
@@ -426,6 +473,91 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diagLoaded = true
 		return m, nil
 
+	case backupsLoadedMsg:
+		m.backupsLoaded = true
+		m.backupsErr = msg.err
+		if msg.err == nil {
+			m.backups = sortBackups(msg.backups)
+			switch {
+			case len(m.backups) == 0:
+				// Never leave the cursor at -1: an empty reload (the
+				// last snapshot was deleted elsewhere) returns it to
+				// the first row the next create will occupy.
+				m.backupCursor = 0
+			case m.backupCursor >= len(m.backups):
+				m.backupCursor = len(m.backups) - 1
+			}
+		}
+		return m, nil
+
+	case backupDoneMsg:
+		if msg.err != nil {
+			m.maintenanceNote = ""
+			m.maintenanceErr = msg.err
+			return m, nil
+		}
+		m.maintenanceErr = nil
+		cmds := []tea.Cmd{loadBackups(m.client)}
+		switch msg.action {
+		case "create":
+			m.maintenanceNote = "Резервная копия создана."
+		case "restore":
+			m.maintenanceNote = "Конфигурация восстановлена из копии " + msg.name + "."
+			// Restore rewrites the whole config, the panel state
+			// included: re-read it before the next password change.
+			m.maintenanceCfg = nil
+			m.settingsCfg = nil
+			cmds = append(cmds, loadMaintenanceConfig(m.client))
+		case "delete":
+			m.maintenanceNote = "Резервная копия удалена."
+		}
+		return m, tea.Batch(cmds...)
+
+	case maintenanceConfigMsg:
+		if msg.err != nil {
+			m.maintenanceErr = msg.err
+			m.passwordPending = false
+			return m, nil
+		}
+		m.maintenanceCfg = msg.cfg
+		if !m.passwordPending {
+			return m, nil
+		}
+		m.passwordPending = false
+		if m.screen != screenMaintenance {
+			return m, nil
+		}
+		if msg.cfg == nil || !msg.cfg.Panel.Enabled {
+			m.maintenanceErr = errPanelDisabled
+			return m, nil
+		}
+		return m.openPasswordPrompt(), nil
+
+	case passwordHashedMsg:
+		if msg.err != nil {
+			m.maintenanceErr = fmt.Errorf("не удалось захэшировать пароль: %w", msg.err)
+			return m, nil
+		}
+		if m.maintenanceCfg == nil {
+			m.maintenanceErr = errors.New("конфигурация не загружена — повторите смену пароля")
+			return m, nil
+		}
+		next := cloneConfig(m.maintenanceCfg)
+		next.Panel.PasswordHash = msg.hash
+		return m, applyPasswordCmd(m.client, next)
+
+	case passwordChangedMsg:
+		if msg.err != nil {
+			m.maintenanceNote = ""
+			m.maintenanceErr = fmt.Errorf("не удалось применить пароль: %w", msg.err)
+			return m, nil
+		}
+		m.maintenanceCfg = msg.cfg
+		m.maintenanceErr = nil
+		m.maintenanceNote = "Готово: пароль изменён."
+		m.settingsCfg = nil // the settings screen re-reads the new hash
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -448,6 +580,8 @@ func (m Model) refreshCmd() tea.Cmd {
 		cmds = append(cmds, loadRequests(m.client))
 	case screenDiag:
 		cmds = append(cmds, loadDiag(m.client))
+	case screenMaintenance:
+		cmds = append(cmds, loadBackups(m.client), loadMaintenanceConfig(m.client))
 	}
 	return tea.Batch(cmds...)
 }
@@ -475,6 +609,8 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 		if !m.diagLoaded {
 			return loadDiag(m.client)
 		}
+	case screenMaintenance:
+		return tea.Batch(loadBackups(m.client), loadMaintenanceConfig(m.client))
 	}
 	return nil
 }
@@ -505,7 +641,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.screen = screenHelp
 		return m, nil
-	case "1", "2", "3", "4", "5", "6", "7":
+	case "1", "2", "3", "4", "5", "6", "7", "8":
 		idx := int(msg.String()[0] - '1')
 		m.screen = screenTabs[idx].screen
 		if m.screen == screenWizard {
@@ -706,6 +842,28 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.openWizard()
 		}
 
+	case screenMaintenance:
+		switch msg.String() {
+		case "j", "down":
+			if m.backupCursor < len(m.backups)-1 {
+				m.backupCursor++
+			}
+		case "k", "up":
+			if m.backupCursor > 0 {
+				m.backupCursor--
+			}
+		case "c":
+			m.maintenanceErr = nil
+			m.maintenanceNote = ""
+			return m, createBackupCmd(m.client, "manual")
+		case "enter":
+			return m.restoreSelectedBackup()
+		case "d":
+			return m.deleteSelectedBackup()
+		case "p":
+			return m.startPasswordChange()
+		}
+
 	case screenHelp:
 		if msg.String() == "esc" {
 			m.screen = m.helpReturn
@@ -740,9 +898,9 @@ func (m Model) forwardToWizard(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// isScreenDigit reports whether s selects a screen tab (1-7).
+// isScreenDigit reports whether s selects a screen tab (1-8).
 func isScreenDigit(s string) bool {
-	return len(s) == 1 && s[0] >= '1' && s[0] <= '7'
+	return len(s) == 1 && s[0] >= '1' && s[0] <= '8'
 }
 
 // handleInputKey processes keys while an input line is open.
@@ -756,7 +914,14 @@ func (m Model) handleInputKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		m.inputActive = false
 		m.input = ""
+		m.inputMode = inputNone
 		m.filterNewID = ""
+		// Cancelling either password prompt drops the pair and the
+		// error of the abandoned attempt.
+		m.passwordFirst = ""
+		if m.screen == screenMaintenance {
+			m.maintenanceErr = nil
+		}
 		return m, nil
 	case tea.KeyEnter:
 		return m.commitInput()
@@ -806,6 +971,10 @@ func (m Model) commitInput() (tea.Model, tea.Cmd) {
 		return m.commitUpstreamFormField()
 	case inputUpstreamPriority:
 		return m.commitUpstreamPriority()
+	case inputMaintenancePassword:
+		return m.commitMaintenancePassword()
+	case inputMaintenanceConfirm:
+		return m.commitMaintenanceConfirm()
 	}
 	m.inputActive = false
 	return m, nil
@@ -865,6 +1034,8 @@ func (m Model) View() string {
 		b.WriteString(m.settingsView())
 	case screenDiag:
 		b.WriteString(m.diagView())
+	case screenMaintenance:
+		b.WriteString(m.maintenanceView())
 	case screenHelp:
 		b.WriteString(m.helpView())
 	default:
@@ -888,6 +1059,11 @@ func (m Model) View() string {
 // that actually work on that screen; the feed's space/x hints therefore
 // never leak onto another screen.
 func (m Model) footerText() string {
+	// While an input line or a prompt owns the keys, the destructive
+	// screen keys do not work: advertise only the two that do.
+	if m.inputActive {
+		return "enter — подтвердить · esc — отмена"
+	}
 	switch m.screen {
 	case screenRequests:
 		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
@@ -901,6 +1077,8 @@ func (m Model) footerText() string {
 		return "j/k — выбор · enter — добавить/удалить · esc — назад · ? — помощь"
 	case screenSettings:
 		return "q — выход · r — обновить · enter — изменить · ctrl+s — применить · ? — помощь"
+	case screenMaintenance:
+		return "j/k — выбор · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
 	default:
 		return "q — выход · r — обновить · ? — помощь"
 	}
@@ -925,7 +1103,7 @@ func (m *Model) helpView() string {
 	lines := []string{
 		titleStyle.Render("mdns — горячие клавиши"),
 		"",
-		"  1-7   переключение экранов (7 — Диагностика)",
+		"  1-8   переключение экранов (7 — Диагностика, 8 — Обслуживание)",
 		"  r     перечитать данные с демона",
 		"  f     фильтр ленты «Запросы» (Enter — применить, esc — отменить)",
 		"  esc   сбросить фильтр ленты / выйти из справки",
@@ -947,6 +1125,12 @@ func (m *Model) helpView() string {
 		"  пробел включить/выключить выбранный (последний включённый не выключается)",
 		"  d     удалить выбранный upstream · p — приоритет · s — стратегия",
 		"  t     проверить выбранный upstream (probe)",
+		"",
+		titleStyle.Render("Обслуживание (экран 8)"),
+		"  j/k   выбор копии · enter — восстановить · d — удалить",
+		"  c     создать резервную копию (метка manual)",
+		"  p     сменить пароль веб-панели (два скрытых ввода, esc — отмена)",
+		dimStyle.Render("  Восстановление заменяет конфигурацию целиком, снапшот создаётся автоматически"),
 		"",
 		titleStyle.Render("Настройки (экран 6)"),
 		"  enter — изменить поле, ctrl+s — применить",

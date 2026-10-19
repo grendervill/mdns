@@ -28,6 +28,10 @@ const (
 	inputUpstreamFormField
 	// inputUpstreamPriority edits the priority of the selected upstream.
 	inputUpstreamPriority
+	// inputMaintenancePassword and inputMaintenanceConfirm edit the
+	// panel password pair on the maintenance screen. Both are secrets.
+	inputMaintenancePassword
+	inputMaintenanceConfirm
 )
 
 // nextBlockMode cycles the block mode.

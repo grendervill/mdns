@@ -14,6 +14,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -46,6 +47,16 @@ type fakeController struct {
 	lastPage  int
 	lastPer   int
 	queryFn   func(q qlog.Query, page, per int) ([]qlog.Entry, int)
+
+	backups       []configbackup.Info
+	createErr     error
+	listErr       error
+	restoreErr    error
+	deleteErr     error
+	lastLabel     string
+	lastRestore   string
+	lastDelete    string
+	createdBackup configbackup.Info
 }
 
 func (f *fakeController) Status(context.Context) (api.Status, error) {
@@ -81,6 +92,33 @@ func (f *fakeController) FilterStatus() []filter.ListStatus { return nil }
 func (f *fakeController) FilterUpdate(_ context.Context, id string) error {
 	f.lastFilterID = id
 	return nil
+}
+func (f *fakeController) CreateConfigBackup(label string) error {
+	f.lastLabel = label
+	if f.createErr != nil {
+		return f.createErr
+	}
+	info := f.createdBackup
+	if info.Name == "" {
+		info = configbackup.Info{
+			Name:    "config-20261019-120000.json",
+			Size:    64,
+			ModTime: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+		}
+	}
+	f.backups = append([]configbackup.Info{info}, f.backups...)
+	return nil
+}
+func (f *fakeController) ListConfigBackups() ([]configbackup.Info, error) {
+	return f.backups, f.listErr
+}
+func (f *fakeController) RestoreConfigBackup(name string) error {
+	f.lastRestore = name
+	return f.restoreErr
+}
+func (f *fakeController) DeleteConfigBackup(name string) error {
+	f.lastDelete = name
+	return f.deleteErr
 }
 
 // newTestServer builds an API server over the fake with a live test

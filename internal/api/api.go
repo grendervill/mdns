@@ -15,6 +15,7 @@ import (
 
 	"mydns/internal/cache"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/links"
 	"mydns/internal/probe"
@@ -95,6 +96,16 @@ type Controller interface {
 	RequestsQuery(q qlog.Query, page, per int) ([]qlog.Entry, int)
 	FilterStatus() []filter.ListStatus
 	FilterUpdate(ctx context.Context, id string) error
+	// CreateConfigBackup stores a snapshot of the current
+	// configuration under DataDir/backups with the given label.
+	CreateConfigBackup(label string) error
+	// ListConfigBackups returns the stored snapshots, newest first.
+	ListConfigBackups() ([]configbackup.Info, error)
+	// RestoreConfigBackup loads a snapshot through the normal config
+	// load and migration path and applies it through UpdateConfig.
+	RestoreConfigBackup(name string) error
+	// DeleteConfigBackup removes one stored snapshot.
+	DeleteConfigBackup(name string) error
 }
 
 // Server is the HTTP API. It is safe for concurrent use after New.
@@ -135,6 +146,10 @@ func New(ctl Controller, bus *Bus, logger *slog.Logger, opts ServerOptions) *Ser
 	mux.HandleFunc("GET /api/v1/stats", s.handleStats)
 	mux.HandleFunc("GET /api/v1/filter/status", s.handleFilterStatus)
 	mux.HandleFunc("POST /api/v1/filter/update", s.handleFilterUpdate)
+	mux.HandleFunc("GET /api/v1/backups", s.handleBackupsList)
+	mux.HandleFunc("POST /api/v1/backups", s.handleBackupCreate)
+	mux.HandleFunc("POST /api/v1/backups/restore", s.handleBackupRestore)
+	mux.HandleFunc("POST /api/v1/backups/delete", s.handleBackupDelete)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	s.mux = mux
 	return s

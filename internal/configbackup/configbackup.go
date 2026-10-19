@@ -7,6 +7,7 @@
 package configbackup
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -23,6 +24,22 @@ import (
 // pruned. Ten covers a rollback chain without letting an unattended
 // panel's saves fill the data directory.
 const retain = 10
+
+// Sentinel errors let a caller tell a bad request from a broken store:
+// ErrInvalidName and ErrInvalid mean the user or the snapshot content is
+// at fault, ErrNotFound means the file is gone, and anything else is an
+// I/O or apply failure.
+var (
+	// ErrInvalidName reports a name that cannot address a snapshot:
+	// blank, not a base name, or not a .json file.
+	ErrInvalidName = errors.New("configbackup: invalid backup name")
+	// ErrNotFound reports a snapshot that is not stored. The returned
+	// error also wraps fs.ErrNotExist, so either check works.
+	ErrNotFound = errors.New("configbackup: backup not found")
+	// ErrInvalid reports a snapshot whose content cannot be decoded or
+	// does not validate.
+	ErrInvalid = errors.New("configbackup: invalid backup")
+)
 
 // namePrefix and nameSuffix are the shape of a snapshot file:
 // config-20060102-150405[-label].json.
@@ -125,10 +142,20 @@ func Load(dir, name string) (*config.Config, error) {
 
 	cfg, err := config.Load(filepath.Join(dir, name))
 	if err != nil {
-		return nil, fmt.Errorf("configbackup: %w", err)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, fmt.Errorf("%w: %w", ErrNotFound, err)
+		case isDecodeError(err):
+			// Bad content is the snapshot's fault, not the store's.
+			return nil, fmt.Errorf("%w: %w", ErrInvalid, err)
+		default:
+			// Permission and I/O failures stay unclassified, so a
+			// caller reports them as an internal error.
+			return nil, fmt.Errorf("configbackup: %w", err)
+		}
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("configbackup: %s: %w", name, err)
+		return nil, fmt.Errorf("%w: %s: %w", ErrInvalid, name, err)
 	}
 	return cfg, nil
 }
@@ -140,9 +167,20 @@ func Delete(dir, name string) error {
 		return err
 	}
 	if err := os.Remove(filepath.Join(dir, name)); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: %w", ErrNotFound, err)
+		}
 		return fmt.Errorf("configbackup: delete %s: %w", name, err)
 	}
 	return nil
+}
+
+// isDecodeError reports whether err came from decoding the snapshot's
+// JSON, as opposed to reading the file.
+func isDecodeError(err error) bool {
+	var syntax *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	return errors.As(err, &syntax) || errors.As(err, &typeErr)
 }
 
 // prune deletes the oldest snapshots beyond retain. It is best-effort
@@ -177,13 +215,13 @@ func stat(path string) (Info, error) {
 // a request can never address a file outside dir.
 func validateName(name string) error {
 	if name == "" || name == "." || name == ".." {
-		return fmt.Errorf("configbackup: invalid backup name %q", name)
+		return fmt.Errorf("%w %q", ErrInvalidName, name)
 	}
 	if name != filepath.Base(name) || strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0) {
-		return fmt.Errorf("configbackup: invalid backup name %q", name)
+		return fmt.Errorf("%w %q", ErrInvalidName, name)
 	}
 	if !strings.HasSuffix(name, nameSuffix) || name == nameSuffix {
-		return fmt.Errorf("configbackup: invalid backup name %q (want a .json file)", name)
+		return fmt.Errorf("%w %q (want a .json file)", ErrInvalidName, name)
 	}
 	return nil
 }

@@ -25,6 +25,13 @@ import (
 	"mydns/internal/tlscert"
 )
 
+// BackupInfo describes one stored configuration snapshot.
+type BackupInfo struct {
+	Name    string    `json:"name"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+}
+
 // Client is everything the TUI needs from the daemon.
 type Client interface {
 	Status(ctx context.Context) (api.Status, error)
@@ -35,6 +42,10 @@ type Client interface {
 	Requests(ctx context.Context, n int) ([]qlog.Entry, error)
 	FilterStatus(ctx context.Context) ([]filter.ListStatus, error)
 	FilterUpdate(ctx context.Context, id string) error
+	Backups(ctx context.Context) ([]BackupInfo, error)
+	CreateBackup(ctx context.Context, label string) error
+	RestoreBackup(ctx context.Context, name string) error
+	DeleteBackup(ctx context.Context, name string) error
 	Events(ctx context.Context) (<-chan api.Event, error)
 }
 
@@ -125,6 +136,41 @@ func (c *UnixClient) FilterUpdate(ctx context.Context, id string) error {
 		ID string `json:"id"`
 	}{ID: id}
 	return c.do(ctx, http.MethodPost, "/api/v1/filter/update", req, nil)
+}
+
+// Backups implements Client: the stored config snapshots, newest first.
+func (c *UnixClient) Backups(ctx context.Context) ([]BackupInfo, error) {
+	var resp struct {
+		Backups []BackupInfo `json:"backups"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/v1/backups", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Backups, nil
+}
+
+// CreateBackup implements Client: store a snapshot with the given label.
+func (c *UnixClient) CreateBackup(ctx context.Context, label string) error {
+	req := struct {
+		Label string `json:"label"`
+	}{Label: label}
+	return c.do(ctx, http.MethodPost, "/api/v1/backups", req, nil)
+}
+
+// RestoreBackup implements Client: apply one stored snapshot.
+func (c *UnixClient) RestoreBackup(ctx context.Context, name string) error {
+	req := struct {
+		Name string `json:"name"`
+	}{Name: name}
+	return c.do(ctx, http.MethodPost, "/api/v1/backups/restore", req, nil)
+}
+
+// DeleteBackup implements Client: remove one stored snapshot.
+func (c *UnixClient) DeleteBackup(ctx context.Context, name string) error {
+	req := struct {
+		Name string `json:"name"`
+	}{Name: name}
+	return c.do(ctx, http.MethodPost, "/api/v1/backups/delete", req, nil)
 }
 
 // Events implements Client: a channel of live events until ctx ends.
