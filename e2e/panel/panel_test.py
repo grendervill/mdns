@@ -605,6 +605,10 @@ def panel_flow(page, context):
     # A plain page load is enough: the server renders the ring's snapshot,
     # so the query issued above must already be in the table (the SSE
     # stream then keeps it current).
+    # The live screen must lead with the newest query; issue one right
+    # before the page load so earlier checks cannot race the assertion.
+    live_name = "e2e-live-%d.example.com" % int(time.time())
+    dig(live_name)
     page.goto(BASE_URL + "/panel/live")
     page.wait_for_function(
         "document.querySelectorAll('#live-rows tr:not(.empty)').length > 0",
