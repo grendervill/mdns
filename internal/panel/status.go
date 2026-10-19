@@ -7,6 +7,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html/template"
 	"math"
@@ -432,13 +433,12 @@ type certView struct {
 	Detail string
 }
 
-// statusView is the whole status page.
-type statusView struct {
-	Domain  string
-	Version string
-	CSRF    string
-	Nav     string // the rail entry to mark active ("status")
-
+// statsView is the self-refreshing statistics part of the status page:
+// the four gauges, the period summary line and the four diagrams. The
+// page renders it through the "stats" template and GET /panel/stats
+// serves exactly that template, so the polled fragment and the page
+// cannot drift apart.
+type statsView struct {
 	Total          string
 	CachePercent   string
 	CacheEntries   string
@@ -447,19 +447,34 @@ type statusView struct {
 	BestLatency    string
 	BestName       string
 
-	// Period selector state. The four gauges above stay all-time; the
-	// donuts and the period summary render the selected range.
-	PeriodOptions []periodOption
-	PeriodFrom    string
-	PeriodTo      string
+	// Period selector state of the block's own summary. The four gauges
+	// stay all-time; the donuts and the period summary render the
+	// selected range.
 	PeriodLabel   string
-	PeriodNotice  string
 	PeriodSummary string
 
 	Donuts []donutView
-	Feed   []rowView
-	Links  []linkView
-	Cert   certView
+}
+
+// statusView is the whole status page.
+type statusView struct {
+	Domain  string
+	Version string
+	CSRF    string
+	Nav     string // the rail entry to mark active ("status")
+
+	// Stats is the polled block. The selector below stays outside it, so
+	// a refresh never resets the admin's selection.
+	Stats statsView
+
+	PeriodOptions []periodOption
+	PeriodFrom    string
+	PeriodTo      string
+	PeriodNotice  string
+
+	Feed  []rowView
+	Links []linkView
+	Cert  certView
 }
 
 // periodOption is one entry of the period selector.
@@ -471,43 +486,81 @@ type periodOption struct {
 
 // handleStatus renders the status screen.
 func (p *Panel) handleStatus(w http.ResponseWriter, r *http.Request) {
+	sel := parsePeriod(r, time.Now())
+	st, sn, rangeSn := p.statusData(r.Context(), sel)
+
 	view := statusView{
 		Version: p.version,
 		CSRF:    p.csrfToken(sessionCSRFBinding(p.sessionToken(r))),
 		Nav:     "status",
+		Stats:   buildStats(st, sn, rangeSn, sel),
+		Feed:    p.feedRows(),
 	}
+	if p.ctrl != nil {
+		if cfg := p.ctrl.Config(); cfg != nil {
+			view.Domain = cfg.Domain
+		}
+	}
+	fillPeriodForm(&view, sel)
+	fillLinks(&view, st)
+	fillCert(&view, st)
 
+	p.render(w, http.StatusOK, "status", view)
+}
+
+// handleStats serves the status page's statistics fragment: the four
+// gauges, the period summary line and the four diagrams for the same
+// period/from/to query as the page. The page polls it every two seconds
+// and swaps the block's contents. The selector, its notice and the live
+// feed are deliberately absent — the form stays outside the polled block
+// and the feed keeps its own SSE stream.
+func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	sel := parsePeriod(r, time.Now())
+	st, sn, rangeSn := p.statusData(r.Context(), sel)
 
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err := templates["status"].ExecuteTemplate(w, "stats", buildStats(st, sn, rangeSn, sel)); err != nil {
+		p.logger.Warn("panel: rendering the statistics fragment", "error", err)
+	}
+}
+
+// statusData reads the daemon snapshot the status screen renders from:
+// the API status (gauge labels, links, certificate) plus the cumulative
+// and period statistics. A status error is logged and leaves the gauges
+// empty rather than stale.
+func (p *Panel) statusData(ctx context.Context, sel periodSelection) (api.Status, stats.Snapshot, stats.Snapshot) {
 	var (
 		st      api.Status
 		sn      stats.Snapshot
 		rangeSn stats.Snapshot
 	)
-	if p.ctrl != nil {
-		if cfg := p.ctrl.Config(); cfg != nil {
-			view.Domain = cfg.Domain
-		}
-		got, err := p.ctrl.Status(r.Context())
-		if err != nil {
-			// The page still renders; the gauges show nothing rather
-			// than stale numbers.
-			p.logger.Warn("panel: reading the daemon status", "error", err)
-		} else {
-			st = got
-		}
-		sn = p.ctrl.Stats()
-		rangeSn = p.ctrl.StatsRange(sel.From, sel.To)
+	if p.ctrl == nil {
+		return st, sn, rangeSn
 	}
 
+	got, err := p.ctrl.Status(ctx)
+	if err != nil {
+		p.logger.Warn("panel: reading the daemon status", "error", err)
+	} else {
+		st = got
+	}
+	sn = p.ctrl.Stats()
+	rangeSn = p.ctrl.StatsRange(sel.From, sel.To)
+	return st, sn, rangeSn
+}
+
+// buildStats fills the statistics block from the status and the two
+// snapshots: the gauges use the cumulative counters, the donuts and the
+// period summary use the selected range. Both the page and the fragment
+// go through it.
+func buildStats(st api.Status, sn, rangeSn stats.Snapshot, sel periodSelection) statsView {
+	var view statsView
 	fillGauges(&view, st, sn)
 	fillDonuts(&view, st, rangeSn)
 	fillPeriod(&view, sel, rangeSn)
-	fillLinks(&view, st)
-	fillCert(&view, st)
-	view.Feed = p.feedRows()
-
-	p.render(w, http.StatusOK, "status", view)
+	return view
 }
 
 // defaultPeriod is the period choice shown when the query is missing or
@@ -515,11 +568,12 @@ func (p *Panel) handleStatus(w http.ResponseWriter, r *http.Request) {
 const defaultPeriod = "30"
 
 // periodOrder fixes the selector order; periodLabels names each choice
-// in Russian. The custom choice parses the two date fields instead of a
-// fixed length.
-var periodOrder = [...]string{"30", "90", "180", "365", "custom"}
+// in Russian. Today is the current UTC calendar day; the custom choice
+// parses the two date fields instead of a fixed length.
+var periodOrder = [...]string{"today", "30", "90", "180", "365", "custom"}
 
 var periodLabels = map[string]string{
+	"today":  "Сегодня",
 	"30":     "Месяц",
 	"90":     "3 месяца",
 	"180":    "6 месяцев",
@@ -550,15 +604,31 @@ type periodSelection struct {
 }
 
 // parsePeriod resolves the period query into a whole-UTC-day range. An
-// unknown choice is the default month. A custom range must carry two
-// valid dates, must not be reversed and must fit the retention window;
-// otherwise it falls back to the month with a short notice. Future
-// dates clamp to now.
+// unknown choice is the default month. "today" is the current UTC
+// calendar day: from and to are the same day. A custom range must carry
+// two valid dates, must not be reversed and must fit the retention
+// window; otherwise it falls back to the month with a short notice.
+// Future dates clamp to now.
 func parsePeriod(r *http.Request, now time.Time) periodSelection {
 	q := r.URL.Query()
 	period := q.Get("period")
 	if _, ok := periodLabels[period]; !ok {
 		period = defaultPeriod
+	}
+
+	if period == "today" {
+		// The collector buckets by UTC calendar day, so today means the
+		// day containing now in UTC, not in the process's local zone.
+		utc := now.UTC()
+		day := time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC)
+		return periodSelection{
+			Period:   "today",
+			From:     day,
+			To:       day,
+			FromText: day.Format("2006-01-02"),
+			ToText:   day.Format("2006-01-02"),
+			Label:    periodLabels["today"],
+		}
 	}
 
 	if period == "custom" {
@@ -626,9 +696,9 @@ func parseDay(raw string) (time.Time, error) {
 	return time.ParseInLocation("2006-01-02", raw, time.UTC)
 }
 
-// fillPeriod fills the selector state and the period totals line. The
-// totals come from the range snapshot, so they always match the donuts.
-func fillPeriod(view *statusView, sel periodSelection, sn stats.Snapshot) {
+// fillPeriodForm fills the selector state. It stays outside the polled
+// statistics block, so a refresh cannot reset the admin's choice.
+func fillPeriodForm(view *statusView, sel periodSelection) {
 	view.PeriodOptions = make([]periodOption, 0, len(periodOrder))
 	for _, v := range periodOrder {
 		view.PeriodOptions = append(view.PeriodOptions, periodOption{
@@ -639,16 +709,21 @@ func fillPeriod(view *statusView, sel periodSelection, sn stats.Snapshot) {
 	}
 	view.PeriodFrom = sel.FromText
 	view.PeriodTo = sel.ToText
-	view.PeriodLabel = sel.Label
 	view.PeriodNotice = sel.Notice
+}
+
+// fillPeriod fills the summary line inside the polled block. The totals
+// come from the range snapshot, so they always match the donuts.
+func fillPeriod(view *statsView, sel periodSelection, sn stats.Snapshot) {
+	view.PeriodLabel = sel.Label
 	view.PeriodSummary = "всего " + formatCount(sn.Total) +
 		" · кеш " + formatCount(sn.Outcomes["cached"]) +
 		" · блок " + formatCount(sn.Outcomes["blocked"]) +
 		" · ошибки " + formatCount(sn.Outcomes["error"])
 }
 
-// fillGauges fills the four counters above the diagrams.
-func fillGauges(view *statusView, st api.Status, sn stats.Snapshot) {
+// fillGauges fills the four all-time counters.
+func fillGauges(view *statsView, st api.Status, sn stats.Snapshot) {
 	view.Total = formatCount(sn.Total)
 
 	if pct, ok := cacheHitPercent(st.Cache); ok {
@@ -679,7 +754,7 @@ func fillGauges(view *statusView, st api.Status, sn stats.Snapshot) {
 
 // fillDonuts fills the four diagrams from the period snapshot, so they
 // follow the selector while the gauges stay all-time.
-func fillDonuts(view *statusView, st api.Status, sn stats.Snapshot) {
+func fillDonuts(view *statsView, st api.Status, sn stats.Snapshot) {
 	view.Donuts = []donutView{
 		buildDonut("Ответы", outcomeShares(sn)),
 		buildDonut("Протоколы", protoShares(sn)),

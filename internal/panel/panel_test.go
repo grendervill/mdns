@@ -247,7 +247,7 @@ func TestDisabledPanelIs404(t *testing.T) {
 
 	getPaths := []string{
 		"/", "/login", "/panel", "/panel/", "/panel/events",
-		"/panel/live", "/panel/live/events",
+		"/panel/stats", "/panel/live", "/panel/live/events",
 		"/panel/static", "/panel/static/app.css",
 		"/panel/upstreams", "/panel/filters", "/panel/settings",
 	}
@@ -357,7 +357,7 @@ func TestLoginFlow(t *testing.T) {
 func TestSessionRequired(t *testing.T) {
 	srv, client := newTestServer(t, true, hashPassword(t, testPassword))
 
-	pages := []string{"/panel/", "/panel/events", "/panel/live", "/panel/live/events"}
+	pages := []string{"/panel/", "/panel/events", "/panel/stats", "/panel/live", "/panel/live/events"}
 	for _, path := range pages {
 		resp, body := do(t, client, http.MethodGet, srv.URL+path, nil)
 		if resp.StatusCode != http.StatusSeeOther {

@@ -16,14 +16,6 @@
       <div class="state"><span class="dot"></span>работает{{if .Version}} · <b>{{.Version}}</b>{{end}}</div>
     </div>
 
-    <div class="gauges">
-      <div class="g"><div class="k">Запросов всего</div><div class="v">{{.Total}}</div></div>
-      <div class="g"><div class="k">Кеш</div><div class="v">{{.CachePercent}}{{if .CacheEntries}}<small>{{.CacheEntries}}</small>{{end}}</div></div>
-      <div class="g"><div class="k">Заблокировано</div><div class="v">{{.Blocked}}<small>{{.BlockedPercent}}</small></div></div>
-      <div class="g"><div class="k">Лучший upstream</div><div class="v">{{.BestLatency}}{{if .BestName}}<small>{{.BestName}}</small>{{end}}</div></div>
-    </div>
-
-    <h3>Куда идут запросы <span class="sub">— период: {{.PeriodLabel}}; наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
     <form class="periodrow" method="get" action="/panel/" role="search">
       <label class="field">
         <span>Период</span>
@@ -44,10 +36,7 @@
       </div>
     </form>
     {{if .PeriodNotice}}<p class="alert" role="alert">{{.PeriodNotice}}</p>{{end}}
-    <p class="note">За период ({{.PeriodLabel}}): {{.PeriodSummary}}</p>
-    <div class="piefold">
-      {{range .Donuts}}{{template "donut" .}}{{end}}
-    </div>
+    <div id="stats-block">{{template "stats" .Stats}}</div>
 
     <h3>Живая лента <span class="sub">— последние 30 · пауза · очистить · полная история</span></h3>
     <div class="wire">
@@ -81,6 +70,20 @@
 <div class="tooltip" id="tip" role="status" aria-live="polite"></div>
 </body>
 </html>
+{{end}}
+{{define "stats"}}
+    <div class="gauges">
+      <div class="g"><div class="k">Запросов всего</div><div class="v">{{.Total}}</div></div>
+      <div class="g"><div class="k">Кеш</div><div class="v">{{.CachePercent}}{{if .CacheEntries}}<small>{{.CacheEntries}}</small>{{end}}</div></div>
+      <div class="g"><div class="k">Заблокировано</div><div class="v">{{.Blocked}}<small>{{.BlockedPercent}}</small></div></div>
+      <div class="g"><div class="k">Лучший upstream</div><div class="v">{{.BestLatency}}{{if .BestName}}<small>{{.BestName}}</small>{{end}}</div></div>
+    </div>
+
+    <h3>Куда идут запросы <span class="sub">— период: {{.PeriodLabel}}; наведите на сегмент для подписи, клик откроет историю с фильтром</span></h3>
+    <p class="note">За период ({{.PeriodLabel}}): {{.PeriodSummary}}</p>
+    <div class="piefold">
+      {{range .Donuts}}{{template "donut" .}}{{end}}
+    </div>
 {{end}}
 {{define "donut"}}
 <div class="pie">

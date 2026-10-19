@@ -1,9 +1,9 @@
 /* mdns panel behaviour.
  *
- * Two small jobs, vanilla JS: the tooltip for the chart segments and
- * the live feed (EventSource). There is no framework, so nothing here
- * injects a <style> element or sets a style attribute in HTML — the
- * page's strict CSP ("default-src 'self'") holds.
+ * Three small jobs, vanilla JS: the tooltip for the chart segments, the
+ * live statistics poller and the live feed (EventSource). There is no
+ * framework, so nothing here injects a <style> element or sets a style
+ * attribute in HTML — the page's strict CSP ("default-src 'self'") holds.
  */
 (function () {
   'use strict';
@@ -13,6 +13,17 @@
   var tip = document.getElementById('tip');
 
   if (tip) {
+    // Delegated on the document, not bound to the rings themselves: the
+    // statistics poller below replaces the diagrams' nodes every couple
+    // of seconds, and per-element listeners would die with them. A swap
+    // therefore keeps hover and keyboard tooltips working.
+    var ringAt = function (node) {
+      if (!node || !node.closest) {
+        return null;
+      }
+      return node.closest('.pie .ring');
+    };
+
     // The text is built from text nodes, never from innerHTML: a
     // segment label is a query string (a domain, a client address).
     var showTip = function (ring, ev) {
@@ -44,13 +55,82 @@
       tip.style.opacity = '0';
     };
 
-    var rings = document.querySelectorAll('.pie .ring');
-    Array.prototype.forEach.call(rings, function (ring) {
-      ring.addEventListener('mousemove', function (ev) { showTip(ring, ev); });
-      ring.addEventListener('mouseleave', hideTip);
-      ring.addEventListener('focus', function () { showTip(ring, null); });
-      ring.addEventListener('blur', hideTip);
+    document.addEventListener('mouseover', function (ev) {
+      var ring = ringAt(ev.target);
+      if (ring) {
+        showTip(ring, ev);
+      }
     });
+    document.addEventListener('mousemove', function (ev) {
+      var ring = ringAt(ev.target);
+      if (ring) {
+        showTip(ring, ev);
+      }
+    });
+    document.addEventListener('mouseout', function (ev) {
+      var ring = ringAt(ev.target);
+      if (!ring) {
+        return;
+      }
+      if (ev.relatedTarget && ev.relatedTarget.nodeType && ring.contains(ev.relatedTarget)) {
+        return;
+      }
+      hideTip();
+    });
+    document.addEventListener('focusin', function (ev) {
+      var ring = ringAt(ev.target);
+      if (ring) {
+        showTip(ring, null);
+      }
+    });
+    document.addEventListener('focusout', function (ev) {
+      if (ringAt(ev.target)) {
+        hideTip();
+      }
+    });
+  }
+
+  /* ---- live statistics -------------------------------------------- */
+
+  // The server renders the gauges, the period summary and the diagrams
+  // into #stats-block. Poll the fragment with the page's own query
+  // string, so the selected period carries over, and swap the block's
+  // contents. The period form is outside the block: a poll never resets
+  // it. Hidden tabs do no work, requests never overlap and a failure
+  // degrades quietly into the next tick.
+  var STATS_INTERVAL = 2000;
+  var statsBlock = document.getElementById('stats-block');
+
+  if (statsBlock && window.fetch) {
+    var statsBusy = false;
+
+    var refreshStats = function () {
+      if (document.hidden || statsBusy) {
+        return;
+      }
+      statsBusy = true;
+      fetch('/panel/stats' + window.location.search, {
+        credentials: 'same-origin',
+        cache: 'no-store'
+      }).then(function (resp) {
+        // A redirect means the session ended: keep the last good block
+        // rather than swapping in the login page.
+        if (!resp.ok || resp.redirected) {
+          throw new Error('stats: request failed');
+        }
+        return resp.text();
+      }).then(function (html) {
+        // Replacing the contents keeps the block node itself, so the
+        // next tick still has a valid target.
+        statsBlock.innerHTML = html;
+      }).catch(function () {
+        // Quiet on purpose: the next tick retries.
+      }).then(function () {
+        statsBusy = false;
+      });
+    };
+
+    setInterval(refreshStats, STATS_INTERVAL);
   }
 
   /* ---- live feed -------------------------------------------------- */

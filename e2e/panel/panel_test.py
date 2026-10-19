@@ -403,9 +403,21 @@ def panel_flow(page, context):
     )
     period_labels = page.locator('select[name="period"] option').all_inner_texts()
     check(
-        "the period selector offers the five windows",
-        period_labels == ["Месяц", "3 месяца", "6 месяцев", "12 месяцев", "Своё"],
+        "the period selector offers today plus the five windows",
+        period_labels == [
+            "Сегодня",
+            "Месяц",
+            "3 месяца",
+            "6 месяцев",
+            "12 месяцев",
+            "Своё",
+        ],
         period_labels,
+    )
+    check(
+        "the «Сегодня» option exists and is first",
+        page.locator('select[name="period"] option[value="today"]').inner_text()
+        == "Сегодня",
     )
     page.select_option('select[name="period"]', "365")
     with page.expect_navigation():
@@ -567,6 +579,26 @@ def panel_flow(page, context):
         "the live row is the newest one",
         page.locator("#feed .q .name").first.inner_text().rstrip(".") == live_name,
         page.locator("#feed .q .name").all_inner_texts()[:3],
+    )
+
+    # --- live statistics -------------------------------------------------
+    # The status page polls /panel/stats every two seconds. A query issued
+    # after the page opened must move the all-time «Запросов всего» gauge
+    # on its own; the marker set on the document proves no reload happened.
+    total_before = page.locator(".gauges .g").nth(0).locator(".v").inner_text()
+    page.evaluate("() => { window.__statsMarker = 'kept'; }")
+    dig("e2e-stats-%d.example.com" % os.getpid())
+    page.wait_for_timeout(2600)
+    total_after = page.locator(".gauges .g").nth(0).locator(".v").inner_text()
+    check(
+        "the poller refreshes the «Запросов всего» gauge",
+        total_after != total_before,
+        "%r -> %r" % (total_before, total_after),
+    )
+    check(
+        "the gauge changed without a page reload",
+        page.evaluate("() => window.__statsMarker") == "kept",
+        "the document was reloaded, so the poller did not do it",
     )
 
     # --- live request screen ---------------------------------------------

@@ -328,6 +328,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	// Static assets are public: the login page itself needs them.
 	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
 	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
+	mux.Handle("GET /panel/stats", p.requireSession(http.HandlerFunc(p.handleStats)))
 	mux.Handle("GET /panel/live", p.requireSession(http.HandlerFunc(p.handleLive)))
 	mux.Handle("GET /panel/live/events", p.requireSession(http.HandlerFunc(p.handleLiveEvents)))
 	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleStatus)))

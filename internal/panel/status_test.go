@@ -245,6 +245,9 @@ func TestStatusRenders(t *testing.T) {
 			t.Errorf("status page is missing %q", want)
 		}
 	}
+	if !strings.Contains(body, `<div id="stats-block">`) {
+		t.Error("the statistics are not wrapped in #stats-block (the poller's target)")
+	}
 
 	// The mockup's dasharrays and offsets, straight from its figure:
 	// slice starts are 0, 74, 93 and 99.7 percent, so the offsets are
@@ -869,8 +872,9 @@ func TestStatusPeriodEmptyHistory(t *testing.T) {
 	}
 }
 
-// TestStatusPeriodForm checks the selector markup: the five choices and
-// the two date inputs, in one GET form.
+// TestStatusPeriodForm checks the selector markup: the six choices in
+// their fixed order («Сегодня» first) and the two date inputs, in one GET
+// form.
 func TestStatusPeriodForm(t *testing.T) {
 	p, srv := statusPanel(t, mockupStatus())
 
@@ -881,6 +885,7 @@ func TestStatusPeriodForm(t *testing.T) {
 		`name="from"`,
 		`name="to"`,
 		`type="date"`,
+		`>Сегодня</option>`,
 		`>Месяц</option>`,
 		`>3 месяца</option>`,
 		`>6 месяцев</option>`,
@@ -891,6 +896,129 @@ func TestStatusPeriodForm(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("the period form is missing %q", want)
 		}
+	}
+
+	if i, j := strings.Index(body, `value="today"`), strings.Index(body, `value="30"`); i < 0 || j < 0 || i > j {
+		t.Errorf("«Сегодня» is not the first period option (today at %d, month at %d)", i, j)
+	}
+}
+
+// TestStatusStatsFragment checks the polled fragment: the same gauges,
+// period summary and donuts as the page for the same query, with the
+// no-store/nosniff headers and without the selector or the live feed.
+func TestStatusStatsFragment(t *testing.T) {
+	ctrl := periodCtrl()
+	p, srv := statusPanel(t, ctrl)
+
+	resp := authedRequest(t, p, srv, "/panel/stats?period=365")
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /panel/stats = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+		t.Errorf("Content-Type = %q, want text/html", got)
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the fragment: %v", err)
+	}
+	body := string(raw)
+
+	for _, want := range []string{
+		`class="gauges"`,
+		"Запросов всего",
+		"1 000",
+		`За период (12 месяцев): всего 40 · кеш 30 · блок 4 · ошибки 1`,
+		`class="piefold"`,
+		`data-value="75 % · 30"`,
+		`href="/panel/history?outcome=cached"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the fragment is missing %q", want)
+		}
+	}
+
+	for _, unwanted := range []string{
+		`action="/panel/"`,
+		`name="period"`,
+		`id="stats-block"`,
+		`id="feed"`,
+		"Живая лента",
+		"<form",
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Errorf("the fragment must not carry %q", unwanted)
+		}
+	}
+
+	from, to := ctrl.lastRange()
+	if from.IsZero() || to.IsZero() || !to.After(from) {
+		t.Fatalf("StatsRange(%v, %v): want an ordered, non-zero window", from, to)
+	}
+}
+
+// TestStatusPeriodToday checks the new first window: the parser resolves
+// it to the current UTC calendar day, and both the page and the fragment
+// honour it.
+func TestStatusPeriodToday(t *testing.T) {
+	now := time.Date(2026, 10, 18, 23, 30, 0, 0, time.UTC)
+	req := httptest.NewRequest(http.MethodGet, "/panel/?period=today", nil)
+	sel := parsePeriod(req, now)
+
+	wantDay := time.Date(2026, 10, 18, 0, 0, 0, 0, time.UTC)
+	if sel.Period != "today" || sel.Label != "Сегодня" {
+		t.Fatalf("parsePeriod(today) = %q/%q, want today/Сегодня", sel.Period, sel.Label)
+	}
+	if !sel.From.Equal(wantDay) || !sel.To.Equal(wantDay) {
+		t.Errorf("today range = (%v, %v), want (%v, %v)", sel.From, sel.To, wantDay, wantDay)
+	}
+	if sel.FromText != "2026-10-18" || sel.ToText != "2026-10-18" {
+		t.Errorf("today text = (%q, %q), want 2026-10-18 twice", sel.FromText, sel.ToText)
+	}
+
+	ctrl := periodCtrl()
+	p, srv := statusPanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/?period=today")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/?period=today = %d, want 200", code)
+	}
+	for _, want := range []string{
+		`<option value="today" selected>Сегодня</option>`,
+		"период: Сегодня",
+		"За период (Сегодня): всего 40 · кеш 30 · блок 4 · ошибки 1",
+		`data-value="75 % · 30"`,
+		`name="from" value="` + time.Now().UTC().Format("2006-01-02") + `"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the today page is missing %q", want)
+		}
+	}
+
+	utc := time.Now().UTC()
+	today := time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC)
+	from, to := ctrl.lastRange()
+	if !from.Equal(today) || !to.Equal(today) {
+		t.Errorf("StatsRange got (%v, %v), want today (%v, %v)", from, to, today, today)
+	}
+
+	code, frag := authedGET(t, p, srv, "/panel/stats?period=today")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/stats?period=today = %d, want 200", code)
+	}
+	if !strings.Contains(frag, "За период (Сегодня)") || !strings.Contains(frag, `data-value="75 % · 30"`) {
+		t.Errorf("the today fragment does not honour the period:\n%s", frag)
+	}
+	if strings.Contains(frag, `name="period"`) {
+		t.Error("the today fragment carries the period selector")
 	}
 }
 
