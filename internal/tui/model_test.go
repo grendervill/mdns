@@ -63,6 +63,8 @@ func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
 		return s.updateErr
 	}
 	s.updates = append(s.updates, c)
+	// A real daemon keeps the accepted config, so follow-up reads see it.
+	s.cfg = c
 	return nil
 }
 func (s *stubClient) Providers(context.Context) ([]providers.Provider, error) {
@@ -405,7 +407,7 @@ func TestEventsReconnect(t *testing.T) {
 // input line is open.
 func TestInputCtrlCQuits(t *testing.T) {
 	m := New(&stubClient{}, Options{Initial: "filters"})
-	m = step(m, key('a'))
+	m = step(m, key('r'))
 	if !m.inputActive {
 		t.Fatalf("the rule input is not open")
 	}

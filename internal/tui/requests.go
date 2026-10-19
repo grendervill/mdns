@@ -184,35 +184,6 @@ func (m *Model) requestLine(e qlog.Entry) string {
 	)
 }
 
-// upstreamsView renders the detailed upstream table.
-func (m *Model) upstreamsView() string {
-	if len(m.status.Upstreams) == 0 {
-		return dimStyle.Render("Данные об upstream'ах появятся после подключения к демону.") + "\n"
-	}
-
-	var b strings.Builder
-	b.WriteString(dimStyle.Render("id           имя                   прот   адрес                  задержка    состояние  отправлено/ошибки"))
-	b.WriteString("\n")
-
-	for _, u := range m.status.Upstreams {
-		sent := fmt.Sprintf("%d/%d", u.Sent, u.Failed)
-		b.WriteString(fmt.Sprintf("%-12s %-21s %-6s %-22s %-11s %-10s %s\n",
-			truncate(u.ID, 12),
-			truncate(u.Name, 21),
-			u.Transport,
-			truncate(u.Address, 22),
-			formatLatency(u.LatencyMS),
-			healthLabel(u),
-			sent,
-		))
-	}
-
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("Стратегия: " + m.status.Strategy))
-	b.WriteString("\n")
-	return b.String()
-}
-
 // truncate shortens s to at most n runes, adding an ellipsis.
 func truncate(s string, n int) string {
 	runes := []rune(s)

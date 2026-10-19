@@ -22,14 +22,20 @@ type settingField struct {
 	toggle func(*config.Config)
 }
 
+// timezoneFieldName is the settings label of the timezone field; the
+// view uses it to render the example zones.
+const timezoneFieldName = "Часовой пояс (IANA, пусто = системный)"
+
 // settingsFields is the fixed field list of the settings screen.
 func (m *Model) settingsFields() []settingField {
 	return []settingField{
 		stringField("Домен", func(c *config.Config) *string { return &c.Domain }),
+		stringAllowEmptyField(timezoneFieldName, func(c *config.Config) *string { return &c.Timezone }),
 		stringField("Стратегия", func(c *config.Config) *string { return &c.Strategy }),
 		intField("Порт plain", func(c *config.Config) *int { return &c.Protocols.Plain.Port }),
 		protocolToggle("Plain включён", func(c *config.Config) *config.Protocol { return &c.Protocols.Plain }),
 		intField("Порт DoH", func(c *config.Config) *int { return &c.Protocols.DoH.Port }),
+		stringAllowEmptyField("Путь DoH", func(c *config.Config) *string { return &c.Protocols.DoH.Path }),
 		protocolToggle("DoH включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoH }),
 		intField("Порт DoT", func(c *config.Config) *int { return &c.Protocols.DoT.Port }),
 		protocolToggle("DoT включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoT }),
@@ -47,6 +53,7 @@ func (m *Model) settingsFields() []settingField {
 			func(c *config.Config) bool { return c.Filter.Enabled },
 			func(c *config.Config, v bool) { c.Filter.Enabled = v }),
 		stringField("Режим фильтра (zero/nxdomain/refused)", func(c *config.Config) *string { return &c.Filter.Mode }),
+		intField("Интервал обновления списков, ч", func(c *config.Config) *int { return &c.Filter.UpdateIntervalHours }),
 		filterListField("Списки фильтра (ID через запятую)", func(c *config.Config) *[]config.FilterList { return &c.Filter.Lists }),
 		stringListField("Разрешённые домены (через запятую)", func(c *config.Config) *[]string { return &c.Filter.UserAllow }),
 		stringListField("Заблокированные домены (через запятую)", func(c *config.Config) *[]string { return &c.Filter.UserBlock }),
@@ -63,6 +70,23 @@ func stringField(name string, target func(*config.Config) *string) settingField 
 			if v == "" {
 				return fmt.Errorf("%s: значение не может быть пустым", name)
 			}
+			if strings.ContainsAny(v, " \t\r\n") {
+				return fmt.Errorf("%s: недопустимые символы", name)
+			}
+			*target(c) = v
+			return nil
+		},
+	}
+}
+
+// stringAllowEmptyField is a plain whitespace-free string setting that
+// accepts an empty value (the timezone means the system zone).
+func stringAllowEmptyField(name string, target func(*config.Config) *string) settingField {
+	return settingField{
+		name: name,
+		get:  func(c *config.Config) string { return *target(c) },
+		set: func(c *config.Config, v string) error {
+			v = strings.TrimSpace(v)
 			if strings.ContainsAny(v, " \t\r\n") {
 				return fmt.Errorf("%s: недопустимые символы", name)
 			}
@@ -247,11 +271,18 @@ func (m *Model) settingsView() string {
 		if i == m.settingsCursor {
 			marker = "> "
 		}
-		line := fmt.Sprintf("%s%-42s %s", marker, f.name, f.get(m.settingsCfg))
+		value := f.get(m.settingsCfg)
+		if value == "" && f.name == timezoneFieldName {
+			value = dimStyle.Render("(системный)")
+		}
+		line := fmt.Sprintf("%s%-42s %s", marker, f.name, value)
 		if i == m.settingsCursor {
 			line = activeTabStyle.Render(line)
 		}
 		b.WriteString(line + "\n")
+		if f.name == timezoneFieldName {
+			b.WriteString(dimStyle.Render("    напр. Europe/Moscow, Europe/London, UTC") + "\n")
+		}
 	}
 
 	if m.inputActive && m.inputMode == inputSettingsField {

@@ -382,12 +382,19 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
   `space` pauses the feed, `x` clears it, `↑↓` (or `j`/`k`) scrolls, and
   while a filter is set the line above the table shows how many of how
   many entries match.
-- **4 Upstream'ы** — per-upstream state, EWMA latency, sent/failed.
-- **5 Фильтры** — per-list state; `enter` refreshes the list under the
-  cursor, `u` — all lists, `m` cycles the block mode, `a` adds a user
-  rule (`block domain` / `allow domain`).
-- **6 Настройки** — the key config fields in place; `enter` edits or
-  toggles, `ctrl+s` applies (`w` opens the wizard).
+- **4 Upstream'ы** — per-upstream state, EWMA latency, sent/failed;
+  `a` adds a provider endpoint from the catalog, `c` a custom one (ID,
+  transport, address, SNI for DoT/DoQ by IP, priority), `space` toggles,
+  `d` removes, `p` edits the priority, `s` cycles the strategy, `t`
+  probes the selected upstream.
+- **5 Фильтры** — per-list state; `a` opens the ready-made list catalog,
+  `c` adds a custom https list, `d` removes the selected list, `e`
+  toggles filtering, `r` adds a user rule (`block domain` /
+  `allow domain`), `enter` refreshes the list under the cursor, `u` —
+  all lists, `m` cycles the block mode.
+- **6 Настройки** — the key config fields in place (including the
+  display timezone, the DoH path and the block-list refresh interval);
+  `enter` edits or toggles, `ctrl+s` applies (`w` opens the wizard).
 - **7 Диагностика** — the self-check over the daemon API, without
   leaving the terminal: config round-trip, listeners against the config,
   certificate, upstream probes, block lists and version, each marked ✓
@@ -396,7 +403,8 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
   with the CLI.
 
 `?` opens the key reference as an overlay (`esc` returns), `q` quits,
-`r` reloads the active screen's data, digits switch screens.
+`r` reloads the active screen's data (on screen 5 it adds a user rule
+instead), digits switch screens.
 
 ### First-run wizard
 
@@ -494,10 +502,12 @@ live screen.
 - **Статус** (`/panel/`) — four all-time gauges (queries total, cache
   hit rate and entries, blocked share, fastest healthy upstream), a
   period form, four donut charts (outcomes, protocols, upstreams,
-  clients), the device links and the certificate state. The period form
-  switches the charts and the «За период» totals to Месяц, 3 месяца,
-  6 месяцев, 12 месяцев or a custom date range (whole UTC days); the
-  gauges above stay all-time. Hovering a segment shows its label and
+  clients), the device links and the certificate state. The numbers
+  (gauges, the period summary and the four charts) refresh themselves
+  every 2 seconds while the tab is visible; the period form switches
+  them to Сегодня, Месяц, 3 месяца, 6 месяцев, 12 месяцев or a custom
+  date range (whole UTC days), while the gauges above stay all-time.
+  Hovering a segment shows its label and
   share; clicking it opens the history filtered by that segment. Folded
   slices — «прочие» when a chart has more than six segments, and the
   clients' «остальные» row — have no single value to filter on and are
