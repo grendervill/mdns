@@ -128,12 +128,6 @@
         }
         return resp.text();
       }).then(function (html) {
-        // The donuts carry focusable links. Replacing them under the
-        // keyboard would drop focus mid-tab; skip this tick and retry
-        // once the focus has moved on.
-        if (statsBlock.contains(document.activeElement)) {
-          return;
-        }
         var tmp = document.createElement('div');
         tmp.innerHTML = html;
         var gauges = tmp.querySelector('[data-stats="gauges"]');
@@ -141,10 +135,16 @@
         if (!gauges || !range) {
           return;
         }
+        // The gauges contain no focusable elements, so they can always
+        // refresh. The donuts carry links: replacing them under the
+        // keyboard would drop focus mid-tab, so that part waits until
+        // the focus has moved on.
         if (statsGauges) {
           statsGauges.innerHTML = gauges.innerHTML;
         }
-        statsBlock.innerHTML = range.innerHTML;
+        if (!statsBlock.contains(document.activeElement)) {
+          statsBlock.innerHTML = range.innerHTML;
+        }
       }).catch(function () {
         // Quiet on purpose: the next tick retries.
       }).finally(function () {

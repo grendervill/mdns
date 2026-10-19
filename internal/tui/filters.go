@@ -224,9 +224,12 @@ func (m *Model) filtersView() string {
 
 	rows := m.filterRows()
 	if len(rows) == 0 {
-		if m.filterCfg == nil && len(m.filterLists) == 0 {
+		switch {
+		case m.filterErr != nil && m.filterCfg == nil:
+			b.WriteString(errStyle.Render("Не удалось загрузить списки: "+truncate(m.filterErr.Error(), 70)) + "\n")
+		case m.filterCfg == nil && len(m.filterLists) == 0:
 			b.WriteString(dimStyle.Render("Списки загружаются…") + "\n")
-		} else {
+		default:
 			// An honest empty state: nothing is configured, and these
 			// are the keys that change that.
 			b.WriteString(dimStyle.Render("Списков нет — a откроет каталог, c добавит свой") + "\n")
