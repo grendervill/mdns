@@ -384,7 +384,7 @@ def panel_flow(page, context):
     )
     tz.fill("Europe/Moscow")
     with page.expect_navigation():
-        page.locator('form[action="/panel/settings"] button[type="submit"]').click()
+        page.locator('form[action="/panel/settings"]').get_by_role("button", name="Применить").click()
     page.goto(BASE_URL + "/panel/settings")
     check(
         "the timezone survives a reload",
