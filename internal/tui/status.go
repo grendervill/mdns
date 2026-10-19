@@ -4,20 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-
 	"mydns/internal/api"
-)
-
-// Styles shared by the views.
-var (
-	titleStyle     = lipgloss.NewStyle().Bold(true)
-	dimStyle       = lipgloss.NewStyle().Faint(true)
-	okStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	warnStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	errStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	activeTabStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	tabStyle       = lipgloss.NewStyle().Faint(true)
 )
 
 // statusView renders the main screen.

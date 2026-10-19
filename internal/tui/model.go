@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"mydns/internal/api"
 	"mydns/internal/config"
@@ -62,6 +63,9 @@ type Options struct {
 	// Initial names the starting screen ("status", "requests", ...);
 	// empty means status.
 	Initial string
+	// DisableAnimations freezes the rail marker instantly, keeping View
+	// deterministic for tests.
+	DisableAnimations bool
 }
 
 // Model is the root bubbletea model of the TUI.
@@ -146,6 +150,10 @@ type Model struct {
 	wizard        *WizardModel
 	wizardLoading bool
 	wizardNote    string
+
+	// anim is the sliding rail marker; the active text style is set
+	// immediately, the copper bar catches up over a few frames.
+	anim railAnim
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -334,6 +342,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
+	case railTickMsg:
+		if m.advanceRail() {
+			return m, m.railTickCmd()
+		}
+		return m, nil
+
 	case wizardOpenedMsg:
 		m.wizardLoading = false
 		if msg.err != nil {
@@ -351,8 +365,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.wizardNote = "Мастер: настройки сохранены и применены."
 		m.settingsCfg = nil // the settings screen reloads the fresh config
-		m.screen = screenStatus
-		return m, fetchStatus(m.client)
+		animCmd := m.switchScreen(screenStatus)
+		return m, tea.Batch(animCmd, fetchStatus(m.client))
 
 	case statusLoadedMsg:
 		if msg.err != nil {
@@ -640,14 +654,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.helpReturn = m.screen
 		}
 		m.screen = screenHelp
+		m.settleRail()
 		return m, nil
 	case "1", "2", "3", "4", "5", "6", "7", "8":
 		idx := int(msg.String()[0] - '1')
-		m.screen = screenTabs[idx].screen
-		if m.screen == screenWizard {
+		if screenTabs[idx].screen == screenWizard {
+			// The wizard owns the whole screen; no rail transition.
 			return m.openWizard()
 		}
-		return m, m.lazyLoadCmd()
+		animCmd := m.switchScreen(screenTabs[idx].screen)
+		return m, tea.Batch(animCmd, m.lazyLoadCmd())
 	}
 
 	switch m.screen {
@@ -725,6 +741,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.toggleCatalogList()
 		case "esc":
 			m.screen = screenFilters
+			m.settleRail()
 			m.filterErr = nil
 		}
 
@@ -772,6 +789,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.addCatalogEndpoint()
 		case "esc":
 			m.screen = screenUpstreams
+			m.settleRail()
 			m.upstreamErr = nil
 		}
 
@@ -806,6 +824,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.applyUpstreamForm()
 		case "esc":
 			m.screen = screenUpstreams
+			m.settleRail()
 			m.upstreamFormErr = nil
 			m.upstreamErr = nil
 		}
@@ -870,6 +889,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.screen == screenHelp {
 				m.screen = screenStatus
 			}
+			m.settleRail()
 		}
 	}
 	return m, nil
@@ -879,6 +899,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // API.
 func (m Model) openWizard() (tea.Model, tea.Cmd) {
 	m.screen = screenWizard
+	m.settleRail()
 	if m.wizard != nil {
 		return m, m.wizard.restartProbes() // resume the pings if parked
 	}
@@ -1009,50 +1030,44 @@ func (m Model) View() string {
 		return m.wizard.View()
 	}
 
-	var b strings.Builder
-	b.WriteString(m.tabsView())
-	b.WriteString("\n\n")
+	content := m.screenView()
+	if m.wizardNote != "" {
+		content += "\n" + titleStyle.Render(m.wizardNote)
+	}
+	return m.shellView(content)
+}
 
+// screenView renders the active screen's body; the shell adds the
+// header, navigation and footer around it.
+func (m *Model) screenView() string {
 	switch m.screen {
 	case screenStatus:
-		b.WriteString(m.statusView())
+		return m.statusView()
 	case screenWizard:
-		b.WriteString(m.wizardView())
+		return m.wizardView()
 	case screenRequests:
-		b.WriteString(m.requestsView())
+		return m.requestsView()
 	case screenUpstreams:
-		b.WriteString(m.upstreamsView())
+		return m.upstreamsView()
 	case screenUpstreamCatalog:
-		b.WriteString(m.upstreamCatalogView())
+		return m.upstreamCatalogView()
 	case screenUpstreamForm:
-		b.WriteString(m.upstreamFormView())
+		return m.upstreamFormView()
 	case screenFilters:
-		b.WriteString(m.filtersView())
+		return m.filtersView()
 	case screenFilterCatalog:
-		b.WriteString(m.catalogView())
+		return m.catalogView()
 	case screenSettings:
-		b.WriteString(m.settingsView())
+		return m.settingsView()
 	case screenDiag:
-		b.WriteString(m.diagView())
+		return m.diagView()
 	case screenMaintenance:
-		b.WriteString(m.maintenanceView())
+		return m.maintenanceView()
 	case screenHelp:
-		b.WriteString(m.helpView())
+		return m.helpView()
 	default:
-		b.WriteString(dimStyle.Render("Этот экран появится в следующем обновлении."))
-		b.WriteString("\n")
+		return dimStyle.Render("Этот экран появится в следующем обновлении.") + "\n"
 	}
-
-	if m.wizardNote != "" {
-		b.WriteString("\n")
-		b.WriteString(titleStyle.Render(m.wizardNote))
-	}
-
-	if m.width > 0 {
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(m.footerText()))
-	}
-	return b.String()
 }
 
 // footerText is the per-screen key reference. Each line names only keys
@@ -1084,18 +1099,40 @@ func (m Model) footerText() string {
 	}
 }
 
-// tabsView renders the top navigation bar.
+// tabsView renders the numeric tab line used on narrow terminals. The
+// labels wrap when the terminal is narrower than the whole line.
 func (m Model) tabsView() string {
+	active := m.railIndex(m.screen)
 	parts := make([]string, 0, len(screenTabs))
 	for i, tab := range screenTabs {
 		label := itoa(i+1) + " " + tab.name
-		if tab.screen == m.screen {
+		if i == active {
 			parts = append(parts, activeTabStyle.Render(label))
 		} else {
 			parts = append(parts, tabStyle.Render(label))
 		}
 	}
-	return strings.Join(parts, "  ")
+	if m.width <= 0 {
+		return strings.Join(parts, "  ")
+	}
+
+	lines := make([]string, 0, len(parts))
+	cur := ""
+	for _, part := range parts {
+		switch {
+		case cur == "":
+			cur = part
+		case lipgloss.Width(cur)+2+lipgloss.Width(part) <= m.width:
+			cur += "  " + part
+		default:
+			lines = append(lines, cur)
+			cur = part
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // helpView is the shortcut reference, shown by the ? overflow screen.
@@ -1103,7 +1140,8 @@ func (m *Model) helpView() string {
 	lines := []string{
 		titleStyle.Render("mdns — горячие клавиши"),
 		"",
-		"  1-8   переключение экранов (7 — Диагностика, 8 — Обслуживание)",
+		"  1–8 — разделы: 1 Статус · 2 Визард · 3 Запросы · 4 Upstream'ы",
+		"       5 Фильтры · 6 Настройки · 7 Диагностика · 8 Обслуживание",
 		"  r     перечитать данные с демона",
 		"  f     фильтр ленты «Запросы» (Enter — применить, esc — отменить)",
 		"  esc   сбросить фильтр ленты / выйти из справки",
