@@ -401,6 +401,10 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
   (passing), ! (warning) or ✗ (failure). This is the daemon-side part of
   `mdns diag`; the filesystem checks (data directory, systemd unit) stay
   with the CLI.
+- **8 Обслуживание** — config backups (list, create, restore, delete; a
+  restore replaces the config entirely, including the panel password and
+  DoH state, and snapshots the current config first) and changing the
+  admin password with a masked two-step prompt (argon2id hash).
 
 `?` opens the key reference as an overlay (`esc` returns), `q` quits,
 `r` reloads the active screen's data (on screen 5 it adds a user rule
