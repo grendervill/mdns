@@ -680,7 +680,6 @@ func TestShutdownAfterStartNeverLeaksPort(t *testing.T) {
 		addr := fmt.Sprintf(":%d", port)
 		deadline := time.Now().Add(time.Second)
 		var ln net.Listener
-		var err error
 		for {
 			ln, err = net.Listen("tcp", addr)
 			if err == nil || time.Now().After(deadline) {
