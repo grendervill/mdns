@@ -7,6 +7,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -353,6 +354,12 @@ type App struct {
 	appCtx context.Context
 	cancel context.CancelFunc
 
+	// stopping is set by Stop under the lock. Once true, no new
+	// configuration change may start: its retirement would Add to
+	// retiring while Stop is parked in Wait (a documented WaitGroup
+	// misuse), and a stopped daemon must not keep swapping runtimes.
+	stopping bool
+
 	// retiring tracks the runtime generations a structural swap handed
 	// to a background goroutine to drain. App.Stop joins it before
 	// releasing resources, so a stopped daemon owns nothing.
@@ -451,6 +458,7 @@ func (a *App) Start(ctx context.Context) error {
 // releases resources. It is safe to call after a failed Start.
 func (a *App) Stop(ctx context.Context) error {
 	a.mu.Lock()
+	a.stopping = true
 
 	if a.cancel != nil {
 		a.cancel()
@@ -561,6 +569,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if a.stopping {
+		return errors.New("app: the daemon is stopping")
+	}
 	if err := next.Validate(); err != nil {
 		return fmt.Errorf("app: invalid config: %w", err)
 	}

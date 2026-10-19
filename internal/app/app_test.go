@@ -202,6 +202,39 @@ func fastMonitor() upstream.MonitorOptions {
 	}
 }
 
+// TestUpdateConfigAfterStopIsRejected pins the shutdown guard: once Stop
+// has begun, a management change is refused instead of Add-ing a
+// retirement the stopping App is about to wait for.
+func TestUpdateConfigAfterStopIsRejected(t *testing.T) {
+	fake := newFakeUpstream(t)
+	port := freePort(t)
+	cfg := testConfig(t, fake, port)
+
+	a, err := app.New(cfg, testOptions(t), discardLogger())
+	if err != nil {
+		t.Fatalf("app.New() = %v, want nil", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := a.Start(ctx); err != nil {
+		t.Fatalf("Start() = %v, want nil", err)
+	}
+
+	sctx, scancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer scancel()
+	if err := a.Stop(sctx); err != nil {
+		t.Fatalf("Stop() = %v, want nil", err)
+	}
+
+	next := *a.Config()
+	next.Cache.Size++
+	err = a.UpdateConfig(context.Background(), &next)
+	if err == nil || err.Error() != "app: the daemon is stopping" {
+		t.Fatalf("UpdateConfig after Stop = %v, want the stopping error", err)
+	}
+}
+
 // TestAppServesPlain checks the whole wiring: App.Start brings up the
 // pipeline and answers a query through the fake upstream.
 func TestAppServesPlain(t *testing.T) {
