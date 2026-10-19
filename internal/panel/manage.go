@@ -126,6 +126,12 @@ func okMessage(key string) string {
 		return "пароль изменён"
 	case "reapply":
 		return "конфиг применён заново"
+	case "backup-created":
+		return "резервная копия создана"
+	case "backup-restored":
+		return "конфигурация восстановлена из копии"
+	case "backup-deleted":
+		return "резервная копия удалена"
 	default:
 		return ""
 	}
@@ -1788,6 +1794,14 @@ func fillCertView(view *certPageView, c tlscert.Status) {
 
 // ---- maintenance --------------------------------------------------
 
+// backupRow is one snapshot in the maintenance table, with its time and
+// size already formatted for display.
+type backupRow struct {
+	Name string
+	When string
+	Size string
+}
+
 // maintenanceView is the maintenance page.
 type maintenanceView struct {
 	manageNotice
@@ -1797,6 +1811,8 @@ type maintenanceView struct {
 	Version string
 	Uptime  string
 	Started string
+
+	Backups []backupRow
 }
 
 // handleMaintenance renders the maintenance screen.
@@ -1818,8 +1834,125 @@ func (p *Panel) renderMaintenance(w http.ResponseWriter, r *http.Request, status
 			view.Started = started.In(p.location()).Format("02.01.2006 15:04:05")
 			view.Uptime = formatUptime(time.Since(started))
 		}
+		infos, err := p.ctrl.ListConfigBackups()
+		switch {
+		case err != nil:
+			p.logger.Warn("panel: listing the config backups", "error", err)
+			if n.Error == "" {
+				n.Error = "не удалось прочитать резервные копии: " + err.Error()
+			}
+		default:
+			loc := p.location()
+			view.Backups = make([]backupRow, 0, len(infos))
+			for _, info := range infos {
+				view.Backups = append(view.Backups, backupRow{
+					Name: info.Name,
+					When: info.ModTime.In(loc).Format("02.01.2006 15:04:05"),
+					Size: formatSize(info.Size),
+				})
+			}
+		}
 	}
+	view.manageNotice = n
 	p.render(w, status, "maintenance", view)
+}
+
+// handleBackupCreate stores a manual snapshot of the live config.
+func (p *Panel) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
+	if p.ctrl == nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	if err := p.ctrl.CreateConfigBackup("manual"); err != nil {
+		p.logger.Warn("panel: creating a config backup", "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-created", http.StatusSeeOther)
+}
+
+// backupExists reports whether name is one of the stored snapshots. The
+// list is the gate for restore and delete, so a hand-written name can
+// never address a file the page did not show.
+func (p *Panel) backupExists(name string) (bool, error) {
+	if p.ctrl == nil {
+		return false, errNoDaemon
+	}
+	infos, err := p.ctrl.ListConfigBackups()
+	if err != nil {
+		return false, err
+	}
+	for _, info := range infos {
+		if info.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// handleBackupRestore applies one snapshot through the daemon's normal
+// config load, migration and UpdateConfig path. A restore that fails
+// validation re-renders the page with the error and leaves the running
+// daemon untouched.
+func (p *Panel) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	// A restore may rebuild the listeners, which outlives the DoH
+	// listener's write timeout.
+	clearWriteDeadline(w)
+
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	ok, err := p.backupExists(name)
+	if err != nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	if !ok {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: "копия не найдена: " + name})
+		return
+	}
+
+	if err := p.ctrl.RestoreConfigBackup(name); err != nil {
+		p.logger.Warn("panel: restoring a config backup", "name", name, "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-restored", http.StatusSeeOther)
+}
+
+// handleBackupDelete removes one snapshot. The name must be one the page
+// listed, so a hand-written path cannot reach outside the backups
+// directory.
+func (p *Panel) handleBackupDelete(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	ok, err := p.backupExists(name)
+	if err != nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	if !ok {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: "копия не найдена: " + name})
+		return
+	}
+
+	if err := p.ctrl.DeleteConfigBackup(name); err != nil {
+		p.logger.Warn("panel: deleting a config backup", "name", name, "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-deleted", http.StatusSeeOther)
+}
+
+// formatSize renders a snapshot size in the largest unit that keeps it
+// readable.
+func formatSize(n int64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d Б", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f КБ", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f МБ", float64(n)/(1024*1024))
+	}
 }
 
 // handleConfigDownload streams the live configuration as a pretty JSON

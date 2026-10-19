@@ -12,6 +12,7 @@ import (
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -71,6 +72,14 @@ func (c *historyCtrl) FilterStatus() []filter.ListStatus { return nil }
 func (c *historyCtrl) FilterUpdate(context.Context, string) error { return nil }
 
 func (c *historyCtrl) Probe(context.Context, []providers.Endpoint) []probe.Result { return nil }
+
+func (c *historyCtrl) CreateConfigBackup(string) error { return nil }
+
+func (c *historyCtrl) ListConfigBackups() ([]configbackup.Info, error) { return nil, nil }
+
+func (c *historyCtrl) RestoreConfigBackup(string) error { return nil }
+
+func (c *historyCtrl) DeleteConfigBackup(string) error { return nil }
 
 func (c *historyCtrl) Requests(n int) []qlog.Entry { return c.ring.Recent(n) }
 

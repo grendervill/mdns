@@ -17,6 +17,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/links"
 	"mydns/internal/probe"
@@ -75,6 +76,14 @@ func (c *statusCtrl) FilterStatus() []filter.ListStatus { return nil }
 func (c *statusCtrl) FilterUpdate(context.Context, string) error { return nil }
 
 func (c *statusCtrl) Probe(context.Context, []providers.Endpoint) []probe.Result { return nil }
+
+func (c *statusCtrl) CreateConfigBackup(string) error { return nil }
+
+func (c *statusCtrl) ListConfigBackups() ([]configbackup.Info, error) { return nil, nil }
+
+func (c *statusCtrl) RestoreConfigBackup(string) error { return nil }
+
+func (c *statusCtrl) DeleteConfigBackup(string) error { return nil }
 
 // Requests returns the newest n entries, oldest first — the contract the
 // real daemon has (qlog.Log.Recent).

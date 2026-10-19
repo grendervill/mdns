@@ -17,6 +17,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -81,6 +82,17 @@ type Controller interface {
 	// endpoint, in input order; failures land in each result, never as
 	// an error.
 	Probe(ctx context.Context, eps []providers.Endpoint) []probe.Result
+	// CreateConfigBackup stores a snapshot of the current
+	// configuration under DataDir/backups with the given label.
+	CreateConfigBackup(label string) error
+	// ListConfigBackups returns the stored snapshots, newest first.
+	ListConfigBackups() ([]configbackup.Info, error)
+	// RestoreConfigBackup loads a snapshot through the normal config
+	// load and migration path and applies it through UpdateConfig,
+	// snapshotting the config it replaces first.
+	RestoreConfigBackup(name string) error
+	// DeleteConfigBackup removes one stored snapshot.
+	DeleteConfigBackup(name string) error
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -344,6 +356,9 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/maintenance", p.requireSession(http.HandlerFunc(p.handleMaintenance)))
 	mux.Handle("GET /panel/maintenance/config.json", p.requireSession(http.HandlerFunc(p.handleConfigDownload)))
 	mux.Handle("POST /panel/maintenance/reapply", p.requireSession(http.HandlerFunc(p.handleReapply)))
+	mux.Handle("POST /panel/maintenance/backups/create", p.requireSession(http.HandlerFunc(p.handleBackupCreate)))
+	mux.Handle("POST /panel/maintenance/backups/restore", p.requireSession(http.HandlerFunc(p.handleBackupRestore)))
+	mux.Handle("POST /panel/maintenance/backups/delete", p.requireSession(http.HandlerFunc(p.handleBackupDelete)))
 
 	// The slash-less spellings. Without an exact route ServeMux would
 	// answer its own 307 before the panel sees the request, which leaks

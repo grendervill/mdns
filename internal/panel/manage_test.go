@@ -17,6 +17,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -79,6 +80,17 @@ type manageCtrl struct {
 	// endpoint set it was asked to check.
 	probeResults []probe.Result
 	probeCalls   [][]providers.Endpoint
+
+	// backups is what ListConfigBackups returns; the other backup
+	// fields record the calls the maintenance page made.
+	backups          []configbackup.Info
+	backupCreates    []string
+	backupRestores   []string
+	backupDeletes    []string
+	backupCreateErr  error
+	backupRestoreErr error
+	backupDeleteErr  error
+	backupListErr    error
 
 	started time.Time
 }
@@ -162,6 +174,73 @@ func (c *manageCtrl) probed() [][]providers.Endpoint {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([][]providers.Endpoint(nil), c.probeCalls...)
+}
+
+// CreateConfigBackup records the label unless the test scripted a
+// failure.
+func (c *manageCtrl) CreateConfigBackup(label string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupCreateErr != nil {
+		return c.backupCreateErr
+	}
+	c.backupCreates = append(c.backupCreates, label)
+	return nil
+}
+
+// ListConfigBackups returns the scripted snapshot list.
+func (c *manageCtrl) ListConfigBackups() ([]configbackup.Info, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupListErr != nil {
+		return nil, c.backupListErr
+	}
+	return append([]configbackup.Info(nil), c.backups...), nil
+}
+
+// RestoreConfigBackup records the restored name unless the test
+// scripted a failure.
+func (c *manageCtrl) RestoreConfigBackup(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupRestoreErr != nil {
+		return c.backupRestoreErr
+	}
+	c.backupRestores = append(c.backupRestores, name)
+	return nil
+}
+
+// DeleteConfigBackup records the deleted name unless the test scripted a
+// failure.
+func (c *manageCtrl) DeleteConfigBackup(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupDeleteErr != nil {
+		return c.backupDeleteErr
+	}
+	c.backupDeletes = append(c.backupDeletes, name)
+	return nil
+}
+
+// createdBackups returns the labels CreateConfigBackup was called with.
+func (c *manageCtrl) createdBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupCreates...)
+}
+
+// restoredBackups returns the names RestoreConfigBackup was called with.
+func (c *manageCtrl) restoredBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupRestores...)
+}
+
+// deletedBackups returns the names DeleteConfigBackup was called with.
+func (c *manageCtrl) deletedBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupDeletes...)
 }
 
 // sent returns the configs UpdateConfig accepted, oldest first.
@@ -1983,6 +2062,162 @@ func TestReapply(t *testing.T) {
 	// The page hands over a copy, so the daemon's config is not aliased.
 	if sent[0] == original {
 		t.Error("the reapply passed the live config pointer instead of a copy")
+	}
+}
+
+// TestMaintenanceBackups lists the snapshots with their controls and
+// shows the empty state when there are none.
+func TestMaintenanceBackups(t *testing.T) {
+	cfg := manageConfig(t)
+	cfg.Timezone = "UTC"
+	when := time.Date(2026, 10, 19, 12, 34, 56, 0, time.UTC)
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{
+		{Name: "config-20261019-123456-auto.json", Size: 2048, ModTime: when},
+		{Name: "config-20261018-090000-before.json", Size: 512, ModTime: when.Add(-24 * time.Hour)},
+	}}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/maintenance")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/maintenance = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Резервные копии", "Создать копию",
+		`action="/panel/maintenance/backups/create"`,
+		`action="/panel/maintenance/backups/restore"`,
+		`action="/panel/maintenance/backups/delete"`,
+		"config-20261019-123456-auto.json", "config-20261018-090000-before.json",
+		`name="name" value="config-20261019-123456-auto.json"`,
+		"19.10.2026 12:34:56", "18.10.2026 12:34:56",
+		"2.0 КБ", "512 Б",
+		"Восстановить", "Удалить",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("maintenance page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+
+	empty := &manageCtrl{cfg: cfg}
+	p2, srv2 := managePanel(t, empty)
+	_, body = authedGET(t, p2, srv2, "/panel/maintenance")
+	if !strings.Contains(body, "копий пока нет") {
+		t.Errorf("empty maintenance page is missing the empty state:\n%s", body)
+	}
+	if strings.Contains(body, "Восстановить") {
+		t.Error("the empty maintenance page still renders restore controls")
+	}
+}
+
+// TestBackupCreate posts the create form and checks the redirect and the
+// controller call.
+func TestBackupCreate(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/create", nil)
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-created")
+	if got := ctrl.createdBackups(); len(got) != 1 || got[0] != "manual" {
+		t.Errorf("CreateConfigBackup calls = %v, want one manual snapshot\n%s", got, body)
+	}
+}
+
+// TestBackupRestore restores one listed snapshot.
+func TestBackupRestore(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/restore", url.Values{"name": {name}})
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-restored")
+	if got := ctrl.restoredBackups(); len(got) != 1 || got[0] != name {
+		t.Errorf("RestoreConfigBackup calls = %v, want [%s]\n%s", got, name, body)
+	}
+}
+
+// TestBackupDelete deletes one listed snapshot.
+func TestBackupDelete(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/delete", url.Values{"name": {name}})
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-deleted")
+	if got := ctrl.deletedBackups(); len(got) != 1 || got[0] != name {
+		t.Errorf("DeleteConfigBackup calls = %v, want [%s]\n%s", got, name, body)
+	}
+}
+
+// TestBackupUnknownName refuses restore and delete of a name the page
+// did not list, including traversal attempts.
+func TestBackupUnknownName(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	for _, path := range []string{"/panel/maintenance/backups/restore", "/panel/maintenance/backups/delete"} {
+		for _, bad := range []string{"config-nope.json", "../escape.json", "/etc/passwd"} {
+			resp, body := managePOST(t, p, srv, path, url.Values{"name": {bad}})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("POST %s %q = %d, want 400\n%s", path, bad, resp.StatusCode, body)
+			}
+			if !strings.Contains(body, "копия не найдена") {
+				t.Errorf("POST %s %q does not explain the unknown name:\n%s", path, bad, body)
+			}
+		}
+	}
+	if n := len(ctrl.restoredBackups()) + len(ctrl.deletedBackups()); n != 0 {
+		t.Errorf("%d unknown-name requests reached the controller, want 0", n)
+	}
+}
+
+// TestBackupRestoreError renders the daemon's error in place: an
+// incompatible snapshot must not redirect as if it were applied.
+func TestBackupRestoreError(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{
+		cfg:              cfg,
+		backups:          []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}},
+		backupRestoreErr: errors.New("несовместимая копия: неизвестная стратегия"),
+	}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/restore", url.Values{"name": {name}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST restore with an invalid backup = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "несовместимая копия") {
+		t.Errorf("the restore error is not rendered:\n%s", body)
+	}
+}
+
+// TestBackupCSRFRejected checks the token gate on every backup route.
+func TestBackupCSRFRejected(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	paths := []string{
+		"/panel/maintenance/backups/create",
+		"/panel/maintenance/backups/restore",
+		"/panel/maintenance/backups/delete",
+	}
+	for _, path := range paths {
+		resp, body := rawPOST(t, p, srv, path, url.Values{"name": {name}})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("POST %s without a token = %d, want 403\n%s", path, resp.StatusCode, body)
+		}
+	}
+	if len(ctrl.createdBackups())+len(ctrl.restoredBackups())+len(ctrl.deletedBackups()) != 0 {
+		t.Error("a CSRF-less request changed the backups")
 	}
 }
 

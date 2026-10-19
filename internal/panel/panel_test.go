@@ -21,6 +21,7 @@ import (
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/panel"
 	"mydns/internal/probe"
@@ -69,6 +70,14 @@ func (f *fakeController) FilterUpdate(context.Context, string) error { return ni
 func (f *fakeController) Probe(context.Context, []providers.Endpoint) []probe.Result {
 	return nil
 }
+
+func (f *fakeController) CreateConfigBackup(string) error { return nil }
+
+func (f *fakeController) ListConfigBackups() ([]configbackup.Info, error) { return nil, nil }
+
+func (f *fakeController) RestoreConfigBackup(string) error { return nil }
+
+func (f *fakeController) DeleteConfigBackup(string) error { return nil }
 
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {

@@ -432,6 +432,47 @@
         </form>
       </div>
     </div>
+
+    <h3>Резервные копии</h3>
+    <div class="cards">
+      <div class="card">
+        <div class="k">Создать копию</div>
+        <p class="hint">Снимок текущего конфига в формате файла демона. Перед каждым изменением настроек копия создаётся автоматически; хранятся последние 10.</p>
+        <form method="post" action="/panel/maintenance/backups/create">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <p class="row-actions"><button class="btn primary" type="submit">Создать копию</button></p>
+        </form>
+      </div>
+    </div>
+
+    {{if .Backups}}
+    <div class="tablewrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>Имя</th><th>Дата</th><th>Размер</th><th></th></tr>
+        </thead>
+        <tbody>
+          {{range .Backups}}
+          <tr>
+            <td class="num">{{.Name}}</td>
+            <td class="num">{{.When}}</td>
+            <td class="num">{{.Size}}</td>
+            <td>
+              <form method="post" action="/panel/maintenance/backups/restore">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="name" value="{{.Name}}">
+                <button class="btn small" type="submit">Восстановить</button>
+                <button class="btn small" type="submit" formaction="/panel/maintenance/backups/delete">Удалить</button>
+              </form>
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else}}
+    <p class="note">копий пока нет</p>
+    {{end}}
   </main>
 </div>
 </body>
