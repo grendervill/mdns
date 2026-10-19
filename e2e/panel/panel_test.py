@@ -354,7 +354,7 @@ def panel_flow(page, context):
     page.fill(custom + ' input[name="address"]', "127.0.0.1:5399")
     started = time.monotonic()
     with page.expect_navigation():
-        page.locator(custom + ' button[type="submit"]').click()
+        page.locator(custom).get_by_role("button", name="Добавить upstream").click()
     elapsed = time.monotonic() - started
     check(
         "the upstream add returns promptly (the runtime swap is async)",
