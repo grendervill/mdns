@@ -16,8 +16,9 @@ import (
 
 // errPanelDisabled refuses a password change while the web panel is
 // off: there is no login to protect, and enabling the panel is a
-// separate decision.
-var errPanelDisabled = errors.New("веб-панель выключена — сначала включите её в настройках или мастере")
+// separate decision. The panel fields live in the wizard, which the
+// settings screen opens with w.
+var errPanelDisabled = errors.New("веб-панель выключена — сначала включите её в мастере (экран 6 → w)")
 
 // loadBackups fetches the stored config snapshots.
 func loadBackups(c Client) tea.Cmd {
@@ -115,21 +116,14 @@ func (m Model) deleteSelectedBackup() (tea.Model, tea.Cmd) {
 	return m, deleteBackupCmd(m.client, backup.Name)
 }
 
-// startPasswordChange opens the panel password flow; a config that is
-// not loaded yet is fetched first.
+// startPasswordChange opens the panel password flow. The live config is
+// always re-read first: the password change rewrites the whole config,
+// so applying a cached copy would revert a concurrent panel change.
 func (m Model) startPasswordChange() (tea.Model, tea.Cmd) {
 	m.maintenanceErr = nil
 	m.maintenanceNote = ""
-	if m.maintenanceCfg == nil {
-		m.passwordPending = true
-		return m, loadMaintenanceConfig(m.client)
-	}
-	if !m.maintenanceCfg.Panel.Enabled {
-		m.passwordPending = false
-		m.maintenanceErr = errPanelDisabled
-		return m, nil
-	}
-	return m.openPasswordPrompt(), nil
+	m.passwordPending = true
+	return m, loadMaintenanceConfig(m.client)
 }
 
 // openPasswordPrompt asks for the new password.

@@ -28,6 +28,14 @@ func maintenanceModel(sc *stubClient, cfg *config.Config) Model {
 	return step(m, maintenanceConfigMsg{cfg: cfg})
 }
 
+// startPassword presses p and folds the live-config reload it schedules.
+func startPassword(t *testing.T, m Model) Model {
+	t.Helper()
+	updated, cmd := m.Update(key('p'))
+	m = updated.(Model)
+	return drainCmd(t, m, cmd)
+}
+
 // drainMutation folds a mutation command and the reload command its
 // result schedules (drainCmd itself does not follow the returned cmd).
 func drainMutation(t *testing.T, m Model, cmd tea.Cmd) Model {
@@ -155,9 +163,10 @@ func TestMaintenancePasswordChanged(t *testing.T) {
 
 	updated, cmd := m.Update(key('p'))
 	m = updated.(Model)
-	if cmd != nil {
-		t.Fatalf("p with a loaded config returned a command")
+	if cmd == nil {
+		t.Fatalf("p returned no live-config reload")
 	}
+	m = drainCmd(t, m, cmd)
 	if !m.inputActive || m.inputMode != inputMaintenancePassword {
 		t.Fatalf("input = (%v, %v), want the password prompt", m.inputActive, m.inputMode)
 	}
@@ -229,7 +238,7 @@ func TestMaintenancePasswordRejected(t *testing.T) {
 	t.Run("short", func(t *testing.T) {
 		sc := &stubClient{cfg: maintenanceCfg()}
 		m := maintenanceModel(sc, sc.cfg)
-		m = step(m, key('p'))
+		m = startPassword(t, m)
 		m = typeText(m, "short")
 		m = step(m, enterKey())
 
@@ -247,7 +256,7 @@ func TestMaintenancePasswordRejected(t *testing.T) {
 	t.Run("whitespace", func(t *testing.T) {
 		sc := &stubClient{cfg: maintenanceCfg()}
 		m := maintenanceModel(sc, sc.cfg)
-		m = step(m, key('p'))
+		m = startPassword(t, m)
 		m = typeText(m, " supersecret ")
 		m = step(m, enterKey())
 
@@ -262,7 +271,7 @@ func TestMaintenancePasswordRejected(t *testing.T) {
 	t.Run("mismatch", func(t *testing.T) {
 		sc := &stubClient{cfg: maintenanceCfg()}
 		m := maintenanceModel(sc, sc.cfg)
-		m = step(m, key('p'))
+		m = startPassword(t, m)
 		m = typeText(m, "password-one")
 		m = step(m, enterKey())
 		m = typeText(m, "password-two")
@@ -291,7 +300,7 @@ func TestMaintenancePasswordDisabled(t *testing.T) {
 	sc := &stubClient{cfg: cfg}
 	m := maintenanceModel(sc, cfg)
 
-	m = step(m, key('p'))
+	m = startPassword(t, m)
 	if m.inputActive {
 		t.Errorf("the password prompt opened for a disabled panel")
 	}
@@ -309,7 +318,7 @@ func TestMaintenancePasswordEsc(t *testing.T) {
 	t.Run("first step", func(t *testing.T) {
 		sc := &stubClient{cfg: maintenanceCfg()}
 		m := maintenanceModel(sc, sc.cfg)
-		m = step(m, key('p'))
+		m = startPassword(t, m)
 		m = typeText(m, "supersecret")
 		m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 
@@ -324,7 +333,7 @@ func TestMaintenancePasswordEsc(t *testing.T) {
 	t.Run("confirmation step", func(t *testing.T) {
 		sc := &stubClient{cfg: maintenanceCfg()}
 		m := maintenanceModel(sc, sc.cfg)
-		m = step(m, key('p'))
+		m = startPassword(t, m)
 		m = typeText(m, "supersecret")
 		m = step(m, enterKey())
 		m = typeText(m, "supersecret")
@@ -355,11 +364,135 @@ func TestMaintenanceFooterAndHelp(t *testing.T) {
 		t.Errorf("the maintenance footer advertises the feed's pause key:\n%s", view)
 	}
 
+	// While the password prompt owns the keys, the footer advertises
+	// only enter and esc: d would otherwise look like a live delete.
+	m = startPassword(t, m)
+	prompt := m.View()
+	if !strings.Contains(prompt, "enter — подтвердить · esc — отмена") {
+		t.Errorf("prompt footer misses the input keys:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "d — удалить") {
+		t.Errorf("prompt footer advertises a screen key:\n%s", prompt)
+	}
+
+	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 	m = step(m, key('?'))
 	help := m.View()
 	for _, want := range []string{"Обслуживание (экран 8)", "резервную копию", "сменить пароль"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help misses %q:\n%s", want, help)
 		}
+	}
+}
+
+// TestMaintenanceEmptyState checks an empty store renders its hint and
+// the destructive keys do nothing without a selection.
+func TestMaintenanceEmptyState(t *testing.T) {
+	sc := &stubClient{}
+	m := maintenanceModel(sc, maintenanceCfg())
+	m = step(m, backupsLoadedMsg{backups: nil})
+
+	if view := m.View(); !strings.Contains(view, "Резервных копий пока нет") {
+		t.Errorf("View() misses the empty state:\n%s", view)
+	}
+
+	m = step(m, enterKey())
+	if m.maintenanceErr == nil || !strings.Contains(m.maintenanceErr.Error(), "не выбрана") {
+		t.Errorf("enter without a selection: err = %v, want the no-selection message", m.maintenanceErr)
+	}
+	m = step(m, key('d'))
+	if m.maintenanceErr == nil || !strings.Contains(m.maintenanceErr.Error(), "не выбрана") {
+		t.Errorf("d without a selection: err = %v, want the no-selection message", m.maintenanceErr)
+	}
+	if len(sc.restored) != 0 || len(sc.deleted) != 0 {
+		t.Errorf("restored = %v, deleted = %v, want no calls", sc.restored, sc.deleted)
+	}
+}
+
+// TestMaintenanceCursorAfterEmptyReload checks the cursor returns to row
+// zero when the list empties, so the next create selects it.
+func TestMaintenanceCursorAfterEmptyReload(t *testing.T) {
+	newest, older := sampleBackups()
+	sc := &stubClient{backups: []BackupInfo{newest, older}}
+	m := maintenanceModel(sc, maintenanceCfg())
+	m = step(m, backupsLoadedMsg{backups: sc.backups})
+	m = step(m, key('j'))
+	if m.backupCursor != 1 {
+		t.Fatalf("cursor = %d, want 1", m.backupCursor)
+	}
+
+	// The last snapshot was removed elsewhere: the reload empties the
+	// table.
+	m = step(m, backupsLoadedMsg{backups: nil})
+	if m.backupCursor != 0 {
+		t.Errorf("cursor = %d after an empty reload, want 0", m.backupCursor)
+	}
+	if view := m.View(); !strings.Contains(view, "Резервных копий пока нет") {
+		t.Errorf("View() misses the empty state:\n%s", view)
+	}
+
+	// A subsequent create lists one row and selects it.
+	sc.backups = []BackupInfo{newest}
+	updated, cmd := m.Update(key('c'))
+	m = updated.(Model)
+	m = drainMutation(t, m, cmd)
+	if len(sc.created) != 1 {
+		t.Fatalf("created = %v, want one call", sc.created)
+	}
+	if m.backupCursor != 0 {
+		t.Errorf("cursor = %d after create, want 0", m.backupCursor)
+	}
+	if _, ok := m.selectedBackup(); !ok {
+		t.Errorf("no row is selected after create")
+	}
+}
+
+// TestMaintenancePasswordFetchesLiveConfig checks p re-reads the config
+// instead of applying the cached copy, so a concurrent change survives.
+func TestMaintenancePasswordFetchesLiveConfig(t *testing.T) {
+	stale := maintenanceCfg()
+	stale.Domain = "stale.example.test"
+	fresh := maintenanceCfg()
+	fresh.Domain = "fresh.example.test"
+
+	sc := &stubClient{cfg: fresh}
+	m := maintenanceModel(sc, stale)
+
+	m = startPassword(t, m)
+	if !m.inputActive || m.inputMode != inputMaintenancePassword {
+		t.Fatalf("input = (%v, %v), want the password prompt", m.inputActive, m.inputMode)
+	}
+	if m.maintenanceCfg == nil || m.maintenanceCfg.Domain != fresh.Domain {
+		t.Fatalf("maintenanceCfg = %+v, want the live config", m.maintenanceCfg)
+	}
+
+	m = typeText(m, "supersecret")
+	m = step(m, enterKey())
+	m = typeText(m, "supersecret")
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("the confirmation returned no hash command")
+	}
+	hashMsg := cmd()
+	if msg, ok := hashMsg.(passwordHashedMsg); !ok || msg.err != nil {
+		t.Fatalf("hash msg = %#v, want success", hashMsg)
+	}
+	updated, cmd = m.Update(hashMsg)
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("the hash produced no apply command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if len(sc.updates) != 1 {
+		t.Fatalf("UpdateConfig calls = %d, want 1", len(sc.updates))
+	}
+	if got := sc.updates[0].Domain; got != fresh.Domain {
+		t.Errorf("applied domain = %q, want the live %q", got, fresh.Domain)
+	}
+	if !auth.Verify(sc.updates[0].Panel.PasswordHash, "supersecret") {
+		t.Errorf("the applied hash does not verify the new password")
 	}
 }

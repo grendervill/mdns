@@ -478,7 +478,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.backupsErr = msg.err
 		if msg.err == nil {
 			m.backups = sortBackups(msg.backups)
-			if m.backupCursor >= len(m.backups) && m.backupCursor > 0 {
+			switch {
+			case len(m.backups) == 0:
+				// Never leave the cursor at -1: an empty reload (the
+				// last snapshot was deleted elsewhere) returns it to
+				// the first row the next create will occupy.
+				m.backupCursor = 0
+			case m.backupCursor >= len(m.backups):
 				m.backupCursor = len(m.backups) - 1
 			}
 		}
@@ -1050,6 +1056,11 @@ func (m Model) View() string {
 // that actually work on that screen; the feed's space/x hints therefore
 // never leak onto another screen.
 func (m Model) footerText() string {
+	// While an input line or a prompt owns the keys, the destructive
+	// screen keys do not work: advertise only the two that do.
+	if m.inputActive {
+		return "enter — подтвердить · esc — отмена"
+	}
 	switch m.screen {
 	case screenRequests:
 		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
