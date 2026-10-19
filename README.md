@@ -1,8 +1,10 @@
+**English** · [Русский](README.ru.md)
+
 # mdns
 
 [![CI](https://github.com/grendervill/mdns/actions/workflows/ci.yml/badge.svg)](https://github.com/grendervill/mdns/actions/workflows/ci.yml)
 
-A self-hosted DNS service for personal VPS: it answers DNS-over-HTTPS,
+A self-hosted DNS service for a personal VPS: it answers DNS-over-HTTPS,
 DNS-over-TLS, DNS-over-QUIC and plain DNS queries for your devices and
 forwards them to a pool of public upstream resolvers, picking the
 fastest healthy one, caching answers and keeping a query log.
@@ -189,7 +191,8 @@ Validate a config without starting anything:
 schema is in `internal/config/config.go`; the example shows every
 section:
 
-- `protocols` — which listeners are on and on which ports.
+- `protocols` — which listeners are on, on which ports, and the DoH
+  path (`path`, one URL segment, `/dns-query` by default).
 - `tls` — `self-signed`, `files` (paths to a certificate pair) or
   `acme` (automatic issuance and renewal; see below).
 - `upstreams` — public resolvers: `transport` is one of `plain`, `dot`,
@@ -484,7 +487,7 @@ included, so a scan cannot tell that a panel exists.
 ### Pages
 
 All pages are server-rendered; there is no framework — one small script
-drives the chart tooltip and the live feed.
+drives the chart tooltip, the live feed and the live screen.
 
 - **Статус** (`/panel/`) — four all-time gauges (queries total, cache
   hit rate and entries, blocked share, fastest healthy upstream), a
@@ -500,6 +503,11 @@ drives the chart tooltip and the live feed.
   with pause and clear buttons and a link to the full history; the feed
   rows, the history table and the CSV export all use the timezone set
   in Настройки.
+- **Живой экран** (`/panel/live`) — the newest 100 queries, newest
+  first, kept current over the event stream: time, client, protocol,
+  name and type, outcome, source, latency and rcode. The page carries a
+  server-rendered snapshot, so it stays useful with scripting off;
+  «Пауза» and «Очистить» work without a reload.
 - **Запросы** (`/panel/history`) — «История запросов», deliberately not
   live (no auto-refresh): 100 rows per page, newest first, with a search
   box (case-insensitive substring of domain, client IP or upstream ID)
@@ -517,7 +525,9 @@ drives the chart tooltip and the live feed.
   OpenDNS and the family variants), add a custom upstream (ID, transport
   `plain`/`dot`/`doh`/`doq`, address, SNI for DoT/DoQ by IP, priority),
   remove one, enable or disable one, and edit the priority column (the
-  order `failover` walks). The routing strategy (`fastest`, `failover`,
+  order `failover` walks). «Проверить» measures the custom form's
+  endpoint before saving and shows the result at once; adding stays a
+  separate button. The routing strategy (`fastest`, `failover`,
   `round_robin`, `random`) is selectable on this page too. A «Доверие
   провайдерам» table lists each provider's public-source rating
   (Privacy Guides recommendations and the providers' privacy policies)
@@ -542,6 +552,8 @@ drives the chart tooltip and the live feed.
   the daemon; the ACME wizard (provider, EAB keys, custom directory)
   lives in the TUI and `mdns setup`, not in the panel.
 - **Настройки** — the key fields: domain, strategy, protocols and ports,
+  the DoH path (one URL segment, `/dns-query` by default; «Сгенерировать»
+  fills a random one — it sheds scanner noise, it is not a secret),
   cache size and TTL clamp, the plain-DNS rate limit, the filter on/off
   and update interval, and the display timezone (an IANA name such as
   `Europe/Moscow`; empty keeps the server's local zone). Applying
@@ -553,6 +565,10 @@ drives the chart tooltip and the live feed.
   config as JSON (it contains the panel password hash and the ACME EAB
   HMAC, and the page warns to treat it as a secret); apply the current
   config again through validation, the web twin of the TUI's apply.
+  Every config change first stores a snapshot in `<data_dir>/backups`
+  (the last 10 are kept); «Создать копию», «Восстановить» and «Удалить»
+  manage them by hand. A restore goes through the normal validation and
+  snapshots the config it replaces, so it is undoable too.
 
 ### How much history is kept
 
