@@ -535,3 +535,30 @@ func TestRenewBeforeUsesAutocertDefault(t *testing.T) {
 		t.Errorf("Email = %q, want %q", mgr.Email, opts.Email)
 	}
 }
+
+// TestForeignSNIDoesNotPoisonStatus pins that a scanner's unknown SNI
+// cannot make the certificate status look broken: only handshakes for
+// the configured domain are recorded.
+func TestForeignSNIDoesNotPoisonStatus(t *testing.T) {
+	g := getterFunc(func(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return nil, fmt.Errorf("acme/autocert: host %q not configured in HostWhitelist", h.ServerName)
+	})
+	m, err := newWithGetter(g, Options{Domain: "example.com", CacheDir: t.TempDir(), Logger: discardLogger()}, time.Now)
+	if err != nil {
+		t.Fatalf("newWithGetter() = %v, want nil", err)
+	}
+
+	if _, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "evil.test"}); err == nil {
+		t.Fatal("foreign SNI = nil error, want the getter error")
+	}
+	if st := m.Status(); st.State != stateWaiting || st.Error != "" {
+		t.Fatalf("a foreign SNI changed the status: %+v", st)
+	}
+
+	if _, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "example.com"}); err == nil {
+		t.Fatal("our SNI = nil error, want the getter error")
+	}
+	if st := m.Status(); st.State != stateError || st.Error == "" {
+		t.Errorf("a failure for our own SNI was not recorded: %+v", st)
+	}
+}

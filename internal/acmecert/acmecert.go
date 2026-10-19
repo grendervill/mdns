@@ -180,6 +180,15 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 		return m.getter.GetCertificate(hello)
 	}
 
+	// A foreign SNI (a scanner, a shared IP, a stale DNS record) says
+	// nothing about our certificate: pass the getter's error through but
+	// do not record it, or one random handshake would make the daemon
+	// report a broken certificate.
+	if hello == nil || !strings.EqualFold(hello.ServerName, m.domain) {
+		cert, err := m.getter.GetCertificate(hello)
+		return cert, err
+	}
+
 	cert, _, err := m.fetch(hello)
 	if err != nil {
 		return nil, err
