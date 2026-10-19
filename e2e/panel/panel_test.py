@@ -221,8 +221,8 @@ def panel_flow(page, context):
         page.locator("main h3").all_inner_texts(),
     )
     check(
-        "the rail carries all seven sections",
-        page.locator(".rail .nav a").count() == 7,
+        "the rail carries all eight sections",
+        page.locator(".rail .nav a").count() == 8,
         page.locator(".rail .nav a").all_inner_texts(),
     )
     # The gauge is "{{.Blocked}}<small>{{.BlockedPercent}}</small>" with no
@@ -251,6 +251,7 @@ def panel_flow(page, context):
     # not only that the handler exists. The collectors are already on the
     # desktop page, so a JavaScript or CSP failure on any page reds here.
     rail_pages = [
+        ("/panel/live", "Живой экран"),
         ("/panel/upstreams", "Upstream’ы"),
         ("/panel/filters", "Фильтры"),
         ("/panel/cert", "Сертификат"),
@@ -353,7 +354,7 @@ def panel_flow(page, context):
     page.fill(custom + ' input[name="address"]', "127.0.0.1:5399")
     started = time.monotonic()
     with page.expect_navigation():
-        page.locator(custom + ' button[type="submit"]').click()
+        page.locator(custom).get_by_role("button", name="Добавить upstream").click()
     elapsed = time.monotonic() - started
     check(
         "the upstream add returns promptly (the runtime swap is async)",
@@ -383,7 +384,7 @@ def panel_flow(page, context):
     )
     tz.fill("Europe/Moscow")
     with page.expect_navigation():
-        page.locator('form[action="/panel/settings"] button[type="submit"]').click()
+        page.locator('form[action="/panel/settings"]').get_by_role("button", name="Применить").click()
     page.goto(BASE_URL + "/panel/settings")
     check(
         "the timezone survives a reload",
@@ -567,6 +568,28 @@ def panel_flow(page, context):
         page.locator("#feed .q .name").first.inner_text().rstrip(".") == live_name,
         page.locator("#feed .q .name").all_inner_texts()[:3],
     )
+
+    # --- live request screen ---------------------------------------------
+    # A plain page load is enough: the server renders the ring's snapshot,
+    # so the query issued above must already be in the table (the SSE
+    # stream then keeps it current).
+    page.goto(BASE_URL + "/panel/live")
+    page.wait_for_function(
+        "document.querySelectorAll('#live-rows tr:not(.empty)').length > 0",
+        timeout=15000,
+    )
+    live_rows = page.locator("#live-rows tr:not(.empty)")
+    check(
+        "the live screen shows the generated traffic",
+        live_rows.count() > 0,
+        live_rows.count(),
+    )
+    check(
+        "the live screen shows the newest query first",
+        live_name in live_rows.first.inner_text(),
+        live_rows.first.inner_text(),
+    )
+    page.screenshot(path=str(SHOTS / "live.png"), full_page=True)
 
     # --- mobile ----------------------------------------------------------
     mobile = context.new_page()

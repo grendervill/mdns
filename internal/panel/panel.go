@@ -1,5 +1,5 @@
 // Package panel serves the mdns admin web UI. It is mounted on the DoH
-// listener next to /dns-query: a small server-rendered HTML surface
+// listener next to the DoH endpoint: a small server-rendered HTML surface
 // with session login and CSRF-protected forms. Later tasks add the
 // status, history and management pages on top of this skeleton.
 package panel
@@ -17,7 +17,10 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -75,6 +78,21 @@ type Controller interface {
 	FilterStatus() []filter.ListStatus
 	// FilterUpdate reloads one block list, or every list when id is "".
 	FilterUpdate(ctx context.Context, id string) error
+	// Probe measures the given endpoints and returns one result per
+	// endpoint, in input order; failures land in each result, never as
+	// an error.
+	Probe(ctx context.Context, eps []providers.Endpoint) []probe.Result
+	// CreateConfigBackup stores a snapshot of the current
+	// configuration under DataDir/backups with the given label.
+	CreateConfigBackup(label string) error
+	// ListConfigBackups returns the stored snapshots, newest first.
+	ListConfigBackups() ([]configbackup.Info, error)
+	// RestoreConfigBackup loads a snapshot through the normal config
+	// load and migration path and applies it through UpdateConfig,
+	// snapshotting the config it replaces first.
+	RestoreConfigBackup(name string) error
+	// DeleteConfigBackup removes one stored snapshot.
+	DeleteConfigBackup(name string) error
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -147,6 +165,11 @@ type Panel struct {
 	// traffic instead of an empty list.
 	feed *feed
 
+	// live is the live screen's ring: the same bus subscription and the
+	// same shape as feed, but a larger bound and richer rows. Keeping it
+	// separate keeps the status page's "последние 30" promise intact.
+	live *feed
+
 	// bus is the live event source; nil when the panel is not wired to
 	// a daemon.
 	bus *api.Bus
@@ -203,6 +226,7 @@ func New(opts Options) *Panel {
 		csrfKey:      mustRandom(32),
 		pingInterval: ping,
 		feed:         newFeed(feedSize),
+		live:         newFeed(liveFeedSize),
 		bus:          opts.Bus,
 		streams:      make(chan struct{}),
 	}
@@ -238,13 +262,14 @@ func (p *Panel) streamDone() <-chan struct{} {
 	return p.streams
 }
 
-// startFeed seeds the live feed with the recent queries the daemon
-// already has and, when a bus is wired, keeps it current. The panel is
-// a process-lifetime object, so the subscription is deliberately not
-// torn down; it ends with the process.
+// startFeed seeds the status and live rings with the recent queries the
+// daemon already has and, when a bus is wired, keeps both current from
+// one subscription. The panel is a process-lifetime object, so the
+// subscription is deliberately not torn down; it ends with the process.
 func (p *Panel) startFeed() {
 	if p.ctrl != nil {
 		p.feed.seed(p.ctrl.Requests(feedSize))
+		p.live.seed(p.ctrl.Requests(liveFeedSize))
 	}
 	if p.bus == nil {
 		return
@@ -257,6 +282,7 @@ func (p *Panel) startFeed() {
 			}
 			if entry, ok := e.Data.(qlog.Entry); ok {
 				p.feed.push(entry)
+				p.live.push(entry)
 			}
 		}
 	}()
@@ -288,7 +314,7 @@ func (p *Panel) location() *time.Location {
 }
 
 // Mount registers every panel route on mux. The DoH listener shares one
-// mux with /dns-query, so the patterns here never collide with it. A
+// mux with the DoH endpoint, so the patterns here never collide with it. A
 // disabled panel still registers the routes but answers 404 on all of
 // them, so it does not reveal that it exists.
 func (p *Panel) Mount(mux *http.ServeMux) {
@@ -302,6 +328,8 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	// Static assets are public: the login page itself needs them.
 	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
 	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
+	mux.Handle("GET /panel/live", p.requireSession(http.HandlerFunc(p.handleLive)))
+	mux.Handle("GET /panel/live/events", p.requireSession(http.HandlerFunc(p.handleLiveEvents)))
 	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleStatus)))
 
 	// Query history: the page and its CSV export share one filter
@@ -318,6 +346,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("POST /panel/upstreams/strategy", p.requireSession(http.HandlerFunc(p.handleUpstreamStrategy)))
 	mux.Handle("POST /panel/upstreams/add", p.requireSession(http.HandlerFunc(p.handleUpstreamAdd)))
 	mux.Handle("POST /panel/upstreams/custom", p.requireSession(http.HandlerFunc(p.handleUpstreamCustom)))
+	mux.Handle("POST /panel/upstreams/probe", p.requireSession(http.HandlerFunc(p.handleUpstreamProbe)))
 	mux.Handle("POST /panel/upstreams/remove", p.requireSession(http.HandlerFunc(p.handleUpstreamRemove)))
 
 	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))
@@ -337,6 +366,9 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /panel/maintenance", p.requireSession(http.HandlerFunc(p.handleMaintenance)))
 	mux.Handle("GET /panel/maintenance/config.json", p.requireSession(http.HandlerFunc(p.handleConfigDownload)))
 	mux.Handle("POST /panel/maintenance/reapply", p.requireSession(http.HandlerFunc(p.handleReapply)))
+	mux.Handle("POST /panel/maintenance/backups/create", p.requireSession(http.HandlerFunc(p.handleBackupCreate)))
+	mux.Handle("POST /panel/maintenance/backups/restore", p.requireSession(http.HandlerFunc(p.handleBackupRestore)))
+	mux.Handle("POST /panel/maintenance/backups/delete", p.requireSession(http.HandlerFunc(p.handleBackupDelete)))
 
 	// The slash-less spellings. Without an exact route ServeMux would
 	// answer its own 307 before the panel sees the request, which leaks

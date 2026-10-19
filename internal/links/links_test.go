@@ -56,6 +56,25 @@ func TestCustomPorts(t *testing.T) {
 	}
 }
 
+// TestCustomDoHPath checks that a configured path replaces the default
+// in the device links, and that an empty path falls back to the default.
+func TestCustomDoHPath(t *testing.T) {
+	cfg := config.Default()
+	cfg.Domain = "dns.example.com"
+	cfg.Protocols.DoH.Path = "/my-secret-doh"
+	cfg.Protocols.DoH.Port = 8443
+
+	got := uris(links.Links(cfg))
+	if want := "https://dns.example.com:8443/my-secret-doh"; got[0] != want {
+		t.Errorf("DoH link = %q, want %q", got[0], want)
+	}
+
+	cfg.Protocols.DoH.Path = ""
+	if got := uris(links.Links(cfg)); got[0] != "https://dns.example.com:8443/dns-query" {
+		t.Errorf("empty path DoH link = %q, want the default /dns-query", got[0])
+	}
+}
+
 // TestDisabledSkipped checks that disabled protocols produce no links.
 func TestDisabledSkipped(t *testing.T) {
 	cfg := config.Default()

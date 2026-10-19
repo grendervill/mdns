@@ -14,6 +14,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go/http3"
 
+	"mydns/internal/config"
 	"mydns/internal/core"
 	"mydns/internal/tlscert"
 )
@@ -32,9 +33,10 @@ const (
 	dohMaxHeaderBytes    = 16 << 10
 )
 
-// Panel is the optional admin web UI mounted on the DoH listener next
-// to /dns-query. *panel.Panel implements it; the interface keeps the
-// dns package free of a dependency on the panel's own imports.
+// Panel is the optional admin web UI mounted on the DoH listener at the
+// configured DoH path's sibling routes (/ and /panel/...). *panel.Panel
+// implements it; the interface keeps the dns package free of a dependency
+// on the panel's own imports.
 type Panel interface {
 	Mount(mux *http.ServeMux)
 }
@@ -114,12 +116,18 @@ func (s *Server) startDoH() error {
 }
 
 // dohMux builds the handler the HTTPS and HTTP/3 listeners share: the
-// RFC 8484 endpoint plus the optional admin panel. The patterns never
-// collide — the panel registers "/", "/login", "/logout" and
-// "/panel/..." and leaves "/dns-query" to this package.
+// RFC 8484 endpoint at the configured path plus the optional admin
+// panel. The patterns never collide — the panel registers "/", "/login",
+// "/logout" and "/panel/..." and leaves the DoH path, which validation
+// keeps clear of them, to this package. A server built without a config
+// (tests) falls back to the default path.
 func (s *Server) dohMux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", s.handleDoH)
+	path := config.DefaultDoHPath
+	if s.cfg != nil {
+		path = s.cfg.DoHPath()
+	}
+	mux.HandleFunc(path, s.handleDoH)
 	if s.panel != nil {
 		s.panel.Mount(mux)
 	}

@@ -21,8 +21,11 @@ import (
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/panel"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -63,6 +66,18 @@ func (f *fakeController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int)
 func (f *fakeController) FilterStatus() []filter.ListStatus { return nil }
 
 func (f *fakeController) FilterUpdate(context.Context, string) error { return nil }
+
+func (f *fakeController) Probe(context.Context, []providers.Endpoint) []probe.Result {
+	return nil
+}
+
+func (f *fakeController) CreateConfigBackup(string) error { return nil }
+
+func (f *fakeController) ListConfigBackups() ([]configbackup.Info, error) { return nil, nil }
+
+func (f *fakeController) RestoreConfigBackup(string) error { return nil }
+
+func (f *fakeController) DeleteConfigBackup(string) error { return nil }
 
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {
@@ -232,6 +247,7 @@ func TestDisabledPanelIs404(t *testing.T) {
 
 	getPaths := []string{
 		"/", "/login", "/panel", "/panel/", "/panel/events",
+		"/panel/live", "/panel/live/events",
 		"/panel/static", "/panel/static/app.css",
 		"/panel/upstreams", "/panel/filters", "/panel/settings",
 	}
@@ -341,7 +357,7 @@ func TestLoginFlow(t *testing.T) {
 func TestSessionRequired(t *testing.T) {
 	srv, client := newTestServer(t, true, hashPassword(t, testPassword))
 
-	pages := []string{"/panel/", "/panel/events"}
+	pages := []string{"/panel/", "/panel/events", "/panel/live", "/panel/live/events"}
 	for _, path := range pages {
 		resp, body := do(t, client, http.MethodGet, srv.URL+path, nil)
 		if resp.StatusCode != http.StatusSeeOther {
@@ -443,6 +459,7 @@ func TestStaticServedWithoutAuth(t *testing.T) {
 	}{
 		{"/panel/static/app.css", "text/css", "--copper"},
 		{"/panel/static/app.js", "javascript", "EventSource"},
+		{"/panel/static/live.js", "javascript", "/panel/live/events"},
 	}
 	for _, tc := range cases {
 		resp, body := do(t, client, http.MethodGet, srv.URL+tc.path, nil)

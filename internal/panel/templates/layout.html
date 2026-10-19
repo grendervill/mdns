@@ -3,6 +3,7 @@
   <div class="brand">mdns<small>{{.Domain}}</small></div>
   <nav class="nav">
     <a{{if eq .Nav "status"}} class="on" aria-current="page"{{end}} href="/panel/">Статус</a>
+    <a{{if eq .Nav "live"}} class="on" aria-current="page"{{end}} href="/panel/live">Живой экран</a>
     <a{{if eq .Nav "history"}} class="on" aria-current="page"{{end}} href="/panel/history">Запросы</a>
     <a{{if eq .Nav "upstreams"}} class="on" aria-current="page"{{end}} href="/panel/upstreams">Upstream’ы</a>
     <a{{if eq .Nav "filters"}} class="on" aria-current="page"{{end}} href="/panel/filters">Фильтры</a>

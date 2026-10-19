@@ -281,6 +281,10 @@ h3 .sub { font-weight: 400; }
 
 /* Live feed. */
 .wire { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+
+/* The live screen uses the wire shell around a table: the outer frame
+   already draws the border, so the table does not repeat it. */
+.wire .tablewrap .tbl { border: 0; }
 .wire .head {
   display: flex;
   gap: 18px;

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -16,7 +17,10 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 	"mydns/internal/tlscert"
@@ -71,6 +75,22 @@ type manageCtrl struct {
 	// refresh while it is still in flight.
 	refreshStarted chan string
 	refreshGate    <-chan struct{}
+
+	// probeResults is what Probe returns; probeCalls records every
+	// endpoint set it was asked to check.
+	probeResults []probe.Result
+	probeCalls   [][]providers.Endpoint
+
+	// backups is what ListConfigBackups returns; the other backup
+	// fields record the calls the maintenance page made.
+	backups          []configbackup.Info
+	backupCreates    []string
+	backupRestores   []string
+	backupDeletes    []string
+	backupCreateErr  error
+	backupRestoreErr error
+	backupDeleteErr  error
+	backupListErr    error
 
 	started time.Time
 }
@@ -139,6 +159,89 @@ func (c *manageCtrl) FilterUpdate(_ context.Context, id string) error {
 }
 
 func (c *manageCtrl) Started() time.Time { return c.started }
+
+// Probe records the requested endpoints and returns the scripted
+// results, so a test can assert exactly what the page probed.
+func (c *manageCtrl) Probe(_ context.Context, eps []providers.Endpoint) []probe.Result {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.probeCalls = append(c.probeCalls, append([]providers.Endpoint(nil), eps...))
+	return append([]probe.Result(nil), c.probeResults...)
+}
+
+// probed returns the endpoint sets Probe was called with.
+func (c *manageCtrl) probed() [][]providers.Endpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]providers.Endpoint(nil), c.probeCalls...)
+}
+
+// CreateConfigBackup records the label unless the test scripted a
+// failure.
+func (c *manageCtrl) CreateConfigBackup(label string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupCreateErr != nil {
+		return c.backupCreateErr
+	}
+	c.backupCreates = append(c.backupCreates, label)
+	return nil
+}
+
+// ListConfigBackups returns the scripted snapshot list.
+func (c *manageCtrl) ListConfigBackups() ([]configbackup.Info, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupListErr != nil {
+		return nil, c.backupListErr
+	}
+	return append([]configbackup.Info(nil), c.backups...), nil
+}
+
+// RestoreConfigBackup records the restored name unless the test
+// scripted a failure.
+func (c *manageCtrl) RestoreConfigBackup(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupRestoreErr != nil {
+		return c.backupRestoreErr
+	}
+	c.backupRestores = append(c.backupRestores, name)
+	return nil
+}
+
+// DeleteConfigBackup records the deleted name unless the test scripted a
+// failure.
+func (c *manageCtrl) DeleteConfigBackup(name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.backupDeleteErr != nil {
+		return c.backupDeleteErr
+	}
+	c.backupDeletes = append(c.backupDeletes, name)
+	return nil
+}
+
+// createdBackups returns the labels CreateConfigBackup was called with.
+func (c *manageCtrl) createdBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupCreates...)
+}
+
+// restoredBackups returns the names RestoreConfigBackup was called with.
+func (c *manageCtrl) restoredBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupRestores...)
+}
+
+// deletedBackups returns the names DeleteConfigBackup was called with.
+func (c *manageCtrl) deletedBackups() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.backupDeletes...)
+}
 
 // sent returns the configs UpdateConfig accepted, oldest first.
 func (c *manageCtrl) sent() []*config.Config {
@@ -633,6 +736,170 @@ func TestUpstreamCustom(t *testing.T) {
 		}
 		if len(ctrl.sent()) != 2 {
 			t.Error("a duplicate id reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamProbe covers the pre-save check: a successful probe shows
+// the latency and rcode, a failure shows the reason, both echo the form,
+// the probe never touches the config, and the upstream can still be saved
+// after a failure.
+func TestUpstreamProbe(t *testing.T) {
+	customForm := func() url.Values {
+		return url.Values{
+			"id": {"my-dns"}, "name": {"My DNS"}, "transport": {"dot"},
+			"address": {"10.0.0.1:853"}, "server_name": {"dns.internal"}, "priority": {"5"},
+		}
+	}
+
+	t.Run("success renders the latency and rcode", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Latency:  84 * time.Millisecond,
+			Rcode:    "NOERROR",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Отвечает: 84 мс, rcode NOERROR") {
+			t.Errorf("the success notice is missing:\n%s", body)
+		}
+		for _, want := range []string{
+			`name="id" value="my-dns"`,
+			`name="name" value="My DNS"`,
+			`name="address" value="10.0.0.1:853"`,
+			`name="server_name" value="dns.internal"`,
+			`name="priority" value="5"`,
+			`<option value="dot" selected>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the form did not echo %q", want)
+			}
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("the probe applied a config")
+		}
+		probed := ctrl.probed()
+		if len(probed) != 1 || len(probed[0]) != 1 {
+			t.Fatalf("Probe calls = %v, want one endpoint", probed)
+		}
+		ep := probed[0][0]
+		if ep.Transport != "dot" || ep.Address != "10.0.0.1:853" || ep.ServerName != "dns.internal" {
+			t.Errorf("probed endpoint = %+v", ep)
+		}
+	})
+
+	t.Run("failure renders the reason", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Err:      "dial tcp 10.0.0.1:853: connection refused",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Нет ответа: dial tcp 10.0.0.1:853: connection refused") {
+			t.Errorf("the failure notice is missing:\n%s", body)
+		}
+		if !strings.Contains(body, `name="address" value="10.0.0.1:853"`) {
+			t.Error("the form values were not echoed after the failure")
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("a failed probe applied a config")
+		}
+	})
+
+	t.Run("an error rcode is reported as an answered error", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Err:      "unexpected reply: SERVFAIL",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Ответил ошибкой: SERVFAIL") {
+			t.Errorf("the answered-error notice is missing:\n%s", body)
+		}
+		if strings.Contains(body, "Нет ответа: unexpected reply") {
+			t.Errorf("an answered error was reported as no answer:\n%s", body)
+		}
+	})
+
+	t.Run("a failed probe can still be saved", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Err: "timeout",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", customForm())
+		wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+		if sent := ctrl.sent(); len(sent) != 1 || sent[0].Upstreams[0].ID != "my-dns" {
+			t.Errorf("the upstream was not saved after a failed probe: %v\n%s", sent, body)
+		}
+	})
+
+	t.Run("unknown transport is refused before probing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := customForm()
+		form.Set("transport", "bogus")
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("probe = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "неизвестный транспорт: bogus") {
+			t.Errorf("the unknown-transport message is missing:\n%s", body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("Probe ran for an unknown transport")
+		}
+	})
+
+	t.Run("empty address is refused before probing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := customForm()
+		form.Set("address", "  ")
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("probe = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "укажите адрес") {
+			t.Errorf("the empty-address message is missing:\n%s", body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("Probe ran with an empty address")
+		}
+	})
+
+	t.Run("csrf is required", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := rawPOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("probe without a token = %d, want 403\n%s", resp.StatusCode, body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("a CSRF-less request reached Probe")
 		}
 	})
 }
@@ -1303,6 +1570,10 @@ func TestSettingsPage(t *testing.T) {
 		`name="doh.port" value="443"`,
 		`name="dot.port" value="853"`,
 		`name="doq.port" value="853"`,
+		`name="doh.path" value="/dns-query"`,
+		"Путь DoH",
+		"Путь не является паролем: он лишь убирает шум сканеров. По умолчанию /dns-query.",
+		"Сгенерировать",
 		`name="strategy"`,
 		`value="fastest" selected`,
 		`name="timezone" value=""`,
@@ -1394,6 +1665,73 @@ func TestSettingsTimezone(t *testing.T) {
 		}
 		if ctrl.cfg.Timezone != "" {
 			t.Errorf("live config timezone = %q, want it unchanged", ctrl.cfg.Timezone)
+		}
+	})
+}
+
+// TestSettingsDoHPath covers the «Путь DoH» field: «Сгенерировать»
+// proposes a fresh path without applying anything, «Применить» persists
+// the typed value, and an invalid path is rejected before UpdateConfig.
+func TestSettingsDoHPath(t *testing.T) {
+	t.Run("generate pre-fills the form and changes nothing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("generate", "doh-path")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("generate = %d, want 200\n%s", resp.StatusCode, body)
+		}
+
+		m := regexp.MustCompile(`name="doh.path" value="(/[0-9a-f]{12})"`).FindStringSubmatch(body)
+		if m == nil {
+			t.Fatalf("the generated path was not echoed into the form:\n%s", body)
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("«Сгенерировать» applied the config instead of only proposing a path")
+		}
+		if cfg.Protocols.DoH.Path != config.DefaultDoHPath {
+			t.Errorf("live path = %q, want it unchanged", cfg.Protocols.DoH.Path)
+		}
+	})
+
+	t.Run("apply persists the typed path", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("doh.path", "/my-secret-doh")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		wantRedirect(t, resp, "/panel/settings?ok=settings")
+
+		sent := ctrl.sent()
+		if len(sent) != 1 {
+			t.Fatalf("UpdateConfig called %d times, want 1\n%s", len(sent), body)
+		}
+		if got := sent[0].Protocols.DoH.Path; got != "/my-secret-doh" {
+			t.Errorf("saved DoH path = %q, want /my-secret-doh", got)
+		}
+	})
+
+	t.Run("an invalid path is rejected", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := validSettingsForm()
+		form.Set("doh.path", "no-leading-slash")
+		resp, body := managePOST(t, p, srv, "/panel/settings", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid path = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "protocols.doh") || !strings.Contains(body, "no-leading-slash") {
+			t.Errorf("the rejected path is not reported:\n%s", body)
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("an invalid path reached UpdateConfig")
 		}
 	})
 }
@@ -1747,6 +2085,162 @@ func TestReapply(t *testing.T) {
 	}
 }
 
+// TestMaintenanceBackups lists the snapshots with their controls and
+// shows the empty state when there are none.
+func TestMaintenanceBackups(t *testing.T) {
+	cfg := manageConfig(t)
+	cfg.Timezone = "UTC"
+	when := time.Date(2026, 10, 19, 12, 34, 56, 0, time.UTC)
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{
+		{Name: "config-20261019-123456-auto.json", Size: 2048, ModTime: when},
+		{Name: "config-20261018-090000-before.json", Size: 512, ModTime: when.Add(-24 * time.Hour)},
+	}}
+	p, srv := managePanel(t, ctrl)
+
+	code, body := authedGET(t, p, srv, "/panel/maintenance")
+	if code != http.StatusOK {
+		t.Fatalf("GET /panel/maintenance = %d, want 200\n%s", code, body)
+	}
+
+	wants := []string{
+		"Резервные копии", "Создать копию",
+		`action="/panel/maintenance/backups/create"`,
+		`action="/panel/maintenance/backups/restore"`,
+		`action="/panel/maintenance/backups/delete"`,
+		"config-20261019-123456-auto.json", "config-20261018-090000-before.json",
+		`name="name" value="config-20261019-123456-auto.json"`,
+		"19.10.2026 12:34:56", "18.10.2026 12:34:56",
+		"2.0 КБ", "512 Б",
+		"Восстановить", "Удалить",
+	}
+	for _, want := range wants {
+		if !strings.Contains(body, want) {
+			t.Errorf("maintenance page is missing %q", want)
+		}
+	}
+	assertNoInlineAssets(t, body)
+
+	empty := &manageCtrl{cfg: cfg}
+	p2, srv2 := managePanel(t, empty)
+	_, body = authedGET(t, p2, srv2, "/panel/maintenance")
+	if !strings.Contains(body, "копий пока нет") {
+		t.Errorf("empty maintenance page is missing the empty state:\n%s", body)
+	}
+	if strings.Contains(body, "Восстановить") {
+		t.Error("the empty maintenance page still renders restore controls")
+	}
+}
+
+// TestBackupCreate posts the create form and checks the redirect and the
+// controller call.
+func TestBackupCreate(t *testing.T) {
+	cfg := manageConfig(t)
+	ctrl := &manageCtrl{cfg: cfg}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/create", nil)
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-created")
+	if got := ctrl.createdBackups(); len(got) != 1 || got[0] != "manual" {
+		t.Errorf("CreateConfigBackup calls = %v, want one manual snapshot\n%s", got, body)
+	}
+}
+
+// TestBackupRestore restores one listed snapshot.
+func TestBackupRestore(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/restore", url.Values{"name": {name}})
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-restored")
+	if got := ctrl.restoredBackups(); len(got) != 1 || got[0] != name {
+		t.Errorf("RestoreConfigBackup calls = %v, want [%s]\n%s", got, name, body)
+	}
+}
+
+// TestBackupDelete deletes one listed snapshot.
+func TestBackupDelete(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/delete", url.Values{"name": {name}})
+	wantRedirect(t, resp, "/panel/maintenance?ok=backup-deleted")
+	if got := ctrl.deletedBackups(); len(got) != 1 || got[0] != name {
+		t.Errorf("DeleteConfigBackup calls = %v, want [%s]\n%s", got, name, body)
+	}
+}
+
+// TestBackupUnknownName refuses restore and delete of a name the page
+// did not list, including traversal attempts.
+func TestBackupUnknownName(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	for _, path := range []string{"/panel/maintenance/backups/restore", "/panel/maintenance/backups/delete"} {
+		for _, bad := range []string{"config-nope.json", "../escape.json", "/etc/passwd"} {
+			resp, body := managePOST(t, p, srv, path, url.Values{"name": {bad}})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("POST %s %q = %d, want 400\n%s", path, bad, resp.StatusCode, body)
+			}
+			if !strings.Contains(body, "копия не найдена") {
+				t.Errorf("POST %s %q does not explain the unknown name:\n%s", path, bad, body)
+			}
+		}
+	}
+	if n := len(ctrl.restoredBackups()) + len(ctrl.deletedBackups()); n != 0 {
+		t.Errorf("%d unknown-name requests reached the controller, want 0", n)
+	}
+}
+
+// TestBackupRestoreError renders the daemon's error in place: an
+// incompatible snapshot must not redirect as if it were applied.
+func TestBackupRestoreError(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{
+		cfg:              cfg,
+		backups:          []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}},
+		backupRestoreErr: errors.New("несовместимая копия: неизвестная стратегия"),
+	}
+	p, srv := managePanel(t, ctrl)
+
+	resp, body := managePOST(t, p, srv, "/panel/maintenance/backups/restore", url.Values{"name": {name}})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST restore with an invalid backup = %d, want 400\n%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "несовместимая копия") {
+		t.Errorf("the restore error is not rendered:\n%s", body)
+	}
+}
+
+// TestBackupCSRFRejected checks the token gate on every backup route.
+func TestBackupCSRFRejected(t *testing.T) {
+	cfg := manageConfig(t)
+	name := "config-20261019-123456-auto.json"
+	ctrl := &manageCtrl{cfg: cfg, backups: []configbackup.Info{{Name: name, Size: 1024, ModTime: time.Now()}}}
+	p, srv := managePanel(t, ctrl)
+
+	paths := []string{
+		"/panel/maintenance/backups/create",
+		"/panel/maintenance/backups/restore",
+		"/panel/maintenance/backups/delete",
+	}
+	for _, path := range paths {
+		resp, body := rawPOST(t, p, srv, path, url.Values{"name": {name}})
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("POST %s without a token = %d, want 403\n%s", path, resp.StatusCode, body)
+		}
+	}
+	if len(ctrl.createdBackups())+len(ctrl.restoredBackups())+len(ctrl.deletedBackups()) != 0 {
+		t.Error("a CSRF-less request changed the backups")
+	}
+}
+
 // ---- cross-cutting ------------------------------------------------
 
 // TestManagePagesSharedShell walks the five new pages: each renders the
@@ -1764,9 +2258,9 @@ func TestManagePagesSharedShell(t *testing.T) {
 	}
 	p, srv := managePanel(t, ctrl)
 
-	pages := []string{"/panel/upstreams", "/panel/filters", "/panel/settings", "/panel/cert", "/panel/maintenance"}
+	pages := []string{"/panel/live", "/panel/upstreams", "/panel/filters", "/panel/settings", "/panel/cert", "/panel/maintenance"}
 	rail := []string{
-		`href="/panel/"`, `href="/panel/history"`, `href="/panel/upstreams"`,
+		`href="/panel/"`, `href="/panel/live"`, `href="/panel/history"`, `href="/panel/upstreams"`,
 		`href="/panel/filters"`, `href="/panel/cert"`, `href="/panel/settings"`,
 		`href="/panel/maintenance"`, `action="/logout"`,
 	}

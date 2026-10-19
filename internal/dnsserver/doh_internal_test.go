@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"slices"
 	"testing"
+
+	"mydns/internal/config"
 )
 
 // TestDoHServersHardened checks that the DoH servers carry the
@@ -81,6 +83,47 @@ func TestDoHMuxWithoutPanel(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("GET / without a panel = %d, want 404", rec.Code)
 	}
+}
+
+// TestDoHMuxCustomPath checks that the handler follows the configured
+// path: the default still serves when none is set, a custom path serves
+// while the old default answers 404, and the panel stays reachable.
+func TestDoHMuxCustomPath(t *testing.T) {
+	t.Run("default config serves the default path", func(t *testing.T) {
+		s := &Server{cfg: config.Default()}
+		rec := httptest.NewRecorder()
+		s.dohMux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dns-query", nil))
+		if rec.Code == http.StatusNotFound {
+			t.Error("/dns-query is not routed with the default config")
+		}
+	})
+
+	t.Run("custom path serves and the default 404s", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.Protocols.DoH.Path = "/my-secret-doh"
+		s := &Server{cfg: cfg}
+		panel := &fakePanel{}
+		s.SetPanel(panel)
+		mux := s.dohMux()
+
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/my-secret-doh", nil))
+		if rec.Code == http.StatusNotFound {
+			t.Error("the configured DoH path is not routed")
+		}
+
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/dns-query", nil))
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("the old /dns-query = %d, want 404 with a custom path", rec.Code)
+		}
+
+		rec = httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/probe", nil))
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("panel route with a custom DoH path = %d, want 204", rec.Code)
+		}
+	})
 }
 
 // TestDoHServersACMEALPN checks the RFC 8737 wiring: an ACME source

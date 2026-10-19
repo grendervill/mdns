@@ -1,0 +1,42 @@
+{{define "live"}}<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mdns — живой экран</title>
+<link rel="stylesheet" href="/panel/static/app.css">
+<script src="/panel/static/live.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  {{template "rail" .}}
+  <main class="main">
+    <div class="topline">
+      <h2>Живой экран</h2>
+      <div class="state"><span class="dot"></span>поток · последние 100</div>
+    </div>
+
+    <div class="wire live">
+      <div class="head">
+        <span>новые запросы сверху · обновляется автоматически</span>
+        <span class="feedctl">
+          <span class="feedstate" id="live-state" hidden></span>
+          <button type="button" class="btn small" id="live-pause" aria-pressed="false">Пауза</button>
+          <button type="button" class="btn small" id="live-clear">Очистить</button>
+        </span>
+      </div>
+      <div class="tablewrap">
+        <table class="tbl">
+          <thead>
+            <tr><th>время</th><th>клиент</th><th>протокол</th><th>имя · тип</th><th>результат</th><th>источник</th><th>задержка</th><th>rcode</th></tr>
+          </thead>
+          <tbody id="live-rows">{{if .Rows}}{{range .Rows}}{{template "live_row" .}}{{end}}{{else}}<tr class="empty"><td colspan="8">Пока нет запросов</td></tr>{{end}}</tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>
+{{end}}
+{{define "live_row"}}<tr><td class="num">{{.Time}}</td><td class="num">{{.Client}}</td><td class="num">{{.Proto}}</td><td>{{.Name}} <span class="muted">{{.Type}}</span></td><td><span class="tag {{.Tag}}">{{.TagText}}</span></td><td class="addr">{{.Source}}</td><td class="num">{{.Latency}}</td><td class="num">{{.Rcode}}</td></tr>{{end}}

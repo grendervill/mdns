@@ -10,6 +10,7 @@ package panel
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,6 +126,12 @@ func okMessage(key string) string {
 		return "пароль изменён"
 	case "reapply":
 		return "конфиг применён заново"
+	case "backup-created":
+		return "резервная копия создана"
+	case "backup-restored":
+		return "конфигурация восстановлена из копии"
+	case "backup-deleted":
+		return "резервная копия удалена"
 	default:
 		return ""
 	}
@@ -293,6 +300,37 @@ type upstreamsView struct {
 	Endpoints       []endpointOption
 	Upstreams       []upstreamRow
 	TrustProviders  []trustRow
+
+	// Custom-form state, echoed so a rejected or probed submission does
+	// not make the operator retype the upstream.
+	FormID         string
+	FormName       string
+	FormTransport  string
+	FormAddress    string
+	FormServerName string
+	FormPriority   string
+}
+
+// upstreamForm is the state of the custom-upstream form.
+type upstreamForm struct {
+	ID         string
+	Name       string
+	Transport  string
+	Address    string
+	ServerName string
+	Priority   string
+}
+
+// upstreamFormFromRequest reads the custom form's fields.
+func upstreamFormFromRequest(r *http.Request) upstreamForm {
+	return upstreamForm{
+		ID:         strings.TrimSpace(r.PostFormValue("id")),
+		Name:       strings.TrimSpace(r.PostFormValue("name")),
+		Transport:  strings.TrimSpace(r.PostFormValue("transport")),
+		Address:    strings.TrimSpace(r.PostFormValue("address")),
+		ServerName: strings.TrimSpace(r.PostFormValue("server_name")),
+		Priority:   strings.TrimSpace(r.PostFormValue("priority")),
+	}
 }
 
 // upstreamRowFor renders one upstream: the config supplies the identity
@@ -342,6 +380,12 @@ func (p *Panel) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 
 // renderUpstreams renders the page from the live config and status.
 func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status int, n manageNotice) {
+	p.renderUpstreamsForm(w, r, status, n, upstreamForm{})
+}
+
+// renderUpstreamsForm renders the page with an explicit custom-form
+// state, so a rejected or probed submission can echo what was typed.
+func (p *Panel) renderUpstreamsForm(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form upstreamForm) {
 	view := upstreamsView{
 		manageNotice:   n,
 		Domain:         p.pageDomain(),
@@ -349,6 +393,12 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 		Nav:            "upstreams",
 		Endpoints:      endpointOptions(),
 		TrustProviders: providerTrustRows(),
+		FormID:         form.ID,
+		FormName:       form.Name,
+		FormTransport:  form.Transport,
+		FormAddress:    form.Address,
+		FormServerName: form.ServerName,
+		FormPriority:   form.Priority,
 	}
 
 	strategy := ""
@@ -725,6 +775,73 @@ func (p *Panel) handleUpstreamCustom(w http.ResponseWriter, r *http.Request) {
 	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
+}
+
+// probeBudget bounds one upstream probe. The DoH listener's write
+// timeout is 10 s, so 5 s leaves room to render the result.
+const probeBudget = 5 * time.Second
+
+// handleUpstreamProbe checks one hand-written upstream without saving
+// it. It never touches the config: the operator sees the latency (or
+// the failure) and can still press «Добавить upstream» afterwards, since
+// an upstream may legitimately be down at configuration time.
+func (p *Panel) handleUpstreamProbe(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	form := upstreamFormFromRequest(r)
+	ep, err := probeEndpoint(form)
+	if err != nil {
+		p.renderUpstreamsForm(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()}, form)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), probeBudget)
+	defer cancel()
+	results := p.ctrl.Probe(ctx, []providers.Endpoint{ep})
+
+	var n manageNotice
+	switch {
+	case len(results) == 0:
+		n.Error = "Нет ответа: проверка не дала результата"
+	case results[0].Err != "":
+		if strings.HasPrefix(results[0].Err, "unexpected reply: ") {
+			n.Error = "Ответил ошибкой: " + strings.TrimPrefix(results[0].Err, "unexpected reply: ")
+		} else {
+			n.Error = "Нет ответа: " + results[0].Err
+		}
+	default:
+		rcode := results[0].Rcode
+		if rcode == "" {
+			rcode = "NOERROR"
+		}
+		latency := formatMS(float64(results[0].Latency) / float64(time.Millisecond))
+		n.OK = fmt.Sprintf("Отвечает: %s, rcode %s", latency, rcode)
+	}
+	p.renderUpstreamsForm(w, r, http.StatusOK, n, form)
+}
+
+// probeEndpoint turns the custom form into the single endpoint to probe.
+// It rejects an empty or unknown transport and an empty address before
+// the controller is called, so a malformed form never starts a probe.
+func probeEndpoint(form upstreamForm) (providers.Endpoint, error) {
+	if form.Transport == "" {
+		return providers.Endpoint{}, errors.New("выберите транспорт")
+	}
+	if !knownTransport(form.Transport) {
+		return providers.Endpoint{}, fmt.Errorf("неизвестный транспорт: %s", form.Transport)
+	}
+	if form.Address == "" {
+		return providers.Endpoint{}, errors.New("укажите адрес upstream")
+	}
+	return providers.Endpoint{
+		Transport:  form.Transport,
+		Address:    form.Address,
+		ServerName: form.ServerName,
+	}, nil
 }
 
 // handleUpstreamRemove drops one upstream. Removing the last enabled one
@@ -1325,6 +1442,7 @@ type settingsView struct {
 
 	FormDomain   string
 	FormTimezone string
+	DoHPath      string
 	Strategies   []strategyOption
 
 	Protocols []protocolRow
@@ -1342,6 +1460,7 @@ func settingsFromConfig(cfg *config.Config) settingsView {
 	view := settingsView{
 		FormDomain:     cfg.Domain,
 		FormTimezone:   cfg.Timezone,
+		DoHPath:        cfg.DoHPath(),
 		CacheSize:      strconv.Itoa(cfg.Cache.Size),
 		CacheMinTTL:    strconv.FormatUint(uint64(cfg.Cache.MinTTL), 10),
 		CacheMaxTTL:    strconv.FormatUint(uint64(cfg.Cache.MaxTTL), 10),
@@ -1371,6 +1490,7 @@ func settingsFromForm(r *http.Request) settingsView {
 	view := settingsView{
 		FormDomain:     r.PostFormValue("domain"),
 		FormTimezone:   strings.TrimSpace(r.PostFormValue("timezone")),
+		DoHPath:        strings.TrimSpace(r.PostFormValue("doh.path")),
 		Strategies:     strategyOptions(strings.TrimSpace(r.PostFormValue("strategy"))),
 		CacheSize:      strings.TrimSpace(r.PostFormValue("cache.size")),
 		CacheMinTTL:    strings.TrimSpace(r.PostFormValue("cache.min_ttl")),
@@ -1423,6 +1543,16 @@ func (p *Panel) handleSettingsApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// «Сгенерировать» only proposes a fresh path: it re-renders the form
+	// with a random value and touches no config. Only a later «Применить»
+	// saves it, so a generate cannot change the running daemon.
+	if r.PostFormValue("generate") == "doh-path" {
+		view := settingsFromForm(r)
+		view.DoHPath = generateDoHPath()
+		p.renderSettings(w, r, http.StatusOK, manageNotice{}, view)
+		return
+	}
+
 	view := settingsFromForm(r)
 	next := cloneConfig(cfg)
 	if err := applySettingsForm(next, r); err != nil {
@@ -1457,6 +1587,10 @@ func applySettingsForm(next *config.Config, r *http.Request) error {
 		}
 		setProtocol(next, f.field, r.PostFormValue(f.field+".enabled") != "", port)
 	}
+
+	// setProtocol rebuilds the DoH protocol value, so the path is set
+	// after the loop: an empty value means the default and is left as is.
+	next.Protocols.DoH.Path = strings.TrimSpace(r.PostFormValue("doh.path"))
 
 	next.Strategy = strings.TrimSpace(r.PostFormValue("strategy"))
 
@@ -1504,6 +1638,13 @@ func setProtocol(cfg *config.Config, field string, enabled bool, port int) {
 	case "doq":
 		cfg.Protocols.DoQ = p
 	}
+}
+
+// generateDoHPath returns a fresh random DoH path: "/" plus 12 lowercase
+// hex characters. It is obfuscation that sheds scanner noise, not a
+// secret, so hex is enough and stays easy to read out.
+func generateDoHPath() string {
+	return "/" + hex.EncodeToString(mustRandom(6))
 }
 
 // formInt parses a required integer form field.
@@ -1657,6 +1798,14 @@ func fillCertView(view *certPageView, c tlscert.Status) {
 
 // ---- maintenance --------------------------------------------------
 
+// backupRow is one snapshot in the maintenance table, with its time and
+// size already formatted for display.
+type backupRow struct {
+	Name string
+	When string
+	Size string
+}
+
 // maintenanceView is the maintenance page.
 type maintenanceView struct {
 	manageNotice
@@ -1666,6 +1815,8 @@ type maintenanceView struct {
 	Version string
 	Uptime  string
 	Started string
+
+	Backups []backupRow
 }
 
 // handleMaintenance renders the maintenance screen.
@@ -1687,8 +1838,125 @@ func (p *Panel) renderMaintenance(w http.ResponseWriter, r *http.Request, status
 			view.Started = started.In(p.location()).Format("02.01.2006 15:04:05")
 			view.Uptime = formatUptime(time.Since(started))
 		}
+		infos, err := p.ctrl.ListConfigBackups()
+		switch {
+		case err != nil:
+			p.logger.Warn("panel: listing the config backups", "error", err)
+			if n.Error == "" {
+				n.Error = "не удалось прочитать резервные копии: " + err.Error()
+			}
+		default:
+			loc := p.location()
+			view.Backups = make([]backupRow, 0, len(infos))
+			for _, info := range infos {
+				view.Backups = append(view.Backups, backupRow{
+					Name: info.Name,
+					When: info.ModTime.In(loc).Format("02.01.2006 15:04:05"),
+					Size: formatSize(info.Size),
+				})
+			}
+		}
 	}
+	view.manageNotice = n
 	p.render(w, status, "maintenance", view)
+}
+
+// handleBackupCreate stores a manual snapshot of the live config.
+func (p *Panel) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
+	if p.ctrl == nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	if err := p.ctrl.CreateConfigBackup("manual"); err != nil {
+		p.logger.Warn("panel: creating a config backup", "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-created", http.StatusSeeOther)
+}
+
+// backupExists reports whether name is one of the stored snapshots. The
+// list is the gate for restore and delete, so a hand-written name can
+// never address a file the page did not show.
+func (p *Panel) backupExists(name string) (bool, error) {
+	if p.ctrl == nil {
+		return false, errNoDaemon
+	}
+	infos, err := p.ctrl.ListConfigBackups()
+	if err != nil {
+		return false, err
+	}
+	for _, info := range infos {
+		if info.Name == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// handleBackupRestore applies one snapshot through the daemon's normal
+// config load, migration and UpdateConfig path. A restore that fails
+// validation re-renders the page with the error and leaves the running
+// daemon untouched.
+func (p *Panel) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
+	// A restore may rebuild the listeners, which outlives the DoH
+	// listener's write timeout.
+	clearWriteDeadline(w)
+
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	ok, err := p.backupExists(name)
+	if err != nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	if !ok {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: "копия не найдена: " + name})
+		return
+	}
+
+	if err := p.ctrl.RestoreConfigBackup(name); err != nil {
+		p.logger.Warn("panel: restoring a config backup", "name", name, "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-restored", http.StatusSeeOther)
+}
+
+// handleBackupDelete removes one snapshot. The name must be one the page
+// listed, so a hand-written path cannot reach outside the backups
+// directory.
+func (p *Panel) handleBackupDelete(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	ok, err := p.backupExists(name)
+	if err != nil {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	if !ok {
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: "копия не найдена: " + name})
+		return
+	}
+
+	if err := p.ctrl.DeleteConfigBackup(name); err != nil {
+		p.logger.Warn("panel: deleting a config backup", "name", name, "error", err)
+		p.renderMaintenance(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()})
+		return
+	}
+	http.Redirect(w, r, maintenancePath+"?ok=backup-deleted", http.StatusSeeOther)
+}
+
+// formatSize renders a snapshot size in the largest unit that keeps it
+// readable.
+func formatSize(n int64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d Б", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f КБ", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f МБ", float64(n)/(1024*1024))
+	}
 }
 
 // handleConfigDownload streams the live configuration as a pretty JSON

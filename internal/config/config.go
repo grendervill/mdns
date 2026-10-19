@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -18,11 +19,22 @@ import (
 	"mydns/internal/dnsname"
 )
 
+// DefaultDoHPath is the RFC 8484 path the DoH endpoint answers on when
+// protocols.doh.path is empty. The panel's routes live under /login,
+// /logout and /panel, so the default never shadows them.
+const DefaultDoHPath = "/dns-query"
+
 // Protocol enables one listener protocol and selects its port. DoT is
 // TCP-only, DoQ is UDP-only; that is decided by the protocol, not config.
+// Path is meaningful only for DoH: it is the single URL segment the DoH
+// handler is mounted on, an obfuscation that sheds scanner noise, not
+// authentication.
 type Protocol struct {
 	Enabled bool `json:"enabled"`
 	Port    int  `json:"port"`
+	// Path is the DoH endpoint path; only protocols.doh uses it, and
+	// Validate rejects it on the other protocols.
+	Path string `json:"path,omitempty"`
 }
 
 // Protocols groups the listener protocols.
@@ -237,7 +249,7 @@ func Default() *Config {
 		Domain:  "mdns.test",
 		Protocols: Protocols{
 			Plain: Protocol{Enabled: true, Port: 53},
-			DoH:   Protocol{Enabled: true, Port: 443},
+			DoH:   Protocol{Enabled: true, Port: 443, Path: DefaultDoHPath},
 			DoT:   Protocol{Enabled: true, Port: 853},
 			DoQ:   Protocol{Enabled: true, Port: 853},
 		},
@@ -281,6 +293,20 @@ func (c *Config) applyDefaults() {
 	if c.Filter.Mode == "" {
 		c.Filter.Mode = "zero"
 	}
+	if c.Protocols.DoH.Path == "" {
+		c.Protocols.DoH.Path = DefaultDoHPath
+	}
+}
+
+// DoHPath returns the effective DoH path: the configured value, or the
+// default when the config leaves it empty. URL builders and the DoH
+// listener both use it, so an empty path and the default behave
+// identically.
+func (c *Config) DoHPath() string {
+	if c.Protocols.DoH.Path == "" {
+		return DefaultDoHPath
+	}
+	return c.Protocols.DoH.Path
 }
 
 // Validate checks the config for consistency: domain shape, port ranges,
@@ -315,12 +341,19 @@ func (c *Config) Validate() error {
 		{"dot", c.Protocols.DoT},
 		{"doq", c.Protocols.DoQ},
 	} {
+		if p.name != "doh" && p.proto.Path != "" {
+			return fmt.Errorf("protocols.%s: path is only valid for doh", p.name)
+		}
 		if !p.proto.Enabled {
 			continue // a disabled protocol's port is irrelevant
 		}
 		if p.proto.Port < 1 || p.proto.Port > 65535 {
 			return fmt.Errorf("protocols.%s: port %d out of range 1-65535", p.name, p.proto.Port)
 		}
+	}
+
+	if err := validateDoHPath(c.Protocols.DoH.Path); err != nil {
+		return err
 	}
 
 	if !strategies[c.Strategy] {
@@ -418,6 +451,39 @@ func (c *Config) Validate() error {
 		}
 		if err := validateAddress(u.Transport, u.Address); err != nil {
 			return fmt.Errorf("upstream %q: %w", u.ID, err)
+		}
+	}
+	return nil
+}
+
+// dohPathPattern is the shape of a configurable DoH path: exactly one
+// URL segment, so it can neither escape to another route nor carry a
+// trailing query.
+var dohPathPattern = regexp.MustCompile(`^/[A-Za-z0-9._~-]{1,64}$`)
+
+// reservedPanelPaths are the routes the panel owns on the shared DoH
+// listener. The DoH path must not shadow them, or a request that should
+// reach the panel would be answered as DoH instead.
+var reservedPanelPaths = []string{"/login", "/logout", "/panel", "/panel/static"}
+
+// validateDoHPath checks protocols.doh.path: empty means the default, a
+// set value must be one URL segment and must not collide with the panel
+// routes.
+func validateDoHPath(path string) error {
+	if path == "" {
+		return nil // empty means the default
+	}
+	if !dohPathPattern.MatchString(path) {
+		return fmt.Errorf("protocols.doh: path %q must be one segment like %s", path, DefaultDoHPath)
+	}
+	if path == "/." || path == "/.." {
+		// http.ServeMux would clean these to "/" and the endpoint would
+		// never be reachable under the configured path.
+		return fmt.Errorf("protocols.doh: path %q must not be \".\" or \"..\"", path)
+	}
+	for _, reserved := range reservedPanelPaths {
+		if path == reserved || strings.HasPrefix(path, reserved+"/") {
+			return fmt.Errorf("protocols.doh: path %q collides with the panel route %s", path, reserved)
 		}
 	}
 	return nil

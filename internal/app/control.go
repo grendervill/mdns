@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"mydns/internal/api"
+	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/links"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -157,6 +159,77 @@ func (a *App) FilterUpdate(ctx context.Context, id string) error {
 	a.bus.Publish(api.Event{Type: "filter", Data: snapshot})
 
 	return err
+}
+
+// backupDir is where the snapshots of one configuration live: a
+// "backups" directory under its data directory.
+func backupDir(cfg *config.Config) string {
+	return filepath.Join(cfg.DataDir, "backups")
+}
+
+// backupLabelPreRestore is the label of the undo snapshot a restore
+// takes of the configuration it replaces. Automatic pre-change ones are
+// labelled "auto", panel-created ones "manual".
+const backupLabelPreRestore = "pre-restore"
+
+// CreateConfigBackup stores a snapshot of the current configuration in
+// DataDir/backups. The snapshot keeps the daemon's exact on-disk format
+// and is migrated and validated when restored.
+func (a *App) CreateConfigBackup(label string) error {
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+
+	if _, err := configbackup.Create(backupDir(cfg), cfg, label); err != nil {
+		return fmt.Errorf("app: creating a config backup: %w", err)
+	}
+	return nil
+}
+
+// ListConfigBackups returns the stored snapshots, newest first.
+func (a *App) ListConfigBackups() ([]configbackup.Info, error) {
+	a.mu.Lock()
+	dir := backupDir(a.cfg)
+	a.mu.Unlock()
+
+	infos, err := configbackup.List(dir)
+	if err != nil {
+		return nil, fmt.Errorf("app: listing config backups: %w", err)
+	}
+	return infos, nil
+}
+
+// RestoreConfigBackup applies a stored snapshot through UpdateConfig,
+// so the restore runs the daemon's normal load, migration and
+// validation path and is as transactional as any other config change.
+// The current config is snapshotted first, which makes the restore
+// itself undoable; a snapshot or validation failure leaves the running
+// daemon untouched.
+func (a *App) RestoreConfigBackup(name string) error {
+	a.mu.Lock()
+	dir := backupDir(a.cfg)
+	a.mu.Unlock()
+
+	restored, err := configbackup.Load(dir, name)
+	if err != nil {
+		return fmt.Errorf("app: loading config backup: %w", err)
+	}
+	if err := a.CreateConfigBackup(backupLabelPreRestore); err != nil {
+		return err
+	}
+	return a.updateConfig(context.Background(), restored, false)
+}
+
+// DeleteConfigBackup removes one stored snapshot.
+func (a *App) DeleteConfigBackup(name string) error {
+	a.mu.Lock()
+	dir := backupDir(a.cfg)
+	a.mu.Unlock()
+
+	if err := configbackup.Delete(dir, name); err != nil {
+		return fmt.Errorf("app: deleting config backup: %w", err)
+	}
+	return nil
 }
 
 // wireEvents connects one runtime generation to the event bus and to

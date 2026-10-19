@@ -41,21 +41,25 @@
     <form method="post" action="/panel/upstreams/custom">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <div class="formgrid">
-        <label class="field"><span>ID (необязательно)</span><input class="ctl" type="text" name="id" spellcheck="false"></label>
-        <label class="field"><span>Название</span><input class="ctl" type="text" name="name"></label>
+        <label class="field"><span>ID (необязательно)</span><input class="ctl" type="text" name="id" value="{{.FormID}}" spellcheck="false"></label>
+        <label class="field"><span>Название</span><input class="ctl" type="text" name="name" value="{{.FormName}}"></label>
         <label class="field"><span>Транспорт</span>
           <select class="ctl" name="transport">
-            <option value="plain">plain</option>
-            <option value="dot">dot</option>
-            <option value="doh">doh</option>
-            <option value="doq">doq</option>
+            <option value="plain"{{if eq .FormTransport "plain"}} selected{{end}}>plain</option>
+            <option value="dot"{{if eq .FormTransport "dot"}} selected{{end}}>dot</option>
+            <option value="doh"{{if eq .FormTransport "doh"}} selected{{end}}>doh</option>
+            <option value="doq"{{if eq .FormTransport "doq"}} selected{{end}}>doq</option>
           </select>
         </label>
-        <label class="field"><span>Адрес</span><input class="ctl" type="text" name="address" placeholder="1.1.1.1:53 или https://host/dns-query" spellcheck="false"></label>
-        <label class="field"><span>ServerName (для DoT/DoQ по IP)</span><input class="ctl" type="text" name="server_name" spellcheck="false"></label>
-        <label class="field"><span>Приоритет</span><input class="ctl num-input" type="number" name="priority" min="0" max="99" placeholder="авто"></label>
+        <label class="field"><span>Адрес</span><input class="ctl" type="text" name="address" value="{{.FormAddress}}" placeholder="1.1.1.1:53 или https://host/dns-query" spellcheck="false"></label>
+        <label class="field"><span>ServerName (для DoT/DoQ по IP)</span><input class="ctl" type="text" name="server_name" value="{{.FormServerName}}" spellcheck="false"></label>
+        <label class="field"><span>Приоритет</span><input class="ctl num-input" type="number" name="priority" value="{{.FormPriority}}" min="0" max="99" placeholder="авто"></label>
       </div>
-      <p class="row-actions"><button class="btn primary" type="submit">Добавить upstream</button></p>
+      <p class="row-actions">
+        <button class="btn primary" type="submit">Добавить upstream</button>
+        <button class="btn" type="submit" formaction="/panel/upstreams/probe">Проверить</button>
+        <span class="hint">Проверка не сохраняет upstream: результат виден сразу, добавление — отдельной кнопкой.</span>
+      </p>
     </form>
 
     <h3>Доверие провайдерам</h3>
@@ -304,10 +308,15 @@
           </div>
         </div>
         {{end}}
+        <label class="field"><span>Путь DoH</span>
+          <input class="ctl" type="text" name="doh.path" value="{{.DoHPath}}" spellcheck="false">
+          <span class="hint">Путь не является паролем: он лишь убирает шум сканеров. По умолчанию /dns-query.</span>
+        </label>
       </div>
 
       <p class="row-actions">
         <button class="btn primary" type="submit">Применить</button>
+        <button class="btn" type="submit" name="generate" value="doh-path">Сгенерировать</button>
         <span class="hint">Домен, протоколы и порты пересобирают слушатели; остальное применяется на месте.</span>
       </p>
     </form>
@@ -423,6 +432,48 @@
         </form>
       </div>
     </div>
+
+    <h3>Резервные копии</h3>
+    <p class="note">Восстановление заменяет конфиг целиком — включая пароль панели и состояние DoH. Перед применением автоматически создаётся копия текущего состояния.</p>
+    <div class="cards">
+      <div class="card">
+        <div class="k">Создать копию</div>
+        <p class="hint">Снимок текущего конфига в формате файла демона. Перед каждым изменением настроек копия создаётся автоматически; хранятся последние 10.</p>
+        <form method="post" action="/panel/maintenance/backups/create">
+          <input type="hidden" name="csrf" value="{{.CSRF}}">
+          <p class="row-actions"><button class="btn primary" type="submit">Создать копию</button></p>
+        </form>
+      </div>
+    </div>
+
+    {{if .Backups}}
+    <div class="tablewrap">
+      <table class="tbl">
+        <thead>
+          <tr><th>Имя</th><th>Дата</th><th>Размер</th><th></th></tr>
+        </thead>
+        <tbody>
+          {{range .Backups}}
+          <tr>
+            <td class="num">{{.Name}}</td>
+            <td class="num">{{.When}}</td>
+            <td class="num">{{.Size}}</td>
+            <td>
+              <form method="post" action="/panel/maintenance/backups/restore">
+                <input type="hidden" name="csrf" value="{{$.CSRF}}">
+                <input type="hidden" name="name" value="{{.Name}}">
+                <button class="btn small" type="submit">Восстановить</button>
+                <button class="btn small" type="submit" formaction="/panel/maintenance/backups/delete">Удалить</button>
+              </form>
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    {{else}}
+    <p class="note">копий пока нет</p>
+    {{end}}
   </main>
 </div>
 </body>

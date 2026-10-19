@@ -14,10 +14,13 @@ import (
 	"mydns/internal/transport"
 )
 
-// Result is one endpoint's probe outcome; Err is empty on success.
+// Result is one endpoint's probe outcome; Err is empty on success. Rcode
+// is the DNS response code of a successful probe (a name such as
+// "NOERROR"), so the panel can show what the resolver actually answered.
 type Result struct {
 	Endpoint providers.Endpoint
 	Latency  time.Duration
+	Rcode    string
 	Err      string
 }
 
@@ -93,5 +96,8 @@ func measureOne(ctx context.Context, ep providers.Endpoint, timeout time.Duratio
 	}
 
 	res.Latency = time.Since(start)
+	if name := dns.RcodeToString[resp.Rcode]; name != "" {
+		res.Rcode = name
+	}
 	return res
 }

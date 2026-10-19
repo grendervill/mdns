@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/cache"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/core"
 	"mydns/internal/dnsserver"
 	"mydns/internal/filter"
@@ -565,7 +567,17 @@ func (a *App) Config() *config.Config {
 // the management request that triggered the change returns without
 // waiting for its own server to stop. On any failure service is
 // restored from the previous config and the config file is untouched.
+// A change that actually differs from the running config first stores
+// a best-effort snapshot of the old one under DataDir/backups.
 func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
+	return a.updateConfig(ctx, next, true)
+}
+
+// updateConfig is UpdateConfig with control over the automatic
+// pre-change snapshot. RestoreConfigBackup snapshots explicitly and
+// then calls with snapshot=false, so a restore stores one pre-restore
+// copy instead of two identical ones.
+func (a *App) updateConfig(ctx context.Context, next *config.Config, snapshot bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -580,8 +592,11 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 	}
 
 	old := a.cfg
+	// A reapply of the very same config persists it again but has
+	// nothing to roll back to: skip the snapshot.
+	snapshot = snapshot && !reflect.DeepEqual(old, next)
 	if !structuralChange(old, next) {
-		return a.applySoft(old, next)
+		return a.applySoft(old, next, snapshot)
 	}
 
 	newRT, err := buildRuntime(next, a.rt, a.opts, a.logger, a.bus)
@@ -634,6 +649,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 		}
 	}
 
+	if snapshot {
+		a.snapshotConfigLocked(old)
+	}
 	if err := next.Save(a.opts.ConfigPath); err != nil {
 		if a.appCtx != nil {
 			// Stop the half-started generation: it never became the
@@ -658,8 +676,9 @@ func (a *App) UpdateConfig(ctx context.Context, next *config.Config) error {
 }
 
 // applySoft applies the non-structural changes in place, with a roll
-// back when persisting fails. The caller must hold a.mu.
-func (a *App) applySoft(old, next *config.Config) error {
+// back when persisting fails. snapshot asks for a pre-change snapshot
+// of the old config. The caller must hold a.mu.
+func (a *App) applySoft(old, next *config.Config, snapshot bool) error {
 	rt := a.rt
 
 	if next.Strategy != old.Strategy {
@@ -690,6 +709,9 @@ func (a *App) applySoft(old, next *config.Config) error {
 		rt.filterInterval = a.filterIntervalFor(next)
 	}
 
+	if snapshot {
+		a.snapshotConfigLocked(old)
+	}
 	if err := next.Save(a.opts.ConfigPath); err != nil {
 		// Roll the applied changes back to the old values.
 		_ = rt.router.SetStrategy(old.Strategy)
@@ -710,6 +732,16 @@ func (a *App) applySoft(old, next *config.Config) error {
 	a.cfg = next
 	a.bus.Publish(api.Event{Type: "filter", Data: a.filterSnapshotLocked()})
 	return nil
+}
+
+// snapshotConfigLocked stores a best-effort backup of the old config
+// before a change is persisted. A failure is logged and never blocks
+// the change: the backup is a convenience, not a precondition. The
+// caller must hold a.mu.
+func (a *App) snapshotConfigLocked(old *config.Config) {
+	if _, err := configbackup.Create(backupDir(old), old, "auto"); err != nil {
+		a.logger.Warn("app: snapshotting the config before a change", "error", err)
+	}
 }
 
 // structuralChange reports whether applying next needs a runtime

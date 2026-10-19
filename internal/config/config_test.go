@@ -43,6 +43,9 @@ func TestDefaultValid(t *testing.T) {
 	if got := c.Protocols.DoH.Port; got != 443 {
 		t.Errorf("doh port = %d, want 443", got)
 	}
+	if got := c.Protocols.DoH.Path; got != config.DefaultDoHPath {
+		t.Errorf("doh path = %q, want %q", got, config.DefaultDoHPath)
+	}
 	if got := c.Protocols.DoT.Port; got != 853 {
 		t.Errorf("dot port = %d, want 853", got)
 	}
@@ -185,6 +188,79 @@ func TestValidateTable(t *testing.T) {
 		{
 			name:    "doh port too high",
 			mutate:  func(c *config.Config) { c.Protocols.DoH.Port = 70000 },
+			wantErr: true,
+		},
+		{
+			name:    "valid custom doh path",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/my-dns._~42" },
+			wantErr: false,
+		},
+		{
+			name:    "empty doh path means the default",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "" },
+			wantErr: false,
+		},
+		{
+			name:    "doh path without leading slash",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "dns-query" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path with whitespace",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/dns query" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path dot segment",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/." },
+			wantErr: true,
+		},
+		{
+			name:    "doh path dotdot segment",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/.." },
+			wantErr: true,
+		},
+		{
+			name:    "path on a non-doh protocol",
+			mutate:  func(c *config.Config) { c.Protocols.Plain.Path = "/dns-query" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path too long",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/" + strings.Repeat("a", 65) },
+			wantErr: true,
+		},
+		{
+			name:    "doh path is just a slash",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path collides with login",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/login" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path collides with logout",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/logout" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path collides with panel",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/panel" },
+			wantErr: true,
+		},
+		{
+			name:    "doh path collides with static",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/panel/static" },
+			wantErr: true,
+		},
+		{
+			// A later config-validation test for overlaps may add a
+			// nested route; the single-segment rule already rejects
+			// anything deeper than "/panel".
+			name:    "doh path is nested under panel",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/panel/x" },
 			wantErr: true,
 		},
 		{
@@ -578,6 +654,9 @@ func TestLoadBackwardCompatDefaults(t *testing.T) {
 	}
 	if c.Filter.Mode != "zero" {
 		t.Errorf("Filter.Mode = %q, want %q for old configs", c.Filter.Mode, "zero")
+	}
+	if c.Protocols.DoH.Path != config.DefaultDoHPath {
+		t.Errorf("DoH path = %q, want the default %q for old configs", c.Protocols.DoH.Path, config.DefaultDoHPath)
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("Validate() = %v, want nil (old configs must keep loading)", err)
