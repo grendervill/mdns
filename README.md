@@ -403,7 +403,8 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
   with the CLI.
 
 `?` opens the key reference as an overlay (`esc` returns), `q` quits,
-`r` reloads the active screen's data, digits switch screens.
+`r` reloads the active screen's data (on screen 5 it adds a user rule
+instead), digits switch screens.
 
 ### First-run wizard
 

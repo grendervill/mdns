@@ -92,14 +92,18 @@
 
   /* ---- live statistics -------------------------------------------- */
 
-  // The server renders the gauges, the period summary and the diagrams
-  // into #stats-block. Poll the fragment with the page's own query
-  // string, so the selected period carries over, and swap the block's
-  // contents. The period form is outside the block: a poll never resets
-  // it. Hidden tabs do no work, requests never overlap and a failure
-  // degrades quietly into the next tick.
+  // The server renders the all-time gauges into #stats-gauges and the
+  // period summary and diagrams into #stats-block, with the period form
+  // between them so a poll never resets it. Poll the fragment with the
+  // page's own query string, so the selected period carries over, and
+  // swap both blocks. Hidden tabs do no work, requests never overlap and
+  // a failure degrades quietly into the next tick.
   var STATS_INTERVAL = 2000;
+  // A hung request would otherwise keep statsBusy set forever and stop
+  // every later tick.
+  var STATS_TIMEOUT = 5000;
   var statsBlock = document.getElementById('stats-block');
+  var statsGauges = document.getElementById('stats-gauges');
 
   if (statsBlock && window.fetch) {
     var statsBusy = false;
@@ -109,9 +113,13 @@
         return;
       }
       statsBusy = true;
+      var ctrl = window.AbortController ? new AbortController() : null;
+      var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, STATS_TIMEOUT) : null;
+
       fetch('/panel/stats' + window.location.search, {
         credentials: 'same-origin',
-        cache: 'no-store'
+        cache: 'no-store',
+        signal: ctrl ? ctrl.signal : undefined
       }).then(function (resp) {
         // A redirect means the session ended: keep the last good block
         // rather than swapping in the login page.
@@ -120,12 +128,29 @@
         }
         return resp.text();
       }).then(function (html) {
-        // Replacing the contents keeps the block node itself, so the
-        // next tick still has a valid target.
-        statsBlock.innerHTML = html;
+        // The donuts carry focusable links. Replacing them under the
+        // keyboard would drop focus mid-tab; skip this tick and retry
+        // once the focus has moved on.
+        if (statsBlock.contains(document.activeElement)) {
+          return;
+        }
+        var tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        var gauges = tmp.querySelector('[data-stats="gauges"]');
+        var range = tmp.querySelector('[data-stats="range"]');
+        if (!gauges || !range) {
+          return;
+        }
+        if (statsGauges) {
+          statsGauges.innerHTML = gauges.innerHTML;
+        }
+        statsBlock.innerHTML = range.innerHTML;
       }).catch(function () {
         // Quiet on purpose: the next tick retries.
-      }).then(function () {
+      }).finally(function () {
+        if (timer) {
+          clearTimeout(timer);
+        }
         statsBusy = false;
       });
     };

@@ -248,6 +248,14 @@ func TestStatusRenders(t *testing.T) {
 	if !strings.Contains(body, `<div id="stats-block">`) {
 		t.Error("the statistics are not wrapped in #stats-block (the poller's target)")
 	}
+	// The all-time gauges come first, then the period form, then the
+	// period summary and the diagrams.
+	gaugeAt := strings.Index(body, "Запросов всего")
+	formAt := strings.Index(body, `class="periodrow"`)
+	periodAt := strings.Index(body, "За период (")
+	if gaugeAt < 0 || formAt < 0 || periodAt < 0 || gaugeAt > formAt || formAt > periodAt {
+		t.Errorf("status layout order = gauges %d, form %d, period %d, want gauges < form < period", gaugeAt, formAt, periodAt)
+	}
 
 	// The mockup's dasharrays and offsets, straight from its figure:
 	// slice starts are 0, 74, 93 and 99.7 percent, so the offsets are
@@ -905,7 +913,8 @@ func TestStatusPeriodForm(t *testing.T) {
 
 // TestStatusStatsFragment checks the polled fragment: the same gauges,
 // period summary and donuts as the page for the same query, with the
-// no-store/nosniff headers and without the selector or the live feed.
+// full page-security headers (no-store, nosniff, no framing) and without
+// the selector or the live feed.
 func TestStatusStatsFragment(t *testing.T) {
 	ctrl := periodCtrl()
 	p, srv := statusPanel(t, ctrl)
@@ -922,6 +931,12 @@ func TestStatusStatsFragment(t *testing.T) {
 	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q, want nosniff", got)
 	}
+	if got := resp.Header.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options = %q, want DENY", got)
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); got != "frame-ancestors 'none'; default-src 'self'" {
+		t.Errorf("Content-Security-Policy = %q, want frame-ancestors 'none'; default-src 'self'", got)
+	}
 	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
 		t.Errorf("Content-Type = %q, want text/html", got)
 	}
@@ -934,6 +949,8 @@ func TestStatusStatsFragment(t *testing.T) {
 
 	for _, want := range []string{
 		`class="gauges"`,
+		`data-stats="gauges"`,
+		`data-stats="range"`,
 		"Запросов всего",
 		"1 000",
 		`За период (12 месяцев): всего 40 · кеш 30 · блок 4 · ошибки 1`,

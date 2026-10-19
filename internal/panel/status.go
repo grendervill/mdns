@@ -487,7 +487,7 @@ type periodOption struct {
 // handleStatus renders the status screen.
 func (p *Panel) handleStatus(w http.ResponseWriter, r *http.Request) {
 	sel := parsePeriod(r, time.Now())
-	st, sn, rangeSn := p.statusData(r.Context(), sel)
+	st, sn, rangeSn := p.statusData(r.Context(), sel, p.logger.Warn)
 
 	view := statusView{
 		Version: p.version,
@@ -516,11 +516,18 @@ func (p *Panel) handleStatus(w http.ResponseWriter, r *http.Request) {
 // and the feed keeps its own SSE stream.
 func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 	sel := parsePeriod(r, time.Now())
-	st, sn, rangeSn := p.statusData(r.Context(), sel)
+	// The fragment is polled every two seconds per open tab, so a
+	// failing status read is logged at Debug here and only at Warn on
+	// the full page.
+	st, sn, rangeSn := p.statusData(r.Context(), sel, p.logger.Debug)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// The fragment is HTML from the same origin and must never be
+	// framed either: a clickjacked same-origin frame keeps the session.
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'; default-src 'self'")
 	if err := templates["status"].ExecuteTemplate(w, "stats", buildStats(st, sn, rangeSn, sel)); err != nil {
 		p.logger.Warn("panel: rendering the statistics fragment", "error", err)
 	}
@@ -528,9 +535,10 @@ func (p *Panel) handleStats(w http.ResponseWriter, r *http.Request) {
 
 // statusData reads the daemon snapshot the status screen renders from:
 // the API status (gauge labels, links, certificate) plus the cumulative
-// and period statistics. A status error is logged and leaves the gauges
-// empty rather than stale.
-func (p *Panel) statusData(ctx context.Context, sel periodSelection) (api.Status, stats.Snapshot, stats.Snapshot) {
+// and period statistics. A status error is logged through logFailure and
+// leaves the gauges empty rather than stale; the full page passes Warn,
+// the polled fragment Debug.
+func (p *Panel) statusData(ctx context.Context, sel periodSelection, logFailure func(string, ...any)) (api.Status, stats.Snapshot, stats.Snapshot) {
 	var (
 		st      api.Status
 		sn      stats.Snapshot
@@ -542,7 +550,7 @@ func (p *Panel) statusData(ctx context.Context, sel periodSelection) (api.Status
 
 	got, err := p.ctrl.Status(ctx)
 	if err != nil {
-		p.logger.Warn("panel: reading the daemon status", "error", err)
+		logFailure("panel: reading the daemon status", "error", err)
 	} else {
 		st = got
 	}
