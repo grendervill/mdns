@@ -3,6 +3,7 @@ package api_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -131,9 +132,9 @@ func TestBackupCreateNoLabel(t *testing.T) {
 // TestBackupRestoreAndDelete checks the name is passed through and the
 // status shape is stable.
 func TestBackupRestoreAndDelete(t *testing.T) {
-	ctl := &fakeController{}
-	ts := newTestServer(t, ctl)
 	name := "config-20261019-120000-manual.json"
+	ctl := &fakeController{backups: []configbackup.Info{{Name: name, Size: 64}}}
+	ts := newTestServer(t, ctl)
 
 	resp := postJSON(t, ts.URL+"/api/v1/backups/restore", map[string]string{"name": " " + name + " "})
 	if resp.StatusCode != http.StatusOK {
@@ -166,10 +167,12 @@ func TestBackupRestoreAndDelete(t *testing.T) {
 	}
 }
 
-// TestBackupBadRequests checks blank names, malformed JSON and a
-// missing name are rejected before the controller.
+// TestBackupBadRequests checks blank names, malformed JSON, a missing
+// name and an unknown name are all rejected with 400 before the
+// controller's mutation runs.
 func TestBackupBadRequests(t *testing.T) {
-	ts := newTestServer(t, &fakeController{})
+	ctl := &fakeController{backups: []configbackup.Info{{Name: "config-20261019-120000.json"}}}
+	ts := newTestServer(t, ctl)
 
 	for _, path := range []string{"/api/v1/backups/restore", "/api/v1/backups/delete"} {
 		if resp := postJSON(t, ts.URL+path, map[string]string{"name": "  "}); resp.StatusCode != http.StatusBadRequest {
@@ -187,6 +190,25 @@ func TestBackupBadRequests(t *testing.T) {
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%s bad JSON status = %d, want 400", path, resp.StatusCode)
 		}
+
+		// Not in the listed set: neither restore nor delete may address
+		// it, and a traversal-looking name is just an unknown name.
+		for _, name := range []string{"config-20260101-000000-gone.json", "../escape.json"} {
+			resp := postJSON(t, ts.URL+path, map[string]string{"name": name})
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s %q status = %d, want 400", path, name, resp.StatusCode)
+			}
+			var body map[string]string
+			if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+				t.Fatalf("decode %s: %v", path, err)
+			}
+			if !strings.Contains(body["error"], "не найдена") {
+				t.Errorf("%s %q error = %q, want the not-found message", path, name, body["error"])
+			}
+		}
+	}
+	if ctl.lastRestore != "" || ctl.lastDelete != "" {
+		t.Errorf("the controller ran a mutation for a name it never listed")
 	}
 
 	resp, err := http.Post(ts.URL+"/api/v1/backups", "application/json", strings.NewReader("{not json"))
@@ -199,14 +221,18 @@ func TestBackupBadRequests(t *testing.T) {
 	}
 }
 
-// TestBackupControllerError checks a rejected mutation surfaces the
-// controller's text as 400, while a listing failure is a 500.
-func TestBackupControllerError(t *testing.T) {
-	invalid := errors.New("configbackup: invalid backup name \"../escape.json\"")
-	ctl := &fakeController{restoreErr: invalid}
+// TestBackupValidationError checks a listed snapshot whose content the
+// controller rejects still surfaces as 400 with its text, while a list
+// failure is a 500.
+func TestBackupValidationError(t *testing.T) {
+	name := "config-20261019-120000.json"
+	ctl := &fakeController{
+		backups:    []configbackup.Info{{Name: name}},
+		restoreErr: fmt.Errorf("%w: domain must not be empty", configbackup.ErrInvalid),
+	}
 	ts := newTestServer(t, ctl)
 
-	resp := postJSON(t, ts.URL+"/api/v1/backups/restore", map[string]string{"name": "../escape.json"})
+	resp := postJSON(t, ts.URL+"/api/v1/backups/restore", map[string]string{"name": name})
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("restore status = %d, want 400", resp.StatusCode)
 	}
@@ -214,12 +240,51 @@ func TestBackupControllerError(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !strings.Contains(body["error"], "invalid backup name") {
+	if !strings.Contains(body["error"], "domain must not be empty") {
 		t.Errorf("error = %q, want the controller's text", body["error"])
 	}
 
 	ctl.listErr = errors.New("read permission denied")
 	if code := getJSON(t, ts, "/api/v1/backups", nil); code != http.StatusInternalServerError {
 		t.Errorf("list status = %d, want 500", code)
+	}
+	// The same failure while gating a mutation is a 500 too.
+	if resp := postJSON(t, ts.URL+"/api/v1/backups/delete", map[string]string{"name": name}); resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("delete with a failed list status = %d, want 500", resp.StatusCode)
+	}
+}
+
+// TestBackupInternalErrors checks a disk or apply failure in any
+// mutation is a 500, not a bad request.
+func TestBackupInternalErrors(t *testing.T) {
+	name := "config-20261019-120000.json"
+	boom := errors.New("write permission denied")
+
+	t.Run("create", func(t *testing.T) {
+		ctl := &fakeController{createErr: boom}
+		ts := newTestServer(t, ctl)
+		if resp := postJSON(t, ts.URL+"/api/v1/backups", map[string]string{"label": "manual"}); resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("create status = %d, want 500", resp.StatusCode)
+		}
+
+		// A rejected label stays a bad request.
+		ctl.createErr = configbackup.ErrInvalidName
+		if resp := postJSON(t, ts.URL+"/api/v1/backups", map[string]string{"label": "../x"}); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("create with a bad label status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	for _, tc := range []struct {
+		path string
+		ctl  *fakeController
+	}{
+		{"/api/v1/backups/restore", &fakeController{backups: []configbackup.Info{{Name: name}}, restoreErr: boom}},
+		{"/api/v1/backups/delete", &fakeController{backups: []configbackup.Info{{Name: name}}, deleteErr: boom}},
+	} {
+		ts := newTestServer(t, tc.ctl)
+		resp := postJSON(t, ts.URL+tc.path, map[string]string{"name": name})
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("%s status = %d, want 500", tc.path, resp.StatusCode)
+		}
 	}
 }

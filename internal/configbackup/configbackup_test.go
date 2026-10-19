@@ -1,6 +1,8 @@
 package configbackup_test
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -209,11 +211,47 @@ func TestPermissions(t *testing.T) {
 func TestTraversalRejected(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"../escape.json", "/etc/passwd", `..\escape.json`, "notes.txt", "", ".", "..", "config-20260101-120000.json/../x.json"} {
-		if _, err := configbackup.Load(dir, name); err == nil {
+		_, err := configbackup.Load(dir, name)
+		if err == nil {
 			t.Errorf("Load(%q) = nil error, want a rejection", name)
+		} else if !errors.Is(err, configbackup.ErrInvalidName) {
+			t.Errorf("Load(%q) = %v, want ErrInvalidName", name, err)
 		}
-		if err := configbackup.Delete(dir, name); err == nil {
+		err = configbackup.Delete(dir, name)
+		if err == nil {
 			t.Errorf("Delete(%q) = nil error, want a rejection", name)
+		} else if !errors.Is(err, configbackup.ErrInvalidName) {
+			t.Errorf("Delete(%q) = %v, want ErrInvalidName", name, err)
 		}
+	}
+}
+
+// TestMissingIsNotFound reports a vanished snapshot as ErrNotFound and
+// fs.ErrNotExist, so the API can answer 400 while an I/O failure stays
+// a 500.
+func TestMissingIsNotFound(t *testing.T) {
+	dir := t.TempDir()
+	name := "config-20260101-120000.json"
+
+	_, err := configbackup.Load(dir, name)
+	if !errors.Is(err, configbackup.ErrNotFound) || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Load(missing) = %v, want ErrNotFound and fs.ErrNotExist", err)
+	}
+	err = configbackup.Delete(dir, name)
+	if !errors.Is(err, configbackup.ErrNotFound) || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Delete(missing) = %v, want ErrNotFound and fs.ErrNotExist", err)
+	}
+}
+
+// TestMalformedIsInvalid reports bad content as ErrInvalid, not an I/O
+// failure.
+func TestMalformedIsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	name := "config-20260101-120000.json"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := configbackup.Load(dir, name); !errors.Is(err, configbackup.ErrInvalid) {
+		t.Errorf("Load(malformed) = %v, want ErrInvalid", err)
 	}
 }

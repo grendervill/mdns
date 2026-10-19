@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
+	"io/fs"
 	"net/http"
 	"strings"
 	"time"
@@ -58,11 +60,8 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// The mutation itself is the user's request, so any failure is
-	// reported as a bad request with the controller's explanation,
-	// exactly as the web panel does.
 	if err := s.ctl.CreateConfigBackup(strings.TrimSpace(req.Label)); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, backupErrorStatus(err), err.Error())
 		return
 	}
 
@@ -83,11 +82,11 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 // handleBackupRestore applies one stored snapshot.
 func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.readBackupName(w, r)
-	if !ok {
+	if !ok || !s.requireListedBackup(w, name) {
 		return
 	}
 	if err := s.ctl.RestoreConfigBackup(name); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, backupErrorStatus(err), err.Error())
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "restored"})
@@ -96,14 +95,49 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 // handleBackupDelete removes one stored snapshot.
 func (s *Server) handleBackupDelete(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.readBackupName(w, r)
-	if !ok {
+	if !ok || !s.requireListedBackup(w, name) {
 		return
 	}
 	if err := s.ctl.DeleteConfigBackup(name); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.writeError(w, backupErrorStatus(err), err.Error())
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// requireListedBackup gates restore and delete on the listed set, the
+// same invariant as the panel's backupExists: a hand-written name can
+// never address a file the list did not show. It writes the error
+// response itself and reports whether the caller may continue.
+func (s *Server) requireListedBackup(w http.ResponseWriter, name string) bool {
+	infos, err := s.ctl.ListConfigBackups()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, "list backups: "+err.Error())
+		return false
+	}
+	for _, info := range infos {
+		if info.Name == name {
+			return true
+		}
+	}
+	s.writeError(w, http.StatusBadRequest, "резервная копия не найдена")
+	return false
+}
+
+// backupErrorStatus separates a bad request from a failure of the
+// daemon: an invalid name, invalid snapshot content or a name that
+// vanished is 400, while a permission problem, a disk error or a failed
+// apply is 500.
+func backupErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, configbackup.ErrInvalidName),
+		errors.Is(err, configbackup.ErrInvalid),
+		errors.Is(err, configbackup.ErrNotFound),
+		errors.Is(err, fs.ErrNotExist):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // readBackupName decodes the {"name":...} body shared by restore and
