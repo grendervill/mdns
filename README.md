@@ -530,7 +530,7 @@ drives the chart tooltip and the live feed.
 - **Фильтры** — a catalog of ready public block lists (AdGuard DNS/Base,
   uBlock Origin, EasyList, Peter Lowe, OISD Small/Full, HaGeZi Pro/Pro++,
   Steven Black, 1Hosts Lite) plus 14 regional lists (RU AdList, AdGuard
-  Ukrainian/German/French/Dutch/Turkish/Chinese/Japanese, EasyList
+  Ukrainian/French/Dutch/Turkish/Chinese/Japanese, EasyList
   Germany/Italy/Hebrew, Polskie Filtry, CERT.PL's Warning List,
   ABPindo, IndianList) with one-click add/remove, plus a custom `https`
   list by ID and URL; per-list applied/skipped rules, update time and

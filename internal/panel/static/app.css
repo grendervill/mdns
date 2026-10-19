@@ -157,6 +157,7 @@ h3 { font: 600 13px/1 var(--sans); color: var(--muted); margin: 26px 0 10px; }
 .tag.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
 .tag.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .tag.err { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.tag.muted { color: var(--muted); border-color: var(--line); }
 
 /* ---- login ------------------------------------------------------ */
 

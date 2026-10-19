@@ -342,6 +342,12 @@ func (s *Server) ReleaseListeners() {
 		_ = s.dohLn.Close()
 		s.dohLn = nil
 	}
+	// The HTTPS (HTTP/1.1 + HTTP/2) server above stays up for in-flight
+	// responses; only its socket is freed. HTTP/3 cannot be kept that
+	// way — its connections share the QUIC socket — so they are closed
+	// outright. We never emit an Alt-Svc header for the panel and
+	// browsers only learn about HTTP/3 from one, so clients fall back to
+	// HTTPS without noticing.
 	if s.h3Srv != nil {
 		_ = s.h3Srv.Close()
 		s.h3Srv = nil
@@ -375,6 +381,14 @@ func (s *Server) ForceClose() {
 	if s.h3Srv != nil {
 		_ = s.h3Srv.Close()
 		s.h3Srv = nil
+	}
+	// A stale challenge responder must not outlive a timed-out retire:
+	// Close it outright and drop the reference, so its goroutine cannot
+	// keep serving after the drain gave up on it.
+	if s.challenge != nil {
+		_ = s.challenge.Close()
+		s.challenge = nil
+		s.challengeLn = nil
 	}
 }
 
