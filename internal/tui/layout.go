@@ -25,9 +25,15 @@ const (
 	// railBreakpoint is the narrowest terminal that shows the left rail;
 	// below it the numeric tab line is the fallback.
 	railBreakpoint = 64
+	// fullRailBreakpoint is where the rail widens from the two-letter
+	// compact form to the full tab names.
+	fullRailBreakpoint = 100
 	// railWidth is the full width of the navigation rail including the
 	// marker column.
 	railWidth = 20
+	// compactRailWidth is the width of the rail with numbers and
+	// two-letter labels: marker, space and a four-column label.
+	compactRailWidth = 6
 	// railFrames bounds the transition: 6 frames at 20 ms = 120 ms.
 	railFrames = 6
 )
@@ -57,6 +63,10 @@ var (
 	railActiveStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Background(colorRailBg).Width(railWidth - 2)
 	railMarkerStyle = lipgloss.NewStyle().Foreground(colorAccent)
 
+	// compact rail styles: the same palette over the four-column label.
+	compactRailItemStyle   = lipgloss.NewStyle().Foreground(colorMuted).Width(compactRailWidth - 2)
+	compactRailActiveStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Background(colorRailBg).Width(compactRailWidth - 2)
+
 	paneStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorBorder).
@@ -80,6 +90,22 @@ type railTickMsg struct{}
 // railVisible reports whether the terminal is wide enough for the rail.
 func (m Model) railVisible() bool {
 	return m.width >= railBreakpoint
+}
+
+// railCompact reports whether the rail shows numbers and two-letter
+// labels instead of the full tab names.
+func (m Model) railCompact() bool {
+	return m.width >= railBreakpoint && m.width < fullRailBreakpoint
+}
+
+// railColumnWidth is the width the rail reserves beside the content;
+// pickerContentWidth and paneView share it so the two-pane breakpoint
+// matches the real content width.
+func (m Model) railColumnWidth() int {
+	if m.railCompact() {
+		return compactRailWidth
+	}
+	return railWidth
 }
 
 // railIndex maps a screen to its rail row. Child screens and the help
@@ -177,20 +203,33 @@ func (m Model) railMarkerRow() int {
 }
 
 // railView renders the eight tabs with numbers and the sliding marker.
+// Between railBreakpoint and fullRailBreakpoint the labels shrink to
+// two letters, so an 80-column terminal keeps 69 content columns.
 func (m Model) railView() string {
 	marker := m.railMarkerRow()
 	active := m.railIndex(m.screen)
+	itemStyle, activeStyle, width := railItemStyle, railActiveStyle, railWidth
+	if m.railCompact() {
+		itemStyle, activeStyle, width = compactRailItemStyle, compactRailActiveStyle, compactRailWidth
+	}
 	lines := make([]string, 0, len(screenTabs))
 	for i, tab := range screenTabs {
 		prefix := " "
 		if i == marker {
 			prefix = railMarkerStyle.Render("▌")
 		}
-		label := itoa(i+1) + " " + tab.name
+		name := tab.name
+		if m.railCompact() {
+			name = tab.short
+		}
+		label := itoa(i+1) + " " + name
+		if w := lipgloss.Width(label); w < width-2 {
+			label += strings.Repeat(" ", width-2-w)
+		}
 		if i == active {
-			lines = append(lines, prefix+" "+railActiveStyle.Render(label))
+			lines = append(lines, prefix+" "+activeStyle.Render(label))
 		} else {
-			lines = append(lines, prefix+" "+railItemStyle.Render(label))
+			lines = append(lines, prefix+" "+itemStyle.Render(label))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -261,7 +300,7 @@ func (m Model) headerView() string {
 // paneView frames the active screen in the content pane, truncating
 // lines that no longer fit beside the rail.
 func (m Model) paneView(content string) string {
-	inner := m.width - railWidth - 1 - paneStyle.GetHorizontalFrameSize()
+	inner := m.width - m.railColumnWidth() - 1 - paneStyle.GetHorizontalFrameSize()
 	if inner < 1 {
 		inner = 1
 	}

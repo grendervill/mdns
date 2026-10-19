@@ -76,7 +76,43 @@ func TestPickerScrollWindow(t *testing.T) {
 	}
 }
 
-// TestPickerNarrowStacks checks the <72 column layout: the list sits
+// TestPickerTwoPaneAt80Columns checks the shell at 80 columns: the
+// compact rail leaves 69 content columns, so the picker keeps the list
+// and the details side by side instead of stacking.
+func TestPickerTwoPaneAt80Columns(t *testing.T) {
+	cfg := upstreamCfgWith()
+	m := upstreamModel(&stubClient{cfg: cfg}, cfg)
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m = step(m, key('s'))
+
+	if m.screen != screenStrategyPicker {
+		t.Fatalf("s opened %v, want the strategy picker", m.screen)
+	}
+	if got := m.pickerContentWidth(); got != 69 {
+		t.Fatalf("picker content width = %d, want 69", got)
+	}
+	if left, right := pickerPaneWidths(69); left+right+1 != 69 {
+		t.Errorf("pane widths %d+%d+1 != 69", left, right)
+	}
+
+	view := m.View()
+	top := 0
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "╭") {
+			top++
+		}
+	}
+	if top != 2 {
+		t.Errorf("80-column view draws %d top-border lines, want 2 (shell pane + two-pane picker):\n%s", top, view)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if w := lipgloss.Width(line); w > 80 {
+			t.Errorf("line width %d > 80: %q", w, line)
+		}
+	}
+}
+
+// TestPickerNarrowStacks checks the <68 column layout: the list sits
 // above the details instead of beside them.
 func TestPickerNarrowStacks(t *testing.T) {
 	p := pickerFixture()

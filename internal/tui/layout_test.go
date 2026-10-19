@@ -37,6 +37,72 @@ func TestRailShowsAllTabsAndOneMarker(t *testing.T) {
 	}
 }
 
+// TestCompactRailShowsAbbreviations checks the 64-99 column mode: the
+// rail shrinks to numbers and two-letter labels, leaves 69 content
+// columns at 80 and still draws exactly one marker.
+func TestCompactRailShowsAbbreviations(t *testing.T) {
+	m := shellModel(t, 80, 24)
+
+	rail := m.railView()
+	for _, tab := range screenTabs {
+		if !strings.Contains(rail, tab.short) {
+			t.Errorf("compact rail misses the abbreviation %q:\n%s", tab.short, rail)
+		}
+		if strings.Contains(rail, tab.name) {
+			t.Errorf("compact rail still carries the full name %q:\n%s", tab.name, rail)
+		}
+	}
+	for i, line := range strings.Split(rail, "\n") {
+		if w := lipgloss.Width(line); w != compactRailWidth {
+			t.Errorf("rail row %d width = %d, want %d: %q", i, w, compactRailWidth, line)
+		}
+	}
+	if n := strings.Count(m.View(), "▌"); n != 1 {
+		t.Errorf("compact rail markers = %d, want exactly 1:\n%s", n, m.View())
+	}
+	if got := m.pickerContentWidth(); got != 69 {
+		t.Errorf("content width at 80 = %d, want 69", got)
+	}
+	if m.railColumnWidth() != compactRailWidth {
+		t.Errorf("railColumnWidth = %d, want %d", m.railColumnWidth(), compactRailWidth)
+	}
+}
+
+// TestCompactRailMarkerAnimates checks the marker transition also runs
+// in the compact rail and lands on the target row.
+func TestCompactRailMarkerAnimates(t *testing.T) {
+	m := New(&stubClient{status: sampleStatus()}, Options{})
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	updated, _ := m.Update(key('4'))
+	m = updated.(Model)
+	if !m.anim.active {
+		t.Fatalf("the compact rail did not start the marker animation")
+	}
+	last := -1
+	for frame := 0; frame < railFrames; frame++ {
+		updated, cmd := m.Update(railTickMsg{})
+		m = updated.(Model)
+		row := m.railMarkerRow()
+		if row < last {
+			t.Errorf("marker moved backwards: %d then %d", last, row)
+		}
+		last = row
+		if frame == railFrames-1 && cmd != nil {
+			t.Errorf("the last frame scheduled another tick")
+		}
+	}
+	if m.anim.active {
+		t.Errorf("animation is still active after %d frames", railFrames)
+	}
+	if got := m.railMarkerRow(); got != 3 {
+		t.Errorf("marker row = %d, want the upstreams row 3", got)
+	}
+	if n := strings.Count(m.View(), "▌"); n != 1 {
+		t.Errorf("compact rail markers = %d, want 1 after animation", n)
+	}
+}
+
 // TestNarrowTerminalFallsBackToTabLine checks the width < 64 fallback:
 // one numeric line with every tab and no rail marker.
 func TestNarrowTerminalFallsBackToTabLine(t *testing.T) {

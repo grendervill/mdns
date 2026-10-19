@@ -37,6 +37,27 @@ func loadMaintenanceConfig(c Client) tea.Cmd {
 	}
 }
 
+// loadStats fetches the cumulative counters and the daemon start time,
+// which the maintenance header renders as uptime.
+func loadStats(c Client) tea.Cmd {
+	return func() tea.Msg {
+		st, err := c.Stats(context.Background())
+		return statsLoadedMsg{stats: st, err: err}
+	}
+}
+
+// reapplyConfigCmd re-reads the live config and PUTs it back unchanged:
+// the TUI twin of the web panel's maintenance action.
+func reapplyConfigCmd(c Client) tea.Cmd {
+	return func() tea.Msg {
+		cfg, err := c.Config(context.Background())
+		if err != nil {
+			return configReappliedMsg{err: err}
+		}
+		return configReappliedMsg{err: c.UpdateConfig(context.Background(), cfg)}
+	}
+}
+
 // createBackupCmd stores a snapshot with the given label.
 func createBackupCmd(c Client, label string) tea.Cmd {
 	return func() tea.Msg {
@@ -198,12 +219,52 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.1f ПиБ", v/1024)
 }
 
+// humanUptime renders a daemon uptime in Russian units, rounded to the
+// minute; the maintenance screen shows it next to the version.
+func humanUptime(d time.Duration) string {
+	if d < time.Minute {
+		return "меньше минуты"
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	mins := int(d.Minutes()) % 60
+	switch {
+	case days > 0:
+		return fmt.Sprintf("%d д %d ч", days, hours)
+	case hours > 0:
+		return fmt.Sprintf("%d ч %d мин", hours, mins)
+	default:
+		return fmt.Sprintf("%d мин", mins)
+	}
+}
+
+// maintenanceMeta is the daemon identity line: version from the loaded
+// status and uptime from the stats start time.
+func (m Model) maintenanceMeta() string {
+	version := "неизвестна"
+	if m.status.Version != "" {
+		version = "v" + m.status.Version
+	}
+	meta := "версия " + version
+	switch {
+	case m.statsErr != nil:
+		meta += " · uptime недоступен"
+	case m.uptimeKnown:
+		meta += " · uptime " + humanUptime(m.uptime)
+	case !m.statsLoaded:
+		meta += " · uptime …"
+	}
+	return dimStyle.Render(meta)
+}
+
 // maintenanceView renders the backups table, the password prompt and
 // the feedback lines.
 func (m *Model) maintenanceView() string {
 	var b strings.Builder
 
 	b.WriteString(titleStyle.Render("Обслуживание — резервные копии и пароль панели"))
+	b.WriteString("\n")
+	b.WriteString(m.maintenanceMeta())
 	b.WriteString("\n\n")
 
 	switch {

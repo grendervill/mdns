@@ -38,6 +38,10 @@ type stubClient struct {
 
 	requestEntries []qlog.Entry
 
+	stats      api.StatsResponse
+	statsErr   error
+	statsCalls int
+
 	filterLists []filter.ListStatus
 	filterErr   error
 
@@ -122,6 +126,10 @@ func (s *stubClient) Probe(ctx context.Context, eps []providers.Endpoint) ([]pro
 }
 func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) {
 	return s.requestEntries, nil
+}
+func (s *stubClient) Stats(context.Context) (api.StatsResponse, error) {
+	s.statsCalls++
+	return s.stats, s.statsErr
 }
 func (s *stubClient) FilterStatus(context.Context) ([]filter.ListStatus, error) {
 	return s.filterLists, s.filterErr

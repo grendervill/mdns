@@ -54,19 +54,21 @@ const (
 	screenHelp
 )
 
-// screenTabs is the navigation order; digits 1-8 select these.
+// screenTabs is the navigation order; digits 1-8 select these. short is
+// the two-letter label the compact rail uses on 64-99 column terminals.
 var screenTabs = []struct {
 	name   string
+	short  string
 	screen screen
 }{
-	{"Статус", screenStatus},
-	{"Визард", screenWizard},
-	{"Запросы", screenRequests},
-	{"Upstream'ы", screenUpstreams},
-	{"Фильтры", screenFilters},
-	{"Настройки", screenSettings},
-	{"Диагностика", screenDiag},
-	{"Обслуживание", screenMaintenance},
+	{"Статус", "Ст", screenStatus},
+	{"Визард", "Ви", screenWizard},
+	{"Запросы", "За", screenRequests},
+	{"Upstream'ы", "Up", screenUpstreams},
+	{"Фильтры", "Фи", screenFilters},
+	{"Настройки", "На", screenSettings},
+	{"Диагностика", "Ди", screenDiag},
+	{"Обслуживание", "Об", screenMaintenance},
 }
 
 // Options configure the model.
@@ -93,6 +95,14 @@ type Model struct {
 
 	status    api.Status
 	statusErr error
+
+	// stats carries the daemon counters and start time; uptime is the
+	// duration measured when the stats arrived, so rendering is stable.
+	stats       api.StatsResponse
+	statsErr    error
+	statsLoaded bool
+	uptime      time.Duration
+	uptimeKnown bool
 
 	events <-chan api.Event
 
@@ -248,6 +258,13 @@ type (
 		err     error
 	}
 
+	// statsLoadedMsg carries the cumulative counters and the daemon
+	// start time (the maintenance uptime).
+	statsLoadedMsg struct {
+		stats api.StatsResponse
+		err   error
+	}
+
 	// eventsRetryMsg re-opens the event stream after eventsRetryDelay.
 	eventsRetryMsg struct{}
 
@@ -256,6 +273,8 @@ type (
 		backups []BackupInfo
 		err     error
 	}
+	// configReappliedMsg reports the re-read-and-PUT maintenance action.
+	configReappliedMsg struct{ err error }
 	// backupDoneMsg reports one create/restore/delete mutation.
 	backupDoneMsg struct {
 		action string
@@ -494,6 +513,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case statsLoadedMsg:
+		m.statsLoaded = true
+		m.statsErr = msg.err
+		if msg.err == nil {
+			m.stats = msg.stats
+			m.uptimeKnown = !msg.stats.Since.IsZero()
+			m.uptime = 0
+			if m.uptimeKnown {
+				if d := time.Since(msg.stats.Since); d > 0 {
+					m.uptime = d
+				}
+			}
+		}
+		return m, nil
+
 	case diagLoadedMsg:
 		m.diagChecks = buildDiagChecks(msg)
 		m.diagLoaded = true
@@ -515,6 +549,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case configReappliedMsg:
+		if msg.err != nil {
+			m.maintenanceNote = ""
+			m.maintenanceErr = fmt.Errorf("не удалось применить конфигурацию: %w", msg.err)
+			return m, nil
+		}
+		m.maintenanceErr = nil
+		m.maintenanceNote = "конфигурация применена заново"
+		return m, fetchStatus(m.client)
 
 	case backupDoneMsg:
 		if msg.err != nil {
@@ -607,7 +651,7 @@ func (m Model) refreshCmd() tea.Cmd {
 	case screenDiag:
 		cmds = append(cmds, loadDiag(m.client))
 	case screenMaintenance:
-		cmds = append(cmds, loadBackups(m.client), loadMaintenanceConfig(m.client))
+		cmds = append(cmds, loadBackups(m.client), loadMaintenanceConfig(m.client), loadStats(m.client))
 	}
 	return tea.Batch(cmds...)
 }
@@ -636,7 +680,7 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 			return loadDiag(m.client)
 		}
 	case screenMaintenance:
-		return tea.Batch(loadBackups(m.client), loadMaintenanceConfig(m.client))
+		return tea.Batch(loadBackups(m.client), loadMaintenanceConfig(m.client), loadStats(m.client))
 	}
 	return nil
 }
@@ -940,6 +984,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.deleteSelectedBackup()
 		case "p":
 			return m.startPasswordChange()
+		case "a":
+			m.maintenanceErr = nil
+			m.maintenanceNote = ""
+			return m, reapplyConfigCmd(m.client)
 		}
 
 	case screenHelp:
@@ -1164,7 +1212,7 @@ func (m Model) footerText() string {
 	case screenSettings:
 		return "q — выход · r — обновить · enter — изменить · s — стратегия · ctrl+s — применить · ? — помощь"
 	case screenMaintenance:
-		return "j/k — выбор · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
+		return "j/k — выбор · a — применить заново · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
 	default:
 		return "q — выход · r — обновить · ? — помощь"
 	}
@@ -1238,9 +1286,11 @@ func (m *Model) helpView() string {
 		"  t     проверить выбранный upstream (probe)",
 		"",
 		titleStyle.Render("Обслуживание (экран 8)"),
+		"  a     применить текущую конфигурацию заново (без изменений)",
 		"  j/k   выбор копии · enter — восстановить · d — удалить",
 		"  c     создать резервную копию (метка manual)",
 		"  p     сменить пароль веб-панели (два скрытых ввода, esc — отмена)",
+		dimStyle.Render("  Версия и uptime демона — в шапке экрана (uptime из /stats)"),
 		dimStyle.Render("  Восстановление заменяет конфигурацию целиком, снапшот создаётся автоматически"),
 		"",
 		titleStyle.Render("Настройки (экран 6)"),

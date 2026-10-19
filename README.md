@@ -369,6 +369,15 @@ daemon always agree — the daemon is the single source of truth.
 Run `mdns` with no arguments (opens the TUI when the daemon socket
 answers, prints a hint otherwise) or `mdns tui --socket <path>`:
 
+The interface is a shell: a header with the domain and connection state,
+a left navigation rail and a footer naming the keys of the active screen.
+From 100 columns the rail shows the full section names; at 64–99 columns
+it collapses to numbers and two-letter labels (`Ст`, `Ви`, `За`, `Up`,
+`Фи`, `На`, `Ди`, `Об`), which leaves 69 content columns on an 80-column
+terminal; below 64 columns the numeric tab line is the fallback. Digits
+`1`–`8` select a section in every mode, and a copper marker slides to the
+active row in ≤150 ms.
+
 - **1 Статус** — domain, listeners, ready-to-use links, upstream health,
   cache counters and the certificate state.
 - **2 Визард** — the setup wizard running against the live daemon
@@ -383,34 +392,48 @@ answers, prints a hint otherwise) or `mdns tui --socket <path>`:
   while a filter is set the line above the table shows how many of how
   many entries match.
 - **4 Upstream'ы** — per-upstream state, EWMA latency, sent/failed;
-  `a` adds a provider endpoint from the catalog, `c` a custom one (ID,
-  transport, address, SNI for DoT/DoQ by IP, priority), `space` toggles,
-  `d` removes, `p` edits the priority, `s` cycles the strategy, `t`
-  probes the selected upstream.
-- **5 Фильтры** — per-list state; `a` opens the ready-made list catalog,
-  `c` adds a custom https list, `d` removes the selected list, `e`
-  toggles filtering, `r` adds a user rule (`block domain` /
-  `allow domain`), `enter` refreshes the list under the cursor, `u` —
-  all lists, `m` cycles the block mode.
+  `a` adds a provider endpoint from a two-pane catalog (choices left,
+  details right), `c` a custom one (ID, transport, address, SNI for
+  DoT/DoQ by IP, priority) with the transport picked from a list,
+  `space` toggles, `d` removes, `p` edits the priority, `s` picks the
+  routing strategy from a list (fastest, failover, round_robin, random)
+  with a description of each choice, `t` probes the selected upstream.
+- **5 Фильтры** — per-list state; `a` opens the ready-made list catalog
+  (two panes: name, category, description and installed state), `c` adds
+  a custom https list, `d` removes the selected list, `e` toggles
+  filtering, `r` adds a user rule (`block domain` / `allow domain`),
+  `enter` refreshes the list under the cursor, `u` — all lists, `m`
+  picks the block mode from a list (zero/nxdomain/refused) instead of
+  cycling it.
 - **6 Настройки** — the key config fields in place (including the
   display timezone, the DoH path and the block-list refresh interval);
-  `enter` edits or toggles, `ctrl+s` applies (`w` opens the wizard).
+  `enter` edits or toggles, the timezone opens a list of zones showing
+  each zone's current local time and UTC offset (plus «Своё…» for a
+  custom zone), `s` picks the strategy from the same list, `ctrl+s`
+  applies (`w` opens the wizard).
 - **7 Диагностика** — the self-check over the daemon API, without
   leaving the terminal: config round-trip, listeners against the config,
   certificate, upstream probes, block lists and version, each marked ✓
   (passing), ! (warning) or ✗ (failure). This is the daemon-side part of
   `mdns diag`; the filesystem checks (data directory, systemd unit) stay
   with the CLI.
-- **8 Обслуживание** — config backups (list, create, restore, delete; a
-  restore replaces the config entirely, including the panel password and
-  DoH state, and snapshots the current config first) and changing the
-  admin password with a masked two-step prompt (argon2id hash). `j/k`
-  selects a snapshot, `c` creates one, `enter` restores it, `d` deletes
-  it, `p` changes the panel password and `r` reloads the list.
+- **8 Обслуживание** — the daemon version and uptime (from the stats
+  start time) above the table; config backups (list, create, restore,
+  delete; a restore replaces the config entirely, including the panel
+  password and DoH state, and snapshots the current config first) and
+  changing the admin password with a masked two-step prompt (argon2id
+  hash). `j/k` selects a snapshot, `c` creates one, `enter` restores it,
+  `d` deletes it, `a` re-applies the current configuration unchanged
+  (fetch and apply, the panel's maintenance action), `p` changes the
+  panel password and `r` reloads the list.
 
-`?` opens the key reference as an overlay (`esc` returns), `q` quits,
-`r` reloads the active screen's data (on screen 5 it adds a user rule
-instead), digits switch screens.
+Every enumeration opens a two-pane picker: the provider and filter
+catalogs, the custom upstream's transport, the routing strategy, the
+block mode and the timezone. The left pane is the choice list, the
+right one describes the highlighted row; `enter` acts on it and `esc`
+returns. `?` opens the key reference as an overlay (`esc` returns), `q`
+quits, `r` reloads the active screen's data (on screen 5 it adds a user
+rule instead), digits switch screens.
 
 ### First-run wizard
 

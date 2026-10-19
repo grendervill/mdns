@@ -29,8 +29,10 @@ type picker struct {
 const pickerHint = "j/k — выбор · enter — выбрать · esc — назад"
 
 // pickerStackWidth is the content width below which the list and the
-// details stack vertically instead of sitting side by side.
-const pickerStackWidth = 72
+// details stack vertically instead of sitting side by side. An 80-column
+// terminal with the compact rail leaves 69 content columns, so the
+// two-pane layout has to survive down to 68.
+const pickerStackWidth = 68
 
 // pickerSelectedStyle marks the highlighted row of a picker.
 var pickerSelectedStyle = lipgloss.NewStyle().
@@ -352,7 +354,7 @@ func (m Model) pickerContentWidth() int {
 		return 100
 	}
 	if m.railVisible() {
-		w := m.width - railWidth - 1 - paneStyle.GetHorizontalFrameSize()
+		w := m.width - m.railColumnWidth() - 1 - paneStyle.GetHorizontalFrameSize()
 		if w < 20 {
 			w = 20
 		}

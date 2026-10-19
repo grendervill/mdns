@@ -40,6 +40,7 @@ type Client interface {
 	Providers(ctx context.Context) ([]providers.Provider, error)
 	Probe(ctx context.Context, eps []providers.Endpoint) ([]probe.Result, error)
 	Requests(ctx context.Context, n int) ([]qlog.Entry, error)
+	Stats(ctx context.Context) (api.StatsResponse, error)
 	FilterStatus(ctx context.Context) ([]filter.ListStatus, error)
 	FilterUpdate(ctx context.Context, id string) error
 	Backups(ctx context.Context) ([]BackupInfo, error)
@@ -121,6 +122,14 @@ func (c *UnixClient) Requests(ctx context.Context, n int) ([]qlog.Entry, error) 
 	var out []qlog.Entry
 	err := c.do(ctx, http.MethodGet, fmt.Sprintf("/api/v1/requests?n=%d", n), nil, &out)
 	return out, err
+}
+
+// Stats implements Client: the cumulative counters plus the daemon start
+// time, which the maintenance screen renders as uptime.
+func (c *UnixClient) Stats(ctx context.Context) (api.StatsResponse, error) {
+	var st api.StatsResponse
+	err := c.do(ctx, http.MethodGet, "/api/v1/stats", nil, &st)
+	return st, err
 }
 
 // FilterStatus implements Client.
