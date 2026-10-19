@@ -876,7 +876,11 @@ func (m Model) View() string {
 
 	if m.width > 0 {
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"))
+		footer := "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
+		if m.screen == screenFilters {
+			footer = "q — выход · r — правило · enter/u — обновить · ? — помощь · ↑↓ — прокрутка"
+		}
+		b.WriteString(dimStyle.Render(footer))
 	}
 	return b.String()
 }
