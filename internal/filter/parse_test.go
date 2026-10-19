@@ -38,6 +38,23 @@ func TestParse(t *testing.T) {
 			skipped: 3,
 		},
 		{
+			name:    "domain-scoped cosmetic rules are not host blocks",
+			in:      "ya.ru##.banner\nya.ru#@#.ad\nya.ru#?#.x\nya.ru#$#.y\nya.ru##body > div\ngood.example\n",
+			block:   []string{"good.example"},
+			applied: 1,
+			skipped: 5,
+		},
+		{
+			name:    "hosts line with an inline comment",
+			in:      "0.0.0.0 ads.x.com # tracker\n127.0.0.1 tracker.example # note",
+			block:   []string{"ads.x.com", "tracker.example"},
+			applied: 2,
+		},
+		{
+			name: "a bang comment containing a cosmetic marker",
+			in:   "! upstream list uses ##.banner\n",
+		},
+		{
 			name:    "hosts zero",
 			in:      "0.0.0.0 ads.x.com",
 			block:   []string{"ads.x.com"},

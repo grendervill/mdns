@@ -21,6 +21,29 @@ var hostIPs = map[string]bool{
 	"::1":       true,
 }
 
+// cosmeticMarkers are the adblock cosmetic-filter separators. Such rules
+// style elements in a browser and mean nothing to a DNS resolver; the
+// domain part before the marker must never be turned into a host block
+// (domain##.banner would otherwise block the whole domain).
+var cosmeticMarkers = []string{"##", "#@#", "#?#", "#@?#", "#$#", "#@$#", "#%#", "#@%#"}
+
+// cosmeticIndex reports the position of a cosmetic separator, or -1.
+// It looks at the first '#' only: inside a hosts-style trailing comment
+// ("0.0.0.0 ads.example # tracker") the rest is not a cosmetic rule.
+func cosmeticIndex(line string) int {
+	i := strings.IndexByte(line, '#')
+	if i < 0 {
+		return -1
+	}
+	rest := line[i:]
+	for _, marker := range cosmeticMarkers {
+		if strings.HasPrefix(rest, marker) {
+			return i
+		}
+	}
+	return -1
+}
+
 // Parsed is the result of parsing one list.
 type Parsed struct {
 	Block   []string // unique blocked domains, in first-seen order
@@ -67,11 +90,11 @@ func Parse(r io.Reader) (Parsed, error) {
 		if strings.HasPrefix(line, "!") {
 			return // comment
 		}
+		if cosmeticIndex(line) >= 0 {
+			out.Skipped++ // cosmetic rule: meaningless in DNS
+			return
+		}
 		if strings.HasPrefix(line, "#") {
-			if strings.HasPrefix(line, "##") || strings.HasPrefix(line, "#@#") || strings.HasPrefix(line, "#?#") {
-				out.Skipped++ // cosmetic rule: meaningless in DNS
-				return
-			}
 			return // comment
 		}
 		if i := strings.IndexByte(line, '#'); i >= 0 {
