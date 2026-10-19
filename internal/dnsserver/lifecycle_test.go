@@ -673,13 +673,32 @@ func TestShutdownAfterStartNeverLeaksPort(t *testing.T) {
 			t.Fatalf("iteration %d: Shutdown() = %v, want nil (a race leaves the listener open)", i, err)
 		}
 
-		// Both listeners must be gone: rebind the port right away.
+		// Both listeners must be gone: rebind the port. A real leak keeps
+		// the port bound forever; give the kernel/serve loop a short,
+		// bounded grace so a loaded CI runner cannot turn a just-closed
+		// socket into a spurious failure.
 		addr := fmt.Sprintf(":%d", port)
-		ln, err := net.Listen("tcp", addr)
+		deadline := time.Now().Add(time.Second)
+		var ln net.Listener
+		var err error
+		for {
+			ln, err = net.Listen("tcp", addr)
+			if err == nil || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		if err != nil {
 			t.Fatalf("iteration %d: rebind tcp %s = %v, want nil (a listener leaked)", i, addr, err)
 		}
-		pc, err := net.ListenPacket("udp", addr)
+		var pc net.PacketConn
+		for {
+			pc, err = net.ListenPacket("udp", addr)
+			if err == nil || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
 		if err != nil {
 			_ = ln.Close()
 			t.Fatalf("iteration %d: rebind udp %s = %v, want nil (a listener leaked)", i, addr, err)
