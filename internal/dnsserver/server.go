@@ -51,17 +51,24 @@ type Server struct {
 	// can be exercised on an unprivileged port.
 	alpnPort int
 
-	mu        sync.Mutex
-	started   bool
-	dotUp     bool
-	dohUp     bool
-	doqUp     bool
-	plainSrv  []*dns.Server
-	tlsSrv    []*dns.Server
-	dohLn     net.Listener
-	httpSrv   *http.Server
-	h3Srv     *http3.Server
+	mu       sync.Mutex
+	started  bool
+	dotUp    bool
+	dohUp    bool
+	doqUp    bool
+	plainSrv []*dns.Server
+	tlsSrv   []*dns.Server
+	dohLn    net.Listener
+	httpSrv  *http.Server
+	h3Srv    *http3.Server
+	// quicLn, quicTr and quicUDP are the DoQ endpoint: the listener, its
+	// transport, and the UDP socket the server bound for it. The
+	// transport only closes a socket it created itself, so the server
+	// closes quicUDP explicitly to free the DoQ port for the next
+	// generation.
 	quicLn    *quic.Listener
+	quicTr    *quic.Transport
+	quicUDP   net.PacketConn
 	challenge *http.Server
 	// challengeLn is the socket behind the ACME HTTP-01 responder. It
 	// is kept so ReleaseListeners can free the port on a runtime swap
@@ -352,10 +359,12 @@ func (s *Server) ReleaseListeners() {
 		_ = s.h3Srv.Close()
 		s.h3Srv = nil
 	}
-	if s.quicLn != nil {
-		_ = s.quicLn.Close()
-		s.quicLn = nil
-	}
+	// DoQ cannot be kept alive either: its connections share the QUIC
+	// socket, and a live connection would hold the UDP port open and
+	// stop the next generation from rebinding it, so the endpoint is
+	// closed outright. DoQ queries are short-lived, and RFC 9250
+	// clients retry on a new connection.
+	s.closeDoQLocked()
 	// The challenge listener goes too so the port is free for the next
 	// generation, but s.challenge stays up: the in-flight challenge
 	// response must remain writable. The retirement stop calls Shutdown
@@ -485,15 +494,32 @@ func (s *Server) stopDoHLocked(ctx context.Context) error {
 
 // stopDoQLocked stops the DoQ endpoint. The caller must hold s.mu.
 func (s *Server) stopDoQLocked(ctx context.Context) error {
-	var firstErr error
+	s.closeDoQLocked()
+	s.doqUp = false
+	return nil
+}
+
+// closeDoQLocked closes the DoQ endpoint and drops its live connections.
+// The listener goes first, so a pending Accept returns quic.ErrServerClosed
+// instead of the transport's close error; then the transport, which drops
+// every live connection; and finally the UDP socket, which the transport
+// does not own because the server bound it. Every Close tolerates an
+// already-closed endpoint, so the call is idempotent: ReleaseListeners
+// releases the socket on a swap and the retirement Shutdown finds nothing
+// left, without a warning. The caller must hold s.mu.
+func (s *Server) closeDoQLocked() {
 	if s.quicLn != nil {
-		if err := s.quicLn.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		_ = s.quicLn.Close()
 		s.quicLn = nil
 	}
-	s.doqUp = false
-	return firstErr
+	if s.quicTr != nil {
+		_ = s.quicTr.Close()
+		s.quicTr = nil
+	}
+	if s.quicUDP != nil {
+		_ = s.quicUDP.Close()
+		s.quicUDP = nil
+	}
 }
 
 // stopChallengeLocked stops the ACME HTTP-01 responder if one runs.

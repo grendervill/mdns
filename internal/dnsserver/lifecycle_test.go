@@ -983,6 +983,81 @@ func TestReleaseListenersAllProtocols(t *testing.T) {
 	assertAllProtocolsAnswer(t, cfg, "after ReleaseListeners")
 }
 
+// TestReleaseListenersDropsLiveDoQConnections covers the DoQ side of the
+// async swap. A live QUIC connection shares the UDP socket, so closing
+// only the listener would leave the port bound and the next generation
+// could not start DoQ, which fails and rolls the swap back. The live
+// connection is dropped instead — DoQ queries are short-lived, and
+// RFC 9250 clients retry on a new connection — so the socket is freed and
+// a second server binds the same port and answers a fresh query on it.
+func TestReleaseListenersDropsLiveDoQConnections(t *testing.T) {
+	port := freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		DoQ: config.Protocol{Enabled: true, Port: port},
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := &syncBuffer{}
+	first := slog.New(slog.NewTextHandler(logs, nil))
+
+	// doqClient builds a DoQ client for the test port and closes it
+	// after the test.
+	doqClient := func() transport.Transport {
+		t.Helper()
+		tr, err := transport.New(config.UpstreamConfig{
+			ID:                 "probe",
+			Name:               "probe",
+			Transport:          "doq",
+			Address:            loopback(port),
+			ServerName:         cfg.Domain,
+			InsecureSkipVerify: true, // self-signed test certificate
+			Enabled:            true,
+		})
+		if err != nil {
+			t.Fatalf("transport.New(doq) = %v, want nil", err)
+		}
+		t.Cleanup(func() { _ = tr.Close() })
+		return tr
+	}
+
+	// exchange sends one query and requires a NOERROR reply with one
+	// answer, tagging failures with when.
+	exchange := func(tr transport.Transport, when string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		resp, err := tr.Exchange(ctx, queryMsg("example.com"))
+		if err != nil {
+			t.Fatalf("DoQ %s: Exchange() = %v, want nil", when, err)
+		}
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Fatalf("DoQ %s: reply rcode %d with %d answers, want NOERROR with 1",
+				when, resp.Rcode, len(resp.Answer))
+		}
+	}
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), first)
+	start(t, srv)
+
+	// One connection stays live in the first client across the swap.
+	exchange(doqClient(), "on the first generation")
+
+	srv.ReleaseListeners()
+
+	// The live connection no longer holds the socket: the same port
+	// binds again and answers a fresh connection.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv2)
+	exchange(doqClient(), "after ReleaseListeners")
+
+	// Dropping the live connection is a normal swap, not a failure.
+	if got := logs.String(); strings.Contains(got, "DoQ accept failed") {
+		t.Errorf("log = %q, want no \"DoQ accept failed\" warning after ReleaseListeners", got)
+	}
+}
+
 // assertAllProtocolsAnswer checks one NOERROR reply carrying one answer
 // on every protocol enabled in cfg, tagging failures with when.
 func assertAllProtocolsAnswer(t *testing.T, cfg *config.Config, when string) {
