@@ -19,6 +19,8 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/filter"
 	"mydns/internal/links"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 	"mydns/internal/tlscert"
@@ -71,6 +73,8 @@ func (c *statusCtrl) Started() time.Time { return time.Time{} }
 func (c *statusCtrl) FilterStatus() []filter.ListStatus { return nil }
 
 func (c *statusCtrl) FilterUpdate(context.Context, string) error { return nil }
+
+func (c *statusCtrl) Probe(context.Context, []providers.Endpoint) []probe.Result { return nil }
 
 // Requests returns the newest n entries, oldest first — the contract the
 // real daemon has (qlog.Log.Recent).

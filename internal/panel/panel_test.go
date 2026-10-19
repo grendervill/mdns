@@ -23,6 +23,8 @@ import (
 	"mydns/internal/config"
 	"mydns/internal/filter"
 	"mydns/internal/panel"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -63,6 +65,10 @@ func (f *fakeController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int)
 func (f *fakeController) FilterStatus() []filter.ListStatus { return nil }
 
 func (f *fakeController) FilterUpdate(context.Context, string) error { return nil }
+
+func (f *fakeController) Probe(context.Context, []providers.Endpoint) []probe.Result {
+	return nil
+}
 
 // discardLogger drops every log line the panel writes.
 func discardLogger() *slog.Logger {

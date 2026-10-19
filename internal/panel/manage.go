@@ -294,6 +294,37 @@ type upstreamsView struct {
 	Endpoints       []endpointOption
 	Upstreams       []upstreamRow
 	TrustProviders  []trustRow
+
+	// Custom-form state, echoed so a rejected or probed submission does
+	// not make the operator retype the upstream.
+	FormID         string
+	FormName       string
+	FormTransport  string
+	FormAddress    string
+	FormServerName string
+	FormPriority   string
+}
+
+// upstreamForm is the state of the custom-upstream form.
+type upstreamForm struct {
+	ID         string
+	Name       string
+	Transport  string
+	Address    string
+	ServerName string
+	Priority   string
+}
+
+// upstreamFormFromRequest reads the custom form's fields.
+func upstreamFormFromRequest(r *http.Request) upstreamForm {
+	return upstreamForm{
+		ID:         strings.TrimSpace(r.PostFormValue("id")),
+		Name:       strings.TrimSpace(r.PostFormValue("name")),
+		Transport:  strings.TrimSpace(r.PostFormValue("transport")),
+		Address:    strings.TrimSpace(r.PostFormValue("address")),
+		ServerName: strings.TrimSpace(r.PostFormValue("server_name")),
+		Priority:   strings.TrimSpace(r.PostFormValue("priority")),
+	}
 }
 
 // upstreamRowFor renders one upstream: the config supplies the identity
@@ -343,6 +374,12 @@ func (p *Panel) handleUpstreams(w http.ResponseWriter, r *http.Request) {
 
 // renderUpstreams renders the page from the live config and status.
 func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status int, n manageNotice) {
+	p.renderUpstreamsForm(w, r, status, n, upstreamForm{})
+}
+
+// renderUpstreamsForm renders the page with an explicit custom-form
+// state, so a rejected or probed submission can echo what was typed.
+func (p *Panel) renderUpstreamsForm(w http.ResponseWriter, r *http.Request, status int, n manageNotice, form upstreamForm) {
 	view := upstreamsView{
 		manageNotice:   n,
 		Domain:         p.pageDomain(),
@@ -350,6 +387,12 @@ func (p *Panel) renderUpstreams(w http.ResponseWriter, r *http.Request, status i
 		Nav:            "upstreams",
 		Endpoints:      endpointOptions(),
 		TrustProviders: providerTrustRows(),
+		FormID:         form.ID,
+		FormName:       form.Name,
+		FormTransport:  form.Transport,
+		FormAddress:    form.Address,
+		FormServerName: form.ServerName,
+		FormPriority:   form.Priority,
 	}
 
 	strategy := ""
@@ -726,6 +769,69 @@ func (p *Panel) handleUpstreamCustom(w http.ResponseWriter, r *http.Request) {
 	p.finishApply(w, r, next, upstreamsPath+"?ok=upstream-added", func(status int, n manageNotice) {
 		p.renderUpstreams(w, r, status, n)
 	})
+}
+
+// probeBudget bounds one upstream probe. The DoH listener's write
+// timeout is 10 s, so 5 s leaves room to render the result.
+const probeBudget = 5 * time.Second
+
+// handleUpstreamProbe checks one hand-written upstream without saving
+// it. It never touches the config: the operator sees the latency (or
+// the failure) and can still press «Добавить upstream» afterwards, since
+// an upstream may legitimately be down at configuration time.
+func (p *Panel) handleUpstreamProbe(w http.ResponseWriter, r *http.Request) {
+	cfg := p.currentConfig()
+	if cfg == nil {
+		p.renderUpstreams(w, r, http.StatusBadRequest, manageNotice{Error: errNoDaemon.Error()})
+		return
+	}
+
+	form := upstreamFormFromRequest(r)
+	ep, err := probeEndpoint(form)
+	if err != nil {
+		p.renderUpstreamsForm(w, r, http.StatusBadRequest, manageNotice{Error: err.Error()}, form)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), probeBudget)
+	defer cancel()
+	results := p.ctrl.Probe(ctx, []providers.Endpoint{ep})
+
+	var n manageNotice
+	switch {
+	case len(results) == 0:
+		n.Error = "Нет ответа: проверка не дала результата"
+	case results[0].Err != "":
+		n.Error = "Нет ответа: " + results[0].Err
+	default:
+		rcode := results[0].Rcode
+		if rcode == "" {
+			rcode = "NOERROR"
+		}
+		latency := formatMS(float64(results[0].Latency) / float64(time.Millisecond))
+		n.OK = fmt.Sprintf("Отвечает: %s, rcode %s", latency, rcode)
+	}
+	p.renderUpstreamsForm(w, r, http.StatusOK, n, form)
+}
+
+// probeEndpoint turns the custom form into the single endpoint to probe.
+// It rejects an empty or unknown transport and an empty address before
+// the controller is called, so a malformed form never starts a probe.
+func probeEndpoint(form upstreamForm) (providers.Endpoint, error) {
+	if form.Transport == "" {
+		return providers.Endpoint{}, errors.New("выберите транспорт")
+	}
+	if !knownTransport(form.Transport) {
+		return providers.Endpoint{}, fmt.Errorf("неизвестный транспорт: %s", form.Transport)
+	}
+	if form.Address == "" {
+		return providers.Endpoint{}, errors.New("укажите адрес upstream")
+	}
+	return providers.Endpoint{
+		Transport:  form.Transport,
+		Address:    form.Address,
+		ServerName: form.ServerName,
+	}, nil
 }
 
 // handleUpstreamRemove drops one upstream. Removing the last enabled one

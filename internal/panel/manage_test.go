@@ -18,6 +18,8 @@ import (
 	"mydns/internal/auth"
 	"mydns/internal/config"
 	"mydns/internal/filter"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 	"mydns/internal/tlscert"
@@ -72,6 +74,11 @@ type manageCtrl struct {
 	// refresh while it is still in flight.
 	refreshStarted chan string
 	refreshGate    <-chan struct{}
+
+	// probeResults is what Probe returns; probeCalls records every
+	// endpoint set it was asked to check.
+	probeResults []probe.Result
+	probeCalls   [][]providers.Endpoint
 
 	started time.Time
 }
@@ -140,6 +147,22 @@ func (c *manageCtrl) FilterUpdate(_ context.Context, id string) error {
 }
 
 func (c *manageCtrl) Started() time.Time { return c.started }
+
+// Probe records the requested endpoints and returns the scripted
+// results, so a test can assert exactly what the page probed.
+func (c *manageCtrl) Probe(_ context.Context, eps []providers.Endpoint) []probe.Result {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.probeCalls = append(c.probeCalls, append([]providers.Endpoint(nil), eps...))
+	return append([]probe.Result(nil), c.probeResults...)
+}
+
+// probed returns the endpoint sets Probe was called with.
+func (c *manageCtrl) probed() [][]providers.Endpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]providers.Endpoint(nil), c.probeCalls...)
+}
 
 // sent returns the configs UpdateConfig accepted, oldest first.
 func (c *manageCtrl) sent() []*config.Config {
@@ -634,6 +657,150 @@ func TestUpstreamCustom(t *testing.T) {
 		}
 		if len(ctrl.sent()) != 2 {
 			t.Error("a duplicate id reached UpdateConfig")
+		}
+	})
+}
+
+// TestUpstreamProbe covers the pre-save check: a successful probe shows
+// the latency and rcode, a failure shows the reason, both echo the form,
+// the probe never touches the config, and the upstream can still be saved
+// after a failure.
+func TestUpstreamProbe(t *testing.T) {
+	customForm := func() url.Values {
+		return url.Values{
+			"id": {"my-dns"}, "name": {"My DNS"}, "transport": {"dot"},
+			"address": {"10.0.0.1:853"}, "server_name": {"dns.internal"}, "priority": {"5"},
+		}
+	}
+
+	t.Run("success renders the latency and rcode", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Latency:  84 * time.Millisecond,
+			Rcode:    "NOERROR",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Отвечает: 84 мс, rcode NOERROR") {
+			t.Errorf("the success notice is missing:\n%s", body)
+		}
+		for _, want := range []string{
+			`name="id" value="my-dns"`,
+			`name="name" value="My DNS"`,
+			`name="address" value="10.0.0.1:853"`,
+			`name="server_name" value="dns.internal"`,
+			`name="priority" value="5"`,
+			`<option value="dot" selected>`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("the form did not echo %q", want)
+			}
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("the probe applied a config")
+		}
+		probed := ctrl.probed()
+		if len(probed) != 1 || len(probed[0]) != 1 {
+			t.Fatalf("Probe calls = %v, want one endpoint", probed)
+		}
+		ep := probed[0][0]
+		if ep.Transport != "dot" || ep.Address != "10.0.0.1:853" || ep.ServerName != "dns.internal" {
+			t.Errorf("probed endpoint = %+v", ep)
+		}
+	})
+
+	t.Run("failure renders the reason", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Err:      "dial tcp 10.0.0.1:853: connection refused",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Нет ответа: dial tcp 10.0.0.1:853: connection refused") {
+			t.Errorf("the failure notice is missing:\n%s", body)
+		}
+		if !strings.Contains(body, `name="address" value="10.0.0.1:853"`) {
+			t.Error("the form values were not echoed after the failure")
+		}
+		if len(ctrl.sent()) != 0 {
+			t.Error("a failed probe applied a config")
+		}
+	})
+
+	t.Run("a failed probe can still be saved", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Err: "timeout",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/custom", customForm())
+		wantRedirect(t, resp, "/panel/upstreams?ok=upstream-added")
+		if sent := ctrl.sent(); len(sent) != 1 || sent[0].Upstreams[0].ID != "my-dns" {
+			t.Errorf("the upstream was not saved after a failed probe: %v\n%s", sent, body)
+		}
+	})
+
+	t.Run("unknown transport is refused before probing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := customForm()
+		form.Set("transport", "bogus")
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("probe = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "неизвестный транспорт: bogus") {
+			t.Errorf("the unknown-transport message is missing:\n%s", body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("Probe ran for an unknown transport")
+		}
+	})
+
+	t.Run("empty address is refused before probing", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		form := customForm()
+		form.Set("address", "  ")
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", form)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("probe = %d, want 400\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "укажите адрес") {
+			t.Errorf("the empty-address message is missing:\n%s", body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("Probe ran with an empty address")
+		}
+	})
+
+	t.Run("csrf is required", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := rawPOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("probe without a token = %d, want 403\n%s", resp.StatusCode, body)
+		}
+		if len(ctrl.probed()) != 0 {
+			t.Error("a CSRF-less request reached Probe")
 		}
 	})
 }

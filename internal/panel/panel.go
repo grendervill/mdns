@@ -18,6 +18,8 @@ import (
 	"mydns/internal/auth"
 	"mydns/internal/config"
 	"mydns/internal/filter"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -75,6 +77,10 @@ type Controller interface {
 	FilterStatus() []filter.ListStatus
 	// FilterUpdate reloads one block list, or every list when id is "".
 	FilterUpdate(ctx context.Context, id string) error
+	// Probe measures the given endpoints and returns one result per
+	// endpoint, in input order; failures land in each result, never as
+	// an error.
+	Probe(ctx context.Context, eps []providers.Endpoint) []probe.Result
 }
 
 // Options configure a Panel. Zero values are safe: Sessions and
@@ -318,6 +324,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.Handle("POST /panel/upstreams/strategy", p.requireSession(http.HandlerFunc(p.handleUpstreamStrategy)))
 	mux.Handle("POST /panel/upstreams/add", p.requireSession(http.HandlerFunc(p.handleUpstreamAdd)))
 	mux.Handle("POST /panel/upstreams/custom", p.requireSession(http.HandlerFunc(p.handleUpstreamCustom)))
+	mux.Handle("POST /panel/upstreams/probe", p.requireSession(http.HandlerFunc(p.handleUpstreamProbe)))
 	mux.Handle("POST /panel/upstreams/remove", p.requireSession(http.HandlerFunc(p.handleUpstreamRemove)))
 
 	mux.Handle("GET /panel/filters", p.requireSession(http.HandlerFunc(p.handleFilters)))

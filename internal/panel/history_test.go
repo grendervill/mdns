@@ -13,6 +13,8 @@ import (
 	"mydns/internal/api"
 	"mydns/internal/config"
 	"mydns/internal/filter"
+	"mydns/internal/probe"
+	"mydns/internal/providers"
 	"mydns/internal/qlog"
 	"mydns/internal/stats"
 )
@@ -67,6 +69,8 @@ func (c *historyCtrl) Started() time.Time { return time.Time{} }
 func (c *historyCtrl) FilterStatus() []filter.ListStatus { return nil }
 
 func (c *historyCtrl) FilterUpdate(context.Context, string) error { return nil }
+
+func (c *historyCtrl) Probe(context.Context, []providers.Endpoint) []probe.Result { return nil }
 
 func (c *historyCtrl) Requests(n int) []qlog.Entry { return c.ring.Recent(n) }
 
