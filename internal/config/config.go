@@ -30,9 +30,11 @@ const DefaultDoHPath = "/dns-query"
 // handler is mounted on, an obfuscation that sheds scanner noise, not
 // authentication.
 type Protocol struct {
-	Enabled bool   `json:"enabled"`
-	Port    int    `json:"port"`
-	Path    string `json:"path,omitempty"`
+	Enabled bool `json:"enabled"`
+	Port    int  `json:"port"`
+	// Path is the DoH endpoint path; only protocols.doh uses it, and
+	// Validate rejects it on the other protocols.
+	Path string `json:"path,omitempty"`
 }
 
 // Protocols groups the listener protocols.
@@ -339,6 +341,9 @@ func (c *Config) Validate() error {
 		{"dot", c.Protocols.DoT},
 		{"doq", c.Protocols.DoQ},
 	} {
+		if p.name != "doh" && p.proto.Path != "" {
+			return fmt.Errorf("protocols.%s: path is only valid for doh", p.name)
+		}
 		if !p.proto.Enabled {
 			continue // a disabled protocol's port is irrelevant
 		}
@@ -470,6 +475,11 @@ func validateDoHPath(path string) error {
 	}
 	if !dohPathPattern.MatchString(path) {
 		return fmt.Errorf("protocols.doh: path %q must be one segment like %s", path, DefaultDoHPath)
+	}
+	if path == "/." || path == "/.." {
+		// http.ServeMux would clean these to "/" and the endpoint would
+		// never be reachable under the configured path.
+		return fmt.Errorf("protocols.doh: path %q must not be \".\" or \"..\"", path)
 	}
 	for _, reserved := range reservedPanelPaths {
 		if path == reserved || strings.HasPrefix(path, reserved+"/") {

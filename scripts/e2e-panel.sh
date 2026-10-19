@@ -3,7 +3,8 @@
 #
 # The panel is a browser surface: the Go handler tests prove the routes and
 # the templates, but only a real browser can prove the login flow, the
-# chart tooltip, the live feed over SSE and the phone layout. This test
+# chart tooltip, the live feed and the live request screen over SSE, and the
+# phone layout. This test
 # installs mdns inside a real systemd container with the same download-mode
 # one-liner a user runs, then drives a real Chromium on the host against
 # https://127.0.0.1:8443 (the container's DoH/panel port 443, published

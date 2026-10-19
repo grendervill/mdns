@@ -816,6 +816,26 @@ func TestUpstreamProbe(t *testing.T) {
 		}
 	})
 
+	t.Run("an error rcode is reported as an answered error", func(t *testing.T) {
+		cfg := manageConfig(t)
+		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
+			Endpoint: providers.Endpoint{Transport: "dot", Address: "10.0.0.1:853"},
+			Err:      "unexpected reply: SERVFAIL",
+		}}}
+		p, srv := managePanel(t, ctrl)
+
+		resp, body := managePOST(t, p, srv, "/panel/upstreams/probe", customForm())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("probe = %d, want 200\n%s", resp.StatusCode, body)
+		}
+		if !strings.Contains(body, "Ответил ошибкой: SERVFAIL") {
+			t.Errorf("the answered-error notice is missing:\n%s", body)
+		}
+		if strings.Contains(body, "Нет ответа: unexpected reply") {
+			t.Errorf("an answered error was reported as no answer:\n%s", body)
+		}
+	})
+
 	t.Run("a failed probe can still be saved", func(t *testing.T) {
 		cfg := manageConfig(t)
 		ctrl := &manageCtrl{cfg: cfg, probeResults: []probe.Result{{
@@ -2238,9 +2258,9 @@ func TestManagePagesSharedShell(t *testing.T) {
 	}
 	p, srv := managePanel(t, ctrl)
 
-	pages := []string{"/panel/upstreams", "/panel/filters", "/panel/settings", "/panel/cert", "/panel/maintenance"}
+	pages := []string{"/panel/live", "/panel/upstreams", "/panel/filters", "/panel/settings", "/panel/cert", "/panel/maintenance"}
 	rail := []string{
-		`href="/panel/"`, `href="/panel/history"`, `href="/panel/upstreams"`,
+		`href="/panel/"`, `href="/panel/live"`, `href="/panel/history"`, `href="/panel/upstreams"`,
 		`href="/panel/filters"`, `href="/panel/cert"`, `href="/panel/settings"`,
 		`href="/panel/maintenance"`, `action="/logout"`,
 	}

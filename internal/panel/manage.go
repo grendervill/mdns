@@ -808,7 +808,11 @@ func (p *Panel) handleUpstreamProbe(w http.ResponseWriter, r *http.Request) {
 	case len(results) == 0:
 		n.Error = "Нет ответа: проверка не дала результата"
 	case results[0].Err != "":
-		n.Error = "Нет ответа: " + results[0].Err
+		if strings.HasPrefix(results[0].Err, "unexpected reply: ") {
+			n.Error = "Ответил ошибкой: " + strings.TrimPrefix(results[0].Err, "unexpected reply: ")
+		} else {
+			n.Error = "Нет ответа: " + results[0].Err
+		}
 	default:
 		rcode := results[0].Rcode
 		if rcode == "" {

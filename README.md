@@ -451,10 +451,11 @@ the error.
 
 ## Web panel
 
-The web panel is the browser face of the daemon: status, query history,
-upstreams, filters, certificate state, settings and maintenance. It
-opens no port of its own — the daemon mounts it on the DoH listener next
-to `/dns-query`, on the same TLS endpoint:
+The web panel is the browser face of the daemon: status, live request
+screen, query history, upstreams, filters, certificate state, settings
+and maintenance. It opens no port of its own — the daemon mounts it on
+the DoH listener next to the configured DoH path (`/dns-query` by
+default), on the same TLS endpoint:
 
 ```text
 https://dns.example.com/
@@ -486,8 +487,9 @@ included, so a scan cannot tell that a panel exists.
 
 ### Pages
 
-All pages are server-rendered; there is no framework — one small script
-drives the chart tooltip, the live feed and the live screen.
+All pages are server-rendered; there is no framework — two small scripts
+(`app.js` and `live.js`) drive the chart tooltip, the live feed and the
+live screen.
 
 - **Статус** (`/panel/`) — four all-time gauges (queries total, cache
   hit rate and entries, blocked share, fastest healthy upstream), a

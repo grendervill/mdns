@@ -33,9 +33,10 @@ const (
 	dohMaxHeaderBytes    = 16 << 10
 )
 
-// Panel is the optional admin web UI mounted on the DoH listener next
-// to /dns-query. *panel.Panel implements it; the interface keeps the
-// dns package free of a dependency on the panel's own imports.
+// Panel is the optional admin web UI mounted on the DoH listener at the
+// configured DoH path's sibling routes (/ and /panel/...). *panel.Panel
+// implements it; the interface keeps the dns package free of a dependency
+// on the panel's own imports.
 type Panel interface {
 	Mount(mux *http.ServeMux)
 }

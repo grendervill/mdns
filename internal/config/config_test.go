@@ -211,6 +211,21 @@ func TestValidateTable(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "doh path dot segment",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/." },
+			wantErr: true,
+		},
+		{
+			name:    "doh path dotdot segment",
+			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/.." },
+			wantErr: true,
+		},
+		{
+			name:    "path on a non-doh protocol",
+			mutate:  func(c *config.Config) { c.Protocols.Plain.Path = "/dns-query" },
+			wantErr: true,
+		},
+		{
 			name:    "doh path too long",
 			mutate:  func(c *config.Config) { c.Protocols.DoH.Path = "/" + strings.Repeat("a", 65) },
 			wantErr: true,
