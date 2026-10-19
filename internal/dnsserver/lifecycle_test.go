@@ -30,6 +30,7 @@ import (
 	"mydns/internal/routing"
 	"mydns/internal/testutil/dnsfake"
 	"mydns/internal/tlscert"
+	"mydns/internal/transport"
 	"mydns/internal/upstream"
 )
 
@@ -940,6 +941,131 @@ func TestReleaseListenersFreesPortsKeepsResponses(t *testing.T) {
 
 	if got := logs.String(); strings.Contains(got, "listener stopped") {
 		t.Errorf("log = %q, want no \"listener stopped\" warning after ReleaseListeners", got)
+	}
+}
+
+// TestReleaseListenersAllProtocols covers ReleaseListeners across the
+// whole listener set: once the sockets are released, every port is free
+// again, so a second Server with the same config binds them and answers
+// on plain UDP/TCP, DoT, DoH and DoQ.
+func TestReleaseListenersAllProtocols(t *testing.T) {
+	plainPort, dotPort, dohPort, doqPort := freePort(t), freePort(t), freePort(t), freePort(t)
+	cfg := config.Default()
+	cfg.Domain = "mdns.test"
+	cfg.Protocols = config.Protocols{
+		Plain: config.Protocol{Enabled: true, Port: plainPort},
+		DoT:   config.Protocol{Enabled: true, Port: dotPort},
+		DoH:   config.Protocol{Enabled: true, Port: dohPort},
+		DoQ:   config.Protocol{Enabled: true, Port: doqPort},
+	}
+
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv)
+
+	want := []string{
+		fmt.Sprintf("plain:%d", plainPort),
+		fmt.Sprintf("doh:%d", dohPort),
+		fmt.Sprintf("dot:%d", dotPort),
+		fmt.Sprintf("doq:%d", doqPort),
+	}
+	if got := srv.Listeners(); !slices.Equal(got, want) {
+		t.Fatalf("Listeners() = %v, want %v (every protocol must be up before the release)", got, want)
+	}
+
+	srv.ReleaseListeners()
+
+	// The same config binds the same ports again: every listener was
+	// really released, not merely marked stopped.
+	srv2, _ := pipeline(t, cfg, newFakeSource(t, true), quiet)
+	start(t, srv2)
+	assertAllProtocolsAnswer(t, cfg, "after ReleaseListeners")
+}
+
+// assertAllProtocolsAnswer checks one NOERROR reply carrying one answer
+// on every protocol enabled in cfg, tagging failures with when.
+func assertAllProtocolsAnswer(t *testing.T, cfg *config.Config, when string) {
+	t.Helper()
+
+	for _, net_ := range []string{"udp", "tcp"} {
+		cl := &dns.Client{Net: net_, Timeout: 2 * time.Second}
+		resp, _, err := cl.Exchange(queryMsg("example.com"), loopback(cfg.Protocols.Plain.Port))
+		if err != nil {
+			t.Errorf("plain %s %s: Exchange() = %v, want nil", net_, when, err)
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Errorf("plain %s %s: reply rcode %d with %d answers, want NOERROR with 1",
+				net_, when, resp.Rcode, len(resp.Answer))
+		}
+	}
+
+	if resp := dotQuery(t, cfg.Protocols.DoT.Port); resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Errorf("DoT %s: reply rcode %d with %d answers, want NOERROR with 1", when, resp.Rcode, len(resp.Answer))
+	}
+
+	assertDoHAnswers(t, cfg.Protocols.DoH.Port, when)
+
+	tr, err := transport.New(config.UpstreamConfig{
+		ID:                 "probe",
+		Name:               "probe",
+		Transport:          "doq",
+		Address:            loopback(cfg.Protocols.DoQ.Port),
+		ServerName:         cfg.Domain,
+		InsecureSkipVerify: true, // self-signed test certificate
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("transport.New(doq) = %v, want nil", err)
+	}
+	defer func() { _ = tr.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := tr.Exchange(ctx, queryMsg("example.com"))
+	if err != nil {
+		t.Errorf("DoQ %s: Exchange() = %v, want nil", when, err)
+	} else if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+		t.Errorf("DoQ %s: reply rcode %d with %d answers, want NOERROR with 1", when, resp.Rcode, len(resp.Answer))
+	}
+}
+
+// assertDoHAnswers POSTs one query to the DoH endpoint and checks the
+// wire-format reply, tagging failures with when.
+func assertDoHAnswers(t *testing.T, port int, when string) {
+	t.Helper()
+
+	packed, err := queryMsg("example.com").Pack()
+	if err != nil {
+		t.Fatalf("Pack() = %v, want nil", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("https://127.0.0.1:%d/dns-query", port), bytes.NewReader(packed))
+	if err != nil {
+		t.Fatalf("NewRequest() = %v, want nil", err)
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+
+	resp, err := dohClient().Do(req)
+	if err != nil {
+		t.Errorf("DoH %s: Do() = %v, want nil", when, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("DoH %s: status = %d, want 200", when, resp.StatusCode)
+		return
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll(body) = %v, want nil", err)
+	}
+	m := new(dns.Msg)
+	if err := m.Unpack(body); err != nil {
+		t.Fatalf("Unpack(body) = %v, want nil", err)
+	}
+	if m.Rcode != dns.RcodeSuccess || len(m.Answer) != 1 {
+		t.Errorf("DoH %s: reply rcode %d with %d answers, want NOERROR with 1", when, m.Rcode, len(m.Answer))
 	}
 }
 
