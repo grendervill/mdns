@@ -13,6 +13,7 @@ import (
 
 	"mydns/internal/api"
 	"mydns/internal/config"
+	"mydns/internal/configbackup"
 	"mydns/internal/filter"
 	"mydns/internal/probe"
 	"mydns/internal/providers"
@@ -28,6 +29,11 @@ type stubController struct {
 	cfg     *config.Config
 	updates []*config.Config
 	filters []string
+
+	backups       []configbackup.Info
+	createdLabels []string
+	restoredNames []string
+	deletedNames  []string
 }
 
 func (s *stubController) Status(context.Context) (api.Status, error) { return s.status, nil }
@@ -49,6 +55,26 @@ func (s *stubController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int)
 func (s *stubController) FilterStatus() []filter.ListStatus { return nil }
 func (s *stubController) FilterUpdate(_ context.Context, id string) error {
 	s.filters = append(s.filters, id)
+	return nil
+}
+func (s *stubController) CreateConfigBackup(label string) error {
+	s.createdLabels = append(s.createdLabels, label)
+	s.backups = append([]configbackup.Info{{
+		Name:    "config-20261019-120000.json",
+		Size:    96,
+		ModTime: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+	}}, s.backups...)
+	return nil
+}
+func (s *stubController) ListConfigBackups() ([]configbackup.Info, error) {
+	return s.backups, nil
+}
+func (s *stubController) RestoreConfigBackup(name string) error {
+	s.restoredNames = append(s.restoredNames, name)
+	return nil
+}
+func (s *stubController) DeleteConfigBackup(name string) error {
+	s.deletedNames = append(s.deletedNames, name)
 	return nil
 }
 
@@ -207,5 +233,75 @@ func TestUnixClientErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mdns.sock") {
 		t.Errorf("error = %q, want it to mention the socket path", err.Error())
+	}
+}
+
+// TestUnixClientBackups checks the backup endpoints: the list decodes
+// the snake_case shape newest first, and each mutation reaches the
+// controller with its label or name.
+func TestUnixClientBackups(t *testing.T) {
+	newest := configbackup.Info{
+		Name:    "config-20261019-120000-manual.json",
+		Size:    128,
+		ModTime: time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+	}
+	older := configbackup.Info{
+		Name:    "config-20261018-090000-auto.json",
+		Size:    64,
+		ModTime: time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC),
+	}
+	ctl := &stubController{backups: []configbackup.Info{newest, older}}
+	sock, _ := startAPIServer(t, ctl)
+	c := tui.NewUnixClient(sock)
+	ctx := context.Background()
+
+	got, err := c.Backups(ctx)
+	if err != nil {
+		t.Fatalf("Backups() = %v, want nil", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Backups() = %d entries, want 2", len(got))
+	}
+	if got[0].Name != newest.Name || got[1].Name != older.Name {
+		t.Errorf("order = [%s %s], want newest first", got[0].Name, got[1].Name)
+	}
+	if got[0].Size != newest.Size || !got[0].ModTime.Equal(newest.ModTime) {
+		t.Errorf("head = %+v, want %+v", got[0], newest)
+	}
+
+	if err := c.CreateBackup(ctx, "manual"); err != nil {
+		t.Fatalf("CreateBackup() = %v, want nil", err)
+	}
+	if len(ctl.createdLabels) != 1 || ctl.createdLabels[0] != "manual" {
+		t.Errorf("created labels = %v, want [manual]", ctl.createdLabels)
+	}
+
+	if err := c.RestoreBackup(ctx, older.Name); err != nil {
+		t.Fatalf("RestoreBackup() = %v, want nil", err)
+	}
+	if len(ctl.restoredNames) != 1 || ctl.restoredNames[0] != older.Name {
+		t.Errorf("restored = %v, want %q", ctl.restoredNames, older.Name)
+	}
+
+	if err := c.DeleteBackup(ctx, newest.Name); err != nil {
+		t.Fatalf("DeleteBackup() = %v, want nil", err)
+	}
+	if len(ctl.deletedNames) != 1 || ctl.deletedNames[0] != newest.Name {
+		t.Errorf("deleted = %v, want %q", ctl.deletedNames, newest.Name)
+	}
+}
+
+// TestUnixClientBackupError checks a rejected mutation surfaces the
+// API's error text.
+func TestUnixClientBackupError(t *testing.T) {
+	sock, _ := startAPIServer(t, &stubController{})
+
+	c := tui.NewUnixClient(sock)
+	err := c.RestoreBackup(context.Background(), "  ")
+	if err == nil {
+		t.Fatalf("RestoreBackup(blank) = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "backup name is required") {
+		t.Errorf("error = %q, want the API's message", err.Error())
 	}
 }

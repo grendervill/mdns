@@ -43,7 +43,16 @@ type stubClient struct {
 
 	probeResults []probe.Result
 	probeFn      func(context.Context, []providers.Endpoint) ([]probe.Result, error)
+
+	backups []BackupInfo
 }
+
+func (s *stubClient) Backups(context.Context) ([]BackupInfo, error) {
+	return s.backups, nil
+}
+func (s *stubClient) CreateBackup(context.Context, string) error  { return nil }
+func (s *stubClient) RestoreBackup(context.Context, string) error { return nil }
+func (s *stubClient) DeleteBackup(context.Context, string) error  { return nil }
 
 func (s *stubClient) Status(context.Context) (api.Status, error) {
 	s.statusCalls++
