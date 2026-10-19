@@ -211,6 +211,7 @@ type upstreamCatalogEntry struct {
 	provider string // provider ID, the ID stem of a new upstream
 	name     string // provider display name
 	end      providers.Endpoint
+	trust    providers.Trust
 }
 
 // upstreamCatalogEntries lists every endpoint of every provider, in the
@@ -219,7 +220,7 @@ func upstreamCatalogEntries() []upstreamCatalogEntry {
 	var out []upstreamCatalogEntry
 	for _, p := range providers.List() {
 		for _, e := range p.AllEndpoints() {
-			out = append(out, upstreamCatalogEntry{provider: p.ID, name: p.Name, end: e})
+			out = append(out, upstreamCatalogEntry{provider: p.ID, name: p.Name, end: e, trust: p.Trust})
 		}
 	}
 	return out
@@ -439,27 +440,6 @@ func (m Model) commitUpstreamPriority() (tea.Model, tea.Cmd) {
 	return m.applyUpstreamCfg(next)
 }
 
-// cycleUpstreamStrategy advances the routing strategy and applies it.
-func (m Model) cycleUpstreamStrategy() (tea.Model, tea.Cmd) {
-	if m.upstreamCfg == nil {
-		m.upstreamErr = errors.New("конфигурация ещё не загружена")
-		return m, loadUpstreamConfig(m.client)
-	}
-	next := cloneConfig(m.upstreamCfg)
-	next.Strategy = nextStrategy(next.Strategy)
-	return m.applyUpstreamCfg(next)
-}
-
-// nextStrategy cycles fastest → failover → round_robin → random.
-func nextStrategy(current string) string {
-	for i, s := range strategyNames {
-		if s == current {
-			return strategyNames[(i+1)%len(strategyNames)]
-		}
-	}
-	return strategyNames[0]
-}
-
 // probeSelectedUpstream probes the row under the cursor without touching
 // the config.
 func (m Model) probeSelectedUpstream() (tea.Model, tea.Cmd) {
@@ -528,10 +508,10 @@ func (m Model) addCatalogEndpoint() (tea.Model, tea.Cmd) {
 		return m, loadUpstreamConfig(m.client)
 	}
 	entries := upstreamCatalogEntries()
-	if m.upstreamCatalogCursor < 0 || m.upstreamCatalogCursor >= len(entries) {
+	if m.picker.cursor < 0 || m.picker.cursor >= len(entries) {
 		return m, nil
 	}
-	e := entries[m.upstreamCatalogCursor]
+	e := entries[m.picker.cursor]
 
 	next := cloneConfig(m.upstreamCfg)
 	for _, u := range next.Upstreams {
@@ -664,7 +644,7 @@ func (m *Model) upstreamsView() string {
 		strategy = m.upstreamCfg.Strategy
 	}
 	b.WriteString(titleStyle.Render("Стратегия: " + strategy))
-	b.WriteString(dimStyle.Render("  (s — переключить: fastest → failover → round_robin → random)"))
+	b.WriteString(dimStyle.Render("  (s — выбрать из списка)"))
 	b.WriteString("\n\n")
 
 	b.WriteString(dimStyle.Render("  id           имя                   прот   адрес                  прио задержка    состояние  отправлено/ошибки"))
@@ -731,43 +711,288 @@ func (m *Model) upstreamsView() string {
 
 // upstreamCatalogView renders the provider endpoint picker.
 func (m *Model) upstreamCatalogView() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Каталог провайдеров"))
-	b.WriteString(dimStyle.Render("  (j/k — выбор, enter — добавить, esc — назад)") + "\n\n")
-
-	entries := upstreamCatalogEntries()
-	if m.upstreamCfg == nil {
-		b.WriteString(dimStyle.Render("Конфигурация загружается…") + "\n")
-		return b.String()
-	}
-
-	for i, e := range entries {
-		marker := "  "
-		if i == m.upstreamCatalogCursor {
-			marker = "> "
-		}
-		state := dimStyle.Render("нет")
-		for _, u := range m.upstreamCfg.Upstreams {
-			if u.Transport == e.end.Transport && u.Address == e.end.Address {
-				state = okStyle.Render("добавлен")
-				break
-			}
-		}
-		label := fmt.Sprintf("%s — %s · %s", e.name, transportLabel(e.end.Transport), e.end.Address)
-		line := fmt.Sprintf("%s%-10s %s", marker, state, label)
-		if i == m.upstreamCatalogCursor {
-			line = activeTabStyle.Render(line)
-		}
-		b.WriteString(line + "\n")
-	}
-
+	m.upstreamCatalogPicker()
+	out := m.pickerView(&m.picker)
 	if m.upstreamErr != nil {
-		b.WriteString("\n" + errStyle.Render(m.upstreamErr.Error()) + "\n")
+		out += "\n" + errStyle.Render(m.upstreamErr.Error())
 	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("enter — добавить endpoint (a открыл этот экран) · esc — вернуться к upstream'ам"))
-	b.WriteString("\n")
-	return b.String()
+	return out
+}
+
+// openUpstreamCatalog opens the provider picker on its first row.
+func (m *Model) openUpstreamCatalog() {
+	m.pickerReturn = screenUpstreams
+	m.picker = picker{title: "Каталог провайдеров"}
+	m.upstreamCatalogPicker()
+	m.upstreamErr = nil
+	m.screen = screenUpstreamCatalog
+	m.settleRail()
+}
+
+// upstreamCatalogPicker refreshes the picker rows from the live config,
+// keeping the cursor.
+func (m *Model) upstreamCatalogPicker() {
+	entries := upstreamCatalogEntries()
+	items := make([]pickerItem, 0, len(entries))
+	for _, e := range entries {
+		installed := m.upstreamConfigured(e.end)
+		status := ""
+		if installed {
+			status = "добавлен"
+		}
+
+		details := []string{
+			e.name,
+			"Провайдер: " + e.name + " (" + e.provider + ")",
+			"Транспорт: " + transportLabel(e.end.Transport) + " (" + e.end.Transport + ")",
+			"Адрес: " + e.end.Address,
+		}
+		if e.end.ServerName != "" {
+			details = append(details, "ServerName: "+e.end.ServerName)
+		}
+		details = append(details, "")
+		if e.trust.Label != "" {
+			details = append(details, "Доверие: "+e.trust.Label)
+		} else {
+			details = append(details, "Доверие: нет данных")
+		}
+		if e.trust.Note != "" {
+			details = append(details, e.trust.Note)
+		}
+		if e.trust.SourceURL != "" {
+			details = append(details, "Источник: "+e.trust.SourceName+" — "+e.trust.SourceURL)
+		}
+		if installed {
+			details = append(details,
+				"",
+				"Дубль: этот транспорт и адрес уже добавлены —",
+				"повторный enter будет отклонён.")
+		}
+		label := e.name + " — " + transportLabel(e.end.Transport) + " · " + e.end.Address
+		items = append(items, pickerItem{Label: label, Status: status, Details: details})
+	}
+	m.picker.setItems(items)
+}
+
+// upstreamConfigured reports whether the endpoint is already added.
+func (m *Model) upstreamConfigured(ep providers.Endpoint) bool {
+	if m.upstreamCfg == nil {
+		return false
+	}
+	for _, u := range m.upstreamCfg.Upstreams {
+		if u.Transport == ep.Transport && u.Address == ep.Address {
+			return true
+		}
+	}
+	return false
+}
+
+// strategyPickerView renders the routing-strategy picker.
+func (m *Model) strategyPickerView() string {
+	m.strategyPickerItems()
+	return m.pickerView(&m.picker)
+}
+
+// openStrategyPicker opens the strategy list on the current value.
+func (m Model) openStrategyPicker() (tea.Model, tea.Cmd) {
+	m.pickerReturn = m.screen
+	if m.pickerReturn != screenSettings {
+		m.pickerReturn = screenUpstreams
+	}
+	cfg := m.strategyConfig()
+	if cfg == nil {
+		if m.pickerReturn == screenSettings {
+			m.settingsErr = errors.New("конфигурация ещё не загружена")
+			return m, loadConfig(m.client)
+		}
+		m.upstreamErr = errors.New("конфигурация ещё не загружена")
+		return m, loadUpstreamConfig(m.client)
+	}
+	m.picker = picker{title: "Стратегия маршрутизации"}
+	m.strategyPickerItems()
+	current := cfg.Strategy
+	if current == "" {
+		current = m.status.Strategy
+	}
+	for i, name := range strategyNames {
+		if name == current {
+			m.picker.cursor = i
+		}
+	}
+	m.screen = screenStrategyPicker
+	m.settleRail()
+	return m, nil
+}
+
+// strategyConfig returns the config the strategy picker edits.
+func (m *Model) strategyConfig() *config.Config {
+	if m.pickerReturn == screenSettings {
+		return m.settingsCfg
+	}
+	return m.upstreamCfg
+}
+
+// strategyPickerItems fills the strategy rows and marks the current one.
+func (m *Model) strategyPickerItems() {
+	current := ""
+	if cfg := m.strategyConfig(); cfg != nil {
+		current = cfg.Strategy
+	}
+	if current == "" {
+		current = m.status.Strategy
+	}
+	items := make([]pickerItem, 0, len(strategyNames))
+	for _, name := range strategyNames {
+		status := ""
+		if name == current {
+			status = "сейчас"
+		}
+		items = append(items, pickerItem{
+			Label:   name,
+			Status:  status,
+			Details: strategyDetails(name),
+		})
+	}
+	m.picker.setItems(items)
+}
+
+// strategyDetails explains one routing strategy.
+func strategyDetails(name string) []string {
+	switch name {
+	case "failover":
+		return []string{
+			"Отказоустойчивость: запросы идут к первому здоровому upstream'у по приоритету (p), остальные ждут в резерве.",
+			"Предсказуемый порядок; при сбое — переключение на следующий.",
+		}
+	case "round_robin":
+		return []string{
+			"По кругу распределяет запросы между здоровыми upstream'ами.",
+			"Ровная нагрузка без учёта задержки.",
+		}
+	case "random":
+		return []string{
+			"Выбирает случайный здоровый upstream.",
+			"Простое распределение нагрузки без измерений.",
+		}
+	default:
+		return []string{
+			"Самый быстрый: выбирает upstream по измеренным задержкам и состоянию здоровья (t — проверить вручную).",
+			"Подходит для повседневного использования.",
+		}
+	}
+}
+
+// applyStrategyPick applies the highlighted strategy and returns to the
+// screen the picker was opened from.
+func (m Model) applyStrategyPick() (tea.Model, tea.Cmd) {
+	if m.picker.cursor < 0 || m.picker.cursor >= len(strategyNames) {
+		return m, nil
+	}
+	strategy := strategyNames[m.picker.cursor]
+
+	if m.pickerReturn == screenSettings {
+		m.screen = screenSettings
+		m.settleRail()
+		if m.settingsCfg == nil {
+			m.settingsErr = errors.New("конфигурация ещё не загружена")
+			return m, loadConfig(m.client)
+		}
+		next := cloneConfig(m.settingsCfg)
+		next.Strategy = strategy
+		m.settingsCfg = next
+		m.settingsErr = nil
+		return m, applySettingsCmd(m.client, cloneConfig(next))
+	}
+
+	m.screen = screenUpstreams
+	m.settleRail()
+	if m.upstreamCfg == nil {
+		m.upstreamErr = errors.New("конфигурация ещё не загружена")
+		return m, loadUpstreamConfig(m.client)
+	}
+	next := cloneConfig(m.upstreamCfg)
+	next.Strategy = strategy
+	m.upstreamErr = nil
+	return m.applyUpstreamCfg(next)
+}
+
+// transportPickerView renders the transport picker of the custom form.
+func (m *Model) transportPickerView() string {
+	m.transportPickerItems()
+	return m.pickerView(&m.picker)
+}
+
+// openTransportPicker opens the transport list on the form's value.
+func (m Model) openTransportPicker() (tea.Model, tea.Cmd) {
+	m.pickerReturn = screenUpstreamForm
+	m.picker = picker{title: "Транспорт upstream"}
+	m.transportPickerItems()
+	for i, t := range upstreamTransports {
+		if t == m.upstreamForm.Transport {
+			m.picker.cursor = i
+		}
+	}
+	m.screen = screenTransportPicker
+	m.settleRail()
+	return m, nil
+}
+
+// transportPickerItems fills the transport rows.
+func (m *Model) transportPickerItems() {
+	items := make([]pickerItem, 0, len(upstreamTransports))
+	for _, t := range upstreamTransports {
+		status := ""
+		if t == m.upstreamForm.Transport {
+			status = "сейчас"
+		}
+		items = append(items, pickerItem{
+			Label:   transportLabel(t),
+			Status:  status,
+			Details: transportDetails(t),
+		})
+	}
+	m.picker.setItems(items)
+}
+
+// transportDetails describes the address format of one transport.
+func transportDetails(transport string) []string {
+	switch transport {
+	case "dot":
+		return []string{
+			"DNS-over-TLS: адрес host:port, обычно :853.",
+			"Шифрование TLS; для адреса по IP задайте ServerName —",
+			"он уходит в SNI и проверяется по сертификату.",
+		}
+	case "doh":
+		return []string{
+			"DNS-over-HTTPS: адрес — https-URL, например",
+			"https://dns.example.com/dns-query.",
+			"ServerName не нужен: имя берётся из URL.",
+		}
+	case "doq":
+		return []string{
+			"DNS-over-QUIC: адрес host:port, обычно :853.",
+			"QUIC + TLS; для адреса по IP задайте ServerName,",
+			"он нужен для проверки сертификата.",
+		}
+	default:
+		return []string{
+			"Обычный DNS: адрес host:port, например 1.1.1.1:53.",
+			"Без шифрования; подходит для локальных резолверов.",
+		}
+	}
+}
+
+// applyTransportPick writes the highlighted transport into the form and
+// returns; the config is untouched until ctrl+s.
+func (m Model) applyTransportPick() (tea.Model, tea.Cmd) {
+	if m.picker.cursor < 0 || m.picker.cursor >= len(upstreamTransports) {
+		return m, nil
+	}
+	m.upstreamForm.Transport = upstreamTransports[m.picker.cursor]
+	m.screen = screenUpstreamForm
+	m.settleRail()
+	return m, nil
 }
 
 // upstreamFormView renders the custom-upstream form.

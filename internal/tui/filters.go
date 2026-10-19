@@ -34,17 +34,8 @@ const (
 	inputMaintenanceConfirm
 )
 
-// nextBlockMode cycles the block mode.
-func nextBlockMode(mode string) string {
-	switch mode {
-	case "zero":
-		return "nxdomain"
-	case "nxdomain":
-		return "refused"
-	default:
-		return "zero"
-	}
-}
+// blockModes is the order of the block-mode picker.
+var blockModes = []string{"zero", "nxdomain", "refused"}
 
 // modeLabel renders a block mode.
 func modeLabel(mode string) string {
@@ -297,42 +288,161 @@ func (m *Model) filtersView() string {
 
 // catalogView renders the built-in list picker.
 func (m *Model) catalogView() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("Каталог списков"))
-	b.WriteString(dimStyle.Render("  (j/k — выбор, enter — добавить/удалить, esc — назад)") + "\n\n")
-
-	entries := filter.Catalog()
-	if m.filterCfg == nil {
-		b.WriteString(dimStyle.Render("Конфигурация загружается…") + "\n")
-		return b.String()
-	}
-
-	b.WriteString(dimStyle.Render(fmt.Sprintf("  %-24s %-26s %-16s %s", "ID", "название", "категория", "статус")))
-	b.WriteString("\n")
-	for i, e := range entries {
-		marker := "  "
-		if i == m.catalogCursor {
-			marker = "> "
-		}
-		state := dimStyle.Render("нет")
-		if hasFilterList(m.filterCfg.Filter.Lists, e.ID) {
-			state = okStyle.Render("установлен")
-		}
-		line := fmt.Sprintf("%s%-24s %-26s %-16s %s",
-			marker, truncate(e.ID, 24), truncate(e.Name, 26), catalogCategoryLabel(e.Category), state)
-		if i == m.catalogCursor {
-			line = activeTabStyle.Render(line)
-		}
-		b.WriteString(line + "\n")
-	}
-
+	m.filterCatalogPicker()
+	out := m.pickerView(&m.picker)
 	if m.filterErr != nil {
-		b.WriteString("\n" + errStyle.Render(m.filterErr.Error()) + "\n")
+		out += "\n" + errStyle.Render(m.filterErr.Error())
 	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("enter — добавить или удалить список · esc — вернуться к фильтрам"))
-	b.WriteString("\n")
-	return b.String()
+	return out
+}
+
+// openFilterCatalog opens the catalog picker on its first row.
+func (m *Model) openFilterCatalog() {
+	m.pickerReturn = screenFilters
+	m.picker = picker{title: "Каталог списков"}
+	m.filterCatalogPicker()
+	m.filterErr = nil
+	m.screen = screenFilterCatalog
+	m.settleRail()
+}
+
+// filterCatalogPicker refreshes the picker rows from the live config and
+// the last status snapshot, keeping the cursor.
+func (m *Model) filterCatalogPicker() {
+	entries := filter.Catalog()
+	items := make([]pickerItem, 0, len(entries))
+	for _, e := range entries {
+		installed := m.filterCfg != nil && hasFilterList(m.filterCfg.Filter.Lists, e.ID)
+		status := "нет"
+		if installed {
+			status = "установлен"
+		}
+		details := []string{
+			e.Name + " (" + e.ID + ")",
+			"Категория: " + catalogCategoryLabel(e.Category),
+			e.Description,
+			"URL: " + e.URL,
+		}
+		if installed {
+			details = append(details, "Статус: установлен — enter уберёт список.")
+		} else {
+			details = append(details, "Статус: не установлен — enter добавит список.")
+		}
+		if live := m.filterStatusByID(e.ID); live != nil {
+			applied, skipped := itoa(live.Applied), itoa(live.Skipped)
+			details = append(details, "Правил: применено "+applied+" · пропущено "+skipped)
+			if live.Error != "" {
+				details = append(details, "Ошибка: "+live.Error)
+			}
+		}
+		details = append(details,
+			"",
+			"Косметические правила (скрытие элементов) на уровне DNS игнорируются —",
+			"применяются только доменные правила списка.")
+		items = append(items, pickerItem{Label: e.Name, Status: status, Details: details})
+	}
+	m.picker.setItems(items)
+}
+
+// filterStatusByID returns the live status of one list, if reported.
+func (m *Model) filterStatusByID(id string) *filter.ListStatus {
+	for i := range m.filterLists {
+		if m.filterLists[i].ID == id {
+			return &m.filterLists[i]
+		}
+	}
+	return nil
+}
+
+// modePickerView renders the block-mode picker.
+func (m *Model) modePickerView() string {
+	m.modePickerItems()
+	return m.pickerView(&m.picker)
+}
+
+// openModePicker opens the block-mode list on the current mode.
+func (m Model) openModePicker() (tea.Model, tea.Cmd) {
+	m.pickerReturn = screenFilters
+	m.picker = picker{title: "Режим блокировки"}
+	m.modePickerItems()
+	for i, mode := range blockModes {
+		if mode == m.currentBlockMode() {
+			m.picker.cursor = i
+		}
+	}
+	m.filterErr = nil
+	m.screen = screenModePicker
+	m.settleRail()
+	return m, nil
+}
+
+// modePickerItems fills the block-mode rows.
+func (m *Model) modePickerItems() {
+	items := make([]pickerItem, 0, len(blockModes))
+	for _, mode := range blockModes {
+		status := ""
+		if mode == m.currentBlockMode() {
+			status = "сейчас"
+		}
+		items = append(items, pickerItem{
+			Label:   mode,
+			Status:  status,
+			Details: modeDetails(mode),
+		})
+	}
+	m.picker.setItems(items)
+}
+
+// currentBlockMode prefers the live config over the status snapshot.
+func (m *Model) currentBlockMode() string {
+	if m.filterCfg != nil && m.filterCfg.Filter.Mode != "" {
+		return m.filterCfg.Filter.Mode
+	}
+	if m.status.Filter.Mode != "" {
+		return m.status.Filter.Mode
+	}
+	return blockModes[0]
+}
+
+// modeDetails explains the DNS answer a blocked client receives.
+func modeDetails(mode string) []string {
+	switch mode {
+	case "nxdomain":
+		return []string{
+			"Клиент получает NXDOMAIN — «такого домена не существует».",
+			"Блокировка выглядит как ошибка в имени, а не как пустой ответ.",
+		}
+	case "refused":
+		return []string{
+			"Клиент получает REFUSED — сервер отказался отвечать.",
+			"Некоторые приложения показывают ошибку сети вместо пустой страницы.",
+		}
+	default:
+		return []string{
+			"Клиент получает 0.0.0.0 (IPv4) или :: (IPv6).",
+			"Соединение не устанавливается, страница выглядит пустой.",
+		}
+	}
+}
+
+// applyModePick applies the highlighted block mode and returns to the
+// filters screen.
+func (m Model) applyModePick() (tea.Model, tea.Cmd) {
+	it, ok := m.picker.selected()
+	if !ok {
+		return m, nil
+	}
+	mode := it.Label
+	m.screen = screenFilters
+	m.settleRail()
+	m.status.Filter.Mode = mode // optimistic until the reload lands
+	if m.filterCfg != nil {
+		next := cloneConfig(m.filterCfg)
+		next.Filter.Mode = mode
+		m.filterCfg = next
+	}
+	m.filterErr = nil
+	return m, applyModeCmd(m.client, mode)
 }
 
 // catalogCategoryLabel renders a catalog category in Russian.
@@ -360,10 +470,10 @@ func (m Model) applyFilterCfg(next *config.Config) (tea.Model, tea.Cmd) {
 // toggleCatalogList adds the highlighted catalog list or removes it.
 func (m Model) toggleCatalogList() (tea.Model, tea.Cmd) {
 	entries := filter.Catalog()
-	if m.filterCfg == nil || m.catalogCursor >= len(entries) {
+	if m.filterCfg == nil || m.picker.cursor < 0 || m.picker.cursor >= len(entries) {
 		return m, nil
 	}
-	id := entries[m.catalogCursor].ID
+	id := entries[m.picker.cursor].ID
 	next := cloneConfig(m.filterCfg)
 	if i := filterListIndex(next.Filter.Lists, id); i >= 0 {
 		next.Filter.Lists = append(next.Filter.Lists[:i], next.Filter.Lists[i+1:]...)

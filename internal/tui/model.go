@@ -38,6 +38,17 @@ const (
 	// screenUpstreamForm is the custom-upstream form opened from the
 	// upstreams screen; it is not a tab.
 	screenUpstreamForm
+	// screenStrategyPicker is the routing-strategy list opened with s
+	// from Upstreams or Settings.
+	screenStrategyPicker
+	// screenModePicker is the block-mode list opened with m on Filters.
+	screenModePicker
+	// screenTimezonePicker is the timezone list opened by Enter on the
+	// settings timezone field.
+	screenTimezonePicker
+	// screenTransportPicker is the transport list opened by Enter on
+	// the transport field of the custom-upstream form.
+	screenTransportPicker
 	// screenHelp is not a tab: the ? key opens it as an overlay and
 	// Esc (or any digit) leaves it.
 	screenHelp
@@ -98,8 +109,7 @@ type Model struct {
 	filterErr    error
 	// filterCfg is the live configuration the filter edits work on; it
 	// is reloaded whenever the screen is entered.
-	filterCfg     *config.Config
-	catalogCursor int
+	filterCfg *config.Config
 	// filterNewID carries the custom-list ID from the first input step
 	// to the URL step.
 	filterNewID string
@@ -114,15 +124,17 @@ type Model struct {
 	upstreamCursor int
 	upstreamErr    error
 
-	// upstreamCatalogCursor is the highlighted row of the provider
-	// endpoint picker.
-	upstreamCatalogCursor int
-
 	// upstreamForm is the state of the custom-upstream form, carrying
 	// every typed field until ctrl+s applies it.
 	upstreamForm      upstreamFormState
 	upstreamFormField int
 	upstreamFormErr   error
+
+	// picker is the shared state of the active enumeration picker; only
+	// one picker screen is visible at a time. pickerReturn is the
+	// screen Enter and Esc return to.
+	picker       picker
+	pickerReturn screen
 
 	// probeUpstream/probeResult hold the last probe's target and its
 	// rendered outcome, shown under the table.
@@ -711,13 +723,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "u":
 			return m, filterUpdateCmd(m.client, "")
 		case "m":
-			next := nextBlockMode(m.status.Filter.Mode)
-			m.status.Filter.Mode = next // optimistic until the reload lands
-			return m, applyModeCmd(m.client, next)
+			return m.openModePicker()
 		case "a":
-			m.screen = screenFilterCatalog
-			m.catalogCursor = 0
-			m.filterErr = nil
+			m.openFilterCatalog()
 			return m, loadFilterConfig(m.client)
 		case "c":
 			return m.startCustomList()
@@ -730,15 +738,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case screenFilterCatalog:
 		switch msg.String() {
 		case "j", "down":
-			if m.catalogCursor < len(filter.Catalog())-1 {
-				m.catalogCursor++
-			}
+			m.picker.moveDown()
 		case "k", "up":
-			if m.catalogCursor > 0 {
-				m.catalogCursor--
-			}
+			m.picker.moveUp()
 		case "enter":
 			return m.toggleCatalogList()
+		case "esc":
+			m.screen = screenFilters
+			m.settleRail()
+			m.filterErr = nil
+		}
+
+	case screenModePicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyModePick()
 		case "esc":
 			m.screen = screenFilters
 			m.settleRail()
@@ -762,35 +780,72 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "p":
 			return m.startUpstreamPriority()
 		case "s":
-			return m.cycleUpstreamStrategy()
+			return m.openStrategyPicker()
 		case "t":
 			return m.probeSelectedUpstream()
 		case "a":
-			m.screen = screenUpstreamCatalog
-			m.upstreamCatalogCursor = 0
-			m.upstreamErr = nil
+			m.openUpstreamCatalog()
 			return m, loadUpstreamConfig(m.client)
 		case "c":
 			return m.startUpstreamForm()
 		}
 
 	case screenUpstreamCatalog:
-		entries := upstreamCatalogEntries()
 		switch msg.String() {
 		case "j", "down":
-			if m.upstreamCatalogCursor < len(entries)-1 {
-				m.upstreamCatalogCursor++
-			}
+			m.picker.moveDown()
 		case "k", "up":
-			if m.upstreamCatalogCursor > 0 {
-				m.upstreamCatalogCursor--
-			}
+			m.picker.moveUp()
 		case "enter":
 			return m.addCatalogEndpoint()
 		case "esc":
 			m.screen = screenUpstreams
 			m.settleRail()
 			m.upstreamErr = nil
+		}
+
+	case screenStrategyPicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyStrategyPick()
+		case "esc":
+			m.screen = m.pickerReturn
+			if m.screen == screenStrategyPicker {
+				m.screen = screenUpstreams
+			}
+			m.settleRail()
+			m.upstreamErr = nil
+			m.settingsErr = nil
+		}
+
+	case screenTimezonePicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyTimezonePick()
+		case "esc":
+			m.screen = screenSettings
+			m.settleRail()
+		}
+
+	case screenTransportPicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyTransportPick()
+		case "esc":
+			m.screen = screenUpstreamForm
+			m.settleRail()
 		}
 
 	case screenUpstreamForm:
@@ -805,8 +860,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.upstreamFormField == upstreamFormTransport {
-				m.upstreamForm.Transport = nextUpstreamTransport(m.upstreamForm.Transport)
-				return m, nil
+				return m.openTransportPicker()
 			}
 			m.inputActive = true
 			m.inputMode = inputUpstreamFormField
@@ -848,10 +902,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				f.toggle(m.settingsCfg)
 				return m, nil
 			}
+			if f.name == timezoneFieldName {
+				return m.openTimezonePicker()
+			}
 			m.inputActive = true
 			m.inputMode = inputSettingsField
 			m.inputField = m.settingsCursor
 			m.input = ""
+		case "s":
+			return m.openStrategyPicker()
 		case "ctrl+s":
 			if m.settingsCfg == nil {
 				return m, nil
@@ -1053,12 +1112,20 @@ func (m *Model) screenView() string {
 		return m.upstreamCatalogView()
 	case screenUpstreamForm:
 		return m.upstreamFormView()
+	case screenStrategyPicker:
+		return m.strategyPickerView()
+	case screenTransportPicker:
+		return m.transportPickerView()
 	case screenFilters:
 		return m.filtersView()
 	case screenFilterCatalog:
 		return m.catalogView()
+	case screenModePicker:
+		return m.modePickerView()
 	case screenSettings:
 		return m.settingsView()
+	case screenTimezonePicker:
+		return m.timezonePickerView()
 	case screenDiag:
 		return m.diagView()
 	case screenMaintenance:
@@ -1083,15 +1150,19 @@ func (m Model) footerText() string {
 	case screenRequests:
 		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
 	case screenFilters:
-		return "q — выход · r — правило · enter/u — обновить · ? — помощь · ↑↓ — прокрутка"
+		return "q — выход · r — правило · enter/u — обновить · m — режим · ? — помощь · ↑↓ — прокрутка"
 	case screenUpstreams:
 		return "space — вкл/выкл · d — удалить · p — приоритет · s — стратегия · t — проверить · a — каталог · c — свой · j/k — выбор · ? — помощь"
 	case screenUpstreamForm:
-		return "j/k — поля · enter — изменить/сменить транспорт · ctrl+s — применить · esc — отмена"
-	case screenUpstreamCatalog, screenFilterCatalog:
+		return "j/k — поля · enter — изменить/выбрать транспорт · ctrl+s — применить · esc — отмена"
+	case screenUpstreamCatalog:
+		return "j/k — выбор · enter — добавить · esc — назад · ? — помощь"
+	case screenFilterCatalog:
 		return "j/k — выбор · enter — добавить/удалить · esc — назад · ? — помощь"
+	case screenStrategyPicker, screenModePicker, screenTimezonePicker, screenTransportPicker:
+		return "j/k — выбор · enter — выбрать · esc — назад · ? — помощь"
 	case screenSettings:
-		return "q — выход · r — обновить · enter — изменить · ctrl+s — применить · ? — помощь"
+		return "q — выход · r — обновить · enter — изменить · s — стратегия · ctrl+s — применить · ? — помощь"
 	case screenMaintenance:
 		return "j/k — выбор · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
 	default:
@@ -1150,10 +1221,11 @@ func (m *Model) helpView() string {
 		"  ↑↓    прокрутка ленты",
 		"",
 		titleStyle.Render("Фильтры (экран 5)"),
-		"  a     каталог списков (enter — добавить/удалить, esc — назад)",
+		"  a     каталог списков (две панели: enter — добавить/удалить, esc — назад)",
 		"  c     свой список: ID, затем https-URL",
 		"  d     удалить выбранный список",
 		"  e     включить или выключить фильтрацию",
+		"  m     режим блокировки: zero / nxdomain / refused",
 		"  r     добавить правило (block домен / allow домен)",
 		"  u     обновить все списки · enter — выбранный",
 		"",
@@ -1161,7 +1233,8 @@ func (m *Model) helpView() string {
 		"  a     каталог провайдеров (enter — добавить, esc — назад)",
 		"  c     свой upstream: ID, название, транспорт, адрес, SNI, приоритет",
 		"  пробел включить/выключить выбранный (последний включённый не выключается)",
-		"  d     удалить выбранный upstream · p — приоритет · s — стратегия",
+		"  d     удалить выбранный upstream · p — приоритет",
+		"  s     стратегия: fastest / failover / round_robin / random",
 		"  t     проверить выбранный upstream (probe)",
 		"",
 		titleStyle.Render("Обслуживание (экран 8)"),
@@ -1171,8 +1244,9 @@ func (m *Model) helpView() string {
 		dimStyle.Render("  Восстановление заменяет конфигурацию целиком, снапшот создаётся автоматически"),
 		"",
 		titleStyle.Render("Настройки (экран 6)"),
-		"  enter — изменить поле, ctrl+s — применить",
-		dimStyle.Render("  Часовой пояс: IANA-зона, напр. Europe/Moscow, Europe/London, UTC (пусто — системная)"),
+		"  enter — изменить поле (часовой пояс — список зон), ctrl+s — применить",
+		"  s     стратегия маршрутизации (список с описанием)",
+		dimStyle.Render("  Часовой пояс: список зон, пусто — системная зона сервера"),
 		"  ?     эта справка",
 		"  q     выход",
 		"",

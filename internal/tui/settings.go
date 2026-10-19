@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -25,6 +26,30 @@ type settingField struct {
 // timezoneFieldName is the settings label of the timezone field; the
 // view uses it to render the example zones.
 const timezoneFieldName = "Часовой пояс (IANA, пусто = системный)"
+
+// timezoneChoice is one row of the timezone picker; an empty value means
+// the server's own zone.
+type timezoneChoice struct {
+	label  string
+	value  string
+	custom bool
+}
+
+// timezoneChoices are the common zones plus the manual entry row.
+var timezoneChoices = []timezoneChoice{
+	{label: "системный", value: ""},
+	{label: "UTC", value: "UTC"},
+	{label: "Europe/Moscow", value: "Europe/Moscow"},
+	{label: "Europe/London", value: "Europe/London"},
+	{label: "Europe/Berlin", value: "Europe/Berlin"},
+	{label: "Europe/Kyiv", value: "Europe/Kyiv"},
+	{label: "Asia/Almaty", value: "Asia/Almaty"},
+	{label: "Asia/Tbilisi", value: "Asia/Tbilisi"},
+	{label: "Asia/Yerevan", value: "Asia/Yerevan"},
+	{label: "Asia/Dubai", value: "Asia/Dubai"},
+	{label: "America/New_York", value: "America/New_York"},
+	{label: "Своё…", custom: true},
+}
 
 // settingsFields is the fixed field list of the settings screen.
 func (m *Model) settingsFields() []settingField {
@@ -263,7 +288,7 @@ func (m *Model) settingsView() string {
 
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("Настройки"))
-	b.WriteString(dimStyle.Render("  (enter — изменить/переключить, ctrl+s — применить, w — мастер)") + "\n\n")
+	b.WriteString(dimStyle.Render("  (enter — изменить/переключить, ctrl+s — применить, s — стратегия, w — мастер)") + "\n\n")
 
 	fields := m.settingsFields()
 	for i, f := range fields {
@@ -297,4 +322,154 @@ func (m *Model) settingsView() string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// timezonePickerView renders the timezone picker.
+func (m *Model) timezonePickerView() string {
+	m.timezonePickerItems()
+	return m.pickerView(&m.picker)
+}
+
+// openTimezonePicker opens the zone list on the configured value.
+func (m Model) openTimezonePicker() (tea.Model, tea.Cmd) {
+	if m.settingsCfg == nil {
+		return m, m.lazyLoadCmd()
+	}
+	m.pickerReturn = screenSettings
+	m.picker = picker{title: "Часовой пояс"}
+	m.timezonePickerItems()
+	for i, c := range timezoneChoices {
+		if !c.custom && c.value == m.settingsCfg.Timezone {
+			m.picker.cursor = i
+		}
+	}
+	m.screen = screenTimezonePicker
+	m.settleRail()
+	return m, nil
+}
+
+// timezonePickerItems fills the zone rows and marks the staged value.
+func (m *Model) timezonePickerItems() {
+	current := ""
+	if m.settingsCfg != nil {
+		current = m.settingsCfg.Timezone
+	}
+	items := make([]pickerItem, 0, len(timezoneChoices))
+	for _, c := range timezoneChoices {
+		status := ""
+		if !c.custom && c.value == current {
+			status = "сейчас"
+		}
+		items = append(items, pickerItem{
+			Label:   c.label,
+			Status:  status,
+			Details: timezoneDetails(c),
+		})
+	}
+	m.picker.setItems(items)
+}
+
+// timezoneDetails shows the current local time and UTC offset of a zone.
+func timezoneDetails(c timezoneChoice) []string {
+	now := time.Now()
+	if c.custom {
+		local := now.In(time.Local)
+		return []string{
+			"Своя IANA-зона: введите её вручную.",
+			"Например, Australia/Sydney или America/Sao_Paulo.",
+			"",
+			"Сейчас на сервере: " + local.Format("02.01.2006 15:04:05") +
+				" (" + utcOffsetLabel(local) + ")",
+			"Пустое значение — системная зона сервера.",
+		}
+	}
+
+	loc := time.Local
+	label := "системный"
+	detail := []string{"Системная зона сервера (" + time.Local.String() + ")"}
+	if c.value != "" {
+		loaded, err := time.LoadLocation(c.value)
+		if err != nil {
+			return []string{
+				"Не удалось загрузить зону " + c.value + ": " + err.Error(),
+				"Пустое значение — системная зона сервера.",
+			}
+		}
+		loc = loaded
+		label = c.value
+		detail = []string{"IANA: " + c.value}
+	}
+	local := now.In(loc)
+	_, offset := local.Zone()
+	detail = append(detail,
+		"Сейчас: "+local.Format("02.01.2006 15:04:05")+" ("+utcOffsetLabel(local)+")",
+		"Смещение от UTC: "+formatUTCOffset(offset),
+	)
+	if c.value == "" {
+		detail = append(detail, "Пустое значение — сервер следует своей системной зоне.")
+	} else {
+		detail = append(detail,
+			"Пустое значение — системная зона сервера;",
+			"иначе в конфиг попадёт "+label+".")
+	}
+	return detail
+}
+
+// utcOffsetLabel renders a time's zone offset as UTC+HH:MM.
+func utcOffsetLabel(t time.Time) string {
+	_, offset := t.Zone()
+	return formatUTCOffset(offset)
+}
+
+// formatUTCOffset formats a seconds offset from UTC.
+func formatUTCOffset(offset int) string {
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	return fmt.Sprintf("UTC%s%02d:%02d", sign, offset/3600, (offset%3600)/60)
+}
+
+// applyTimezonePick stages the highlighted zone in the settings copy and
+// returns; ctrl+s on the settings screen applies it.
+func (m Model) applyTimezonePick() (tea.Model, tea.Cmd) {
+	if m.picker.cursor < 0 || m.picker.cursor >= len(timezoneChoices) {
+		return m, nil
+	}
+	choice := timezoneChoices[m.picker.cursor]
+	m.screen = screenSettings
+	m.settleRail()
+
+	if m.settingsCfg == nil {
+		return m, m.lazyLoadCmd()
+	}
+
+	idx := -1
+	for i, f := range m.settingsFields() {
+		if f.name == timezoneFieldName {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return m, nil
+	}
+	m.settingsCursor = idx
+
+	if choice.custom {
+		// Reuse the existing free-text input for an arbitrary IANA zone.
+		m.inputActive = true
+		m.inputMode = inputSettingsField
+		m.inputField = idx
+		m.input = ""
+		return m, nil
+	}
+
+	if err := commitSettingsField(m.settingsFields()[idx], m.settingsCfg, choice.value); err != nil {
+		m.settingsErr = err
+	} else {
+		m.settingsErr = nil
+	}
+	return m, nil
 }

@@ -91,6 +91,35 @@ func editSettingsField(t *testing.T, m Model, name, value string) Model {
 	return updated.(Model)
 }
 
+// pickTimezone opens the timezone picker from the settings screen,
+// selects the named row and confirms it.
+func pickTimezone(t *testing.T, m Model, label string) Model {
+	t.Helper()
+	if m.screen != screenTimezonePicker {
+		m = moveToSettingsField(t, m, timezoneFieldName)
+		m = step(m, enterKey())
+	}
+	if m.screen != screenTimezonePicker {
+		t.Fatalf("enter on the timezone field opened %v, want the timezone picker", m.screen)
+	}
+	found := false
+	for i, c := range timezoneChoices {
+		if c.label == label {
+			m.picker.cursor = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("timezone choice %q not found", label)
+	}
+	updated, cmd := m.Update(enterKey())
+	if cmd != nil {
+		t.Errorf("staging timezone %q returned a command", label)
+	}
+	return updated.(Model)
+}
+
 // TestFilterManualUpdate checks that enter refreshes the list under the
 // cursor.
 func TestFilterManualUpdate(t *testing.T) {
@@ -129,8 +158,8 @@ func TestFilterUpdateAll(t *testing.T) {
 	}
 }
 
-// TestFilterModeToggle checks that m cycles the block mode and sends
-// the full config.
+// TestFilterModeToggle checks that m opens the mode picker, the current
+// mode is marked, and Enter applies the highlighted mode.
 func TestFilterModeToggle(t *testing.T) {
 	sc := &stubClient{}
 	m := New(sc, Options{Initial: "filters"})
@@ -138,8 +167,27 @@ func TestFilterModeToggle(t *testing.T) {
 
 	updated, cmd := m.Update(key('m'))
 	m = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("m returned a command, want the picker screen")
+	}
+	if m.screen != screenModePicker {
+		t.Fatalf("screen = %v, want the mode picker", m.screen)
+	}
+	if !strings.Contains(m.View(), "сейчас") || !strings.Contains(m.View(), "0.0.0.0") {
+		t.Errorf("mode picker View() misses the marker or the explanation:\n%s", m.View())
+	}
+
+	m = step(m, key('j')) // zero → nxdomain
+	if !strings.Contains(m.View(), "NXDOMAIN") {
+		t.Errorf("mode picker View() misses the NXDOMAIN explanation:\n%s", m.View())
+	}
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	if m.screen != screenFilters {
+		t.Errorf("screen = %v after Enter, want filters", m.screen)
+	}
 	if cmd == nil {
-		t.Fatalf("m returned no command")
+		t.Fatalf("Enter returned no command")
 	}
 	_ = cmd()
 
@@ -271,11 +319,11 @@ func TestSettingsNewFieldRoundTrip(t *testing.T) {
 		t.Errorf("the timezone hint is missing:\n%s", m.View())
 	}
 
-	m = editSettingsField(t, m, timezoneFieldName, "Europe/Moscow")
+	m = pickTimezone(t, m, "Europe/Moscow")
 	if got := m.settingsCfg.Timezone; got != "Europe/Moscow" {
 		t.Errorf("timezone = %q, want Europe/Moscow", got)
 	}
-	m = editSettingsField(t, m, timezoneFieldName, "")
+	m = pickTimezone(t, m, "системный")
 	if got := m.settingsCfg.Timezone; got != "" {
 		t.Errorf("timezone = %q, want it cleared to the system zone", got)
 	}
@@ -319,7 +367,13 @@ func TestSettingsNewFieldApplyError(t *testing.T) {
 	m := New(sc, Options{Initial: "settings"})
 	m = step(m, configLoadedMsg{cfg: config.Default()})
 
-	m = editSettingsField(t, m, timezoneFieldName, "Mars/Base")
+	m = pickTimezone(t, m, "Своё…")
+	if !m.inputActive || m.inputMode != inputSettingsField {
+		t.Fatalf("«Своё…» did not open the free-text timezone input")
+	}
+	m = typeText(m, "Mars/Base")
+	updated, _ := m.Update(enterKey())
+	m = updated.(Model)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	m = updated.(Model)
 	m = drainCmd(t, m, cmd)
@@ -359,10 +413,13 @@ func TestFilterCatalogToggle(t *testing.T) {
 	}
 
 	m = step(m, key('j'))
-	if m.catalogCursor != 1 {
-		t.Errorf("j moved the cursor to %d, want 1", m.catalogCursor)
+	if m.picker.cursor != 1 {
+		t.Errorf("j moved the cursor to %d, want 1", m.picker.cursor)
 	}
 	m = step(m, key('k'))
+	if m.picker.cursor != 0 {
+		t.Errorf("k moved the cursor to %d, want 0", m.picker.cursor)
+	}
 
 	updated, cmd = m.Update(enterKey())
 	m = updated.(Model)
@@ -389,6 +446,131 @@ func TestFilterCatalogToggle(t *testing.T) {
 	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 	if m.screen != screenFilters {
 		t.Errorf("esc left the picker on %v, want the filters screen", m.screen)
+	}
+}
+
+// TestFilterCatalogDetails checks the right pane: category, description,
+// URL, the applied/skipped counters and the DNS-level cosmetic note.
+func TestFilterCatalogDetails(t *testing.T) {
+	cfg := config.Default()
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "filters"})
+	m = step(m, filterConfigLoadedMsg{cfg: cfg})
+	m = step(m, filterLoadedMsg{lists: []filter.ListStatus{{
+		ID: "adguard-dns-filter", Applied: 123, Skipped: 4,
+	}}})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+
+	view := m.View()
+	for _, want := range []string{
+		"реклама", "AdGuard's DNS-tuned", "https://adguardteam.github.io",
+		"применено 123", "пропущено 4", "Косметические", "не установлен",
+	} {
+		if !strings.Contains(view, want) {
+			t.Errorf("catalog View() misses %q:\n%s", want, view)
+		}
+	}
+
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 {
+		t.Fatalf("UpdateConfig calls = %d, want 1", len(sc.updates))
+	}
+	if got := sc.updates[0].Filter.Lists; len(got) != 1 || got[0].ID != "adguard-dns-filter" {
+		t.Errorf("lists after Enter = %+v, want adguard-dns-filter installed", got)
+	}
+}
+
+// TestSettingsStrategyPicker checks that s on Settings opens the strategy
+// list, marks the current value and applies the chosen one.
+func TestSettingsStrategyPicker(t *testing.T) {
+	sc := &stubClient{}
+	m := New(sc, Options{Initial: "settings"})
+	m = step(m, configLoadedMsg{cfg: config.Default()})
+
+	m = step(m, key('s'))
+	if m.screen != screenStrategyPicker {
+		t.Fatalf("screen = %v, want the strategy picker", m.screen)
+	}
+	view := m.View()
+	if !strings.Contains(view, "сейчас") || !strings.Contains(view, "fastest") {
+		t.Errorf("strategy picker View() misses the current marker:\n%s", view)
+	}
+
+	m = step(m, key('j'))
+	m = step(m, key('j'))
+	m = step(m, key('j')) // fastest → random
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	if m.screen != screenSettings {
+		t.Errorf("screen = %v after Enter, want settings", m.screen)
+	}
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 || sc.updates[0].Strategy != "random" {
+		t.Fatalf("updates = %+v, want one random strategy write", sc.updates)
+	}
+}
+
+// TestTimezonePickerStages checks that the zone list stages the value
+// without a config write, that the details show a real local time, and
+// that «Своё…» reuses the free-text input.
+func TestTimezonePickerStages(t *testing.T) {
+	sc := &stubClient{}
+	m := New(sc, Options{Initial: "settings"})
+	m = step(m, configLoadedMsg{cfg: config.Default()})
+
+	m = moveToSettingsField(t, m, timezoneFieldName)
+	m = step(m, enterKey())
+	if m.screen != screenTimezonePicker {
+		t.Fatalf("screen = %v, want the timezone picker", m.screen)
+	}
+	view := m.View()
+	for _, want := range []string{"Сейчас:", "UTC+", "системный"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("timezone picker View() misses %q:\n%s", want, view)
+		}
+	}
+
+	m = pickTimezone(t, m, "UTC")
+	if got := m.settingsCfg.Timezone; got != "UTC" {
+		t.Errorf("staged timezone = %q, want UTC", got)
+	}
+	if len(sc.updates) != 0 {
+		t.Fatalf("timezone staging called UpdateConfig %d times, want 0", len(sc.updates))
+	}
+
+	// UTC is now current and its detail is a UTC+00:00 clock.
+	m = moveToSettingsField(t, m, timezoneFieldName)
+	m = step(m, enterKey())
+	view = m.View()
+	if !strings.Contains(view, "UTC+00:00") {
+		t.Errorf("UTC detail misses the zero offset:\n%s", view)
+	}
+
+	m = pickTimezone(t, m, "Своё…")
+	if !m.inputActive || m.inputMode != inputSettingsField {
+		t.Fatalf("«Своё…» did not open the free-text input")
+	}
+	m = typeText(m, "Europe/Paris")
+	updated, _ := m.Update(enterKey())
+	m = updated.(Model)
+	if got := m.settingsCfg.Timezone; got != "Europe/Paris" {
+		t.Errorf("custom timezone = %q, want Europe/Paris", got)
+	}
+	if len(sc.updates) != 0 {
+		t.Errorf("custom timezone staging called UpdateConfig %d times", len(sc.updates))
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 || sc.updates[0].Timezone != "Europe/Paris" {
+		t.Errorf("updates = %+v, want one Europe/Paris write after ctrl+s", sc.updates)
 	}
 }
 

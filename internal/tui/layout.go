@@ -86,15 +86,23 @@ func (m Model) railVisible() bool {
 // overlay stay on the tab they belong to, so the rail never goes blank.
 func (m Model) railIndex(s screen) int {
 	switch s {
-	case screenFilterCatalog:
+	case screenFilterCatalog, screenModePicker:
 		s = screenFilters
-	case screenUpstreamCatalog, screenUpstreamForm:
+	case screenUpstreamCatalog, screenUpstreamForm, screenTransportPicker:
 		s = screenUpstreams
+	case screenStrategyPicker:
+		s = m.pickerReturn
+		if s != screenSettings {
+			s = screenUpstreams
+		}
+	case screenTimezonePicker:
+		s = screenSettings
 	case screenHelp:
 		s = m.helpReturn
 		if s == screenHelp {
 			s = screenStatus
 		}
+		return m.railIndex(s)
 	}
 	for i, tab := range screenTabs {
 		if tab.screen == s {
