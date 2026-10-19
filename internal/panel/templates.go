@@ -26,6 +26,7 @@ var templateFS embed.FS
 var templates = map[string]*template.Template{
 	"login":       template.Must(template.New("login").Parse(loginPage)),
 	"status":      pageTemplates("status", "templates/status.html"),
+	"live":        pageTemplates("live", "templates/live.html"),
 	"history":     pageTemplates("history", "templates/history.html"),
 	"upstreams":   pageTemplates("upstreams", "templates/manage.html"),
 	"filters":     pageTemplates("filters", "templates/manage.html"),

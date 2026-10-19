@@ -165,6 +165,11 @@ type Panel struct {
 	// traffic instead of an empty list.
 	feed *feed
 
+	// live is the live screen's ring: the same bus subscription and the
+	// same shape as feed, but a larger bound and richer rows. Keeping it
+	// separate keeps the status page's "последние 30" promise intact.
+	live *feed
+
 	// bus is the live event source; nil when the panel is not wired to
 	// a daemon.
 	bus *api.Bus
@@ -221,6 +226,7 @@ func New(opts Options) *Panel {
 		csrfKey:      mustRandom(32),
 		pingInterval: ping,
 		feed:         newFeed(feedSize),
+		live:         newFeed(liveFeedSize),
 		bus:          opts.Bus,
 		streams:      make(chan struct{}),
 	}
@@ -256,13 +262,14 @@ func (p *Panel) streamDone() <-chan struct{} {
 	return p.streams
 }
 
-// startFeed seeds the live feed with the recent queries the daemon
-// already has and, when a bus is wired, keeps it current. The panel is
-// a process-lifetime object, so the subscription is deliberately not
-// torn down; it ends with the process.
+// startFeed seeds the status and live rings with the recent queries the
+// daemon already has and, when a bus is wired, keeps both current from
+// one subscription. The panel is a process-lifetime object, so the
+// subscription is deliberately not torn down; it ends with the process.
 func (p *Panel) startFeed() {
 	if p.ctrl != nil {
 		p.feed.seed(p.ctrl.Requests(feedSize))
+		p.live.seed(p.ctrl.Requests(liveFeedSize))
 	}
 	if p.bus == nil {
 		return
@@ -275,6 +282,7 @@ func (p *Panel) startFeed() {
 			}
 			if entry, ok := e.Data.(qlog.Entry); ok {
 				p.feed.push(entry)
+				p.live.push(entry)
 			}
 		}
 	}()
@@ -320,6 +328,8 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	// Static assets are public: the login page itself needs them.
 	mux.Handle("GET /panel/static/", http.StripPrefix("/panel/static/", p.staticHandler()))
 	mux.Handle("GET /panel/events", p.requireSession(http.HandlerFunc(p.handleEvents)))
+	mux.Handle("GET /panel/live", p.requireSession(http.HandlerFunc(p.handleLive)))
+	mux.Handle("GET /panel/live/events", p.requireSession(http.HandlerFunc(p.handleLiveEvents)))
 	mux.Handle("GET /panel/{$}", p.requireSession(http.HandlerFunc(p.handleStatus)))
 
 	// Query history: the page and its CSV export share one filter

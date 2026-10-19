@@ -63,17 +63,17 @@ func newFeed(limit int) *feed {
 }
 
 // push prepends one entry, dropping the oldest when the buffer is full.
+// The shift happens in place once the buffer has grown to its limit, so
+// a busy feed does not allocate on every query.
 func (f *feed) push(e qlog.Entry) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	rows := make([]qlog.Entry, 0, f.limit)
-	rows = append(rows, e)
-	rows = append(rows, f.rows...)
-	if len(rows) > f.limit {
-		rows = rows[:f.limit]
+	if len(f.rows) < f.limit {
+		f.rows = append(f.rows, qlog.Entry{})
 	}
-	f.rows = rows
+	copy(f.rows[1:], f.rows[:len(f.rows)-1])
+	f.rows[0] = e
 }
 
 // seed fills an empty buffer from the daemon's query log. entries are
@@ -751,11 +751,20 @@ func (p *Panel) feedRows() []rowView {
 	return rowsFor(p.feed.snapshot(), p.location())
 }
 
-// handleEvents streams the live feed as Server-Sent Events, behind the
+// handleEvents streams the status feed as Server-Sent Events, behind the
 // session cookie (never a URL token). It sends an immediate ping so a
 // client can tell "connected" from "waiting", then a snapshot frame
 // with the buffer's current rows, then one row frame per new query.
 func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
+	p.stream(w, r, p.feedHTML, p.rowHTML)
+}
+
+// stream serves one live HTML feed as Server-Sent Events. The snapshot
+// and row callbacks render the page-specific fragments, so the status
+// feed and the live screen share the transport: an immediate ping, a
+// snapshot, then one row per request event, all paced by the panel's
+// ping interval.
+func (p *Panel) stream(w http.ResponseWriter, r *http.Request, snapshot func() string, row func(qlog.Entry) string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -777,7 +786,7 @@ func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !writeSSE(w, flusher, "ping", "{}") {
 		return
 	}
-	if !writeSSE(w, flusher, "snapshot", p.feedHTML()) {
+	if !writeSSE(w, flusher, "snapshot", snapshot()) {
 		return
 	}
 
@@ -813,7 +822,7 @@ func (p *Panel) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				continue
 			}
-			if !writeSSE(w, flusher, "row", p.rowHTML(entry)) {
+			if !writeSSE(w, flusher, "row", row(entry)) {
 				return
 			}
 		case <-ticker.C:
