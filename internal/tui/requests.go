@@ -58,18 +58,21 @@ func (m *Model) requestsView() string {
 
 	b.WriteString(note.String())
 
-	// Reserve the lines that stay pinned above and below the rows: the
-	// column header, the scroll note and the filter prompt. The rows use
-	// whatever the body has left, so the shell never clips the newest
-	// entries (and with them the header) off the top.
-	fixed := len(contentLines(note.String())) + 1
+	// Reserve exactly the rows that stay pinned around the scrolling
+	// rows: the note block, the column header, the optional scroll note
+	// and the filter prompt. Every reserved row is counted the way it is
+	// written (including the blank line before the prompt and any wrap
+	// of a long typed filter), so the prompt never falls past the last
+	// visible row.
+	fixed := strings.Count(note.String(), "\n") + 1 // note rows + column header
 	if m.inputActive && m.inputMode == inputRequestsFilter {
-		fixed += 2
+		prompt := "Фильтр ленты (домен/клиент/upstream/прото): " + m.input + "▏"
+		fixed += 1 + len(wrapText(prompt, m.pickerContentWidth()))
 	}
 	limit := len(shown)
 	if height := m.contentHeight(); height > 0 {
 		limit = height - fixed
-		if m.requestsScroll > 0 && limit > 1 {
+		if m.requestsScroll > 0 {
 			limit-- // the scroll note takes one row
 		}
 		if limit < 0 {

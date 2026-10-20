@@ -468,6 +468,72 @@ func TestRequestsLiveUpdateKeepsNewest(t *testing.T) {
 	}
 }
 
+// TestRequestsScrollKeptOnLiveEvent checks a reader who scrolled up is
+// not yanked back to the tail when a live entry arrives.
+func TestRequestsScrollKeptOnLiveEvent(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+	m = step(m, key('k'))
+	m = step(m, key('k'))
+	if m.requestsScroll != 2 {
+		t.Fatalf("requestsScroll = %d after two k, want 2", m.requestsScroll)
+	}
+
+	m = step(m, requestEvent(qlog.Entry{QName: "live.example.com.", Proto: "udp"}))
+	if m.requestsScroll != 2 {
+		t.Errorf("a live event reset requestsScroll to %d, want 2 kept", m.requestsScroll)
+	}
+	if strings.Contains(m.View(), "live.example.com.") {
+		t.Errorf("the scrolled-up reader jumped to the newest entry:\n%s", m.View())
+	}
+}
+
+// TestRequestsFilterPromptFitsTerminal pins the prompt to the last
+// visible row on both target sizes with a full feed and an active filter.
+func TestRequestsFilterPromptFitsTerminal(t *testing.T) {
+	for _, size := range [][2]int{{120, 40}, {80, 24}} {
+		width, height := size[0], size[1]
+
+		// Full feed, prompt open with typed text, no committed filter.
+		m := New(&stubClient{}, Options{Initial: "requests"})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+		m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+		m = step(m, key('f'))
+		m = typeText(m, "d4")
+
+		view := m.View()
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): d4▏") {
+			t.Errorf("%dx%d: the prompt is not rendered:\n%s", width, height, view)
+		}
+		lines := strings.Split(view, "\n")
+		if len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d:\n%s", width, height, len(lines), height, view)
+		}
+		if strings.Contains(view, "PgUp/PgDn — прокрутка") {
+			t.Errorf("%dx%d: the prompt was pushed into the scroll region:\n%s", width, height, view)
+		}
+		if m.contentOffset != 0 {
+			t.Errorf("%dx%d: contentOffset = %d, want 0", width, height, m.contentOffset)
+		}
+
+		// A committed filter stays visible while its prompt is reopened.
+		m = step(m, enterKey())
+		m = step(m, key('f'))
+		view = m.View()
+		if !strings.Contains(view, "Фильтр: «d4»") {
+			t.Errorf("%dx%d: the filter note vanished:\n%s", width, height, view)
+		}
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): d4▏") {
+			t.Errorf("%dx%d: the prompt is clipped with an active filter:\n%s", width, height, view)
+		}
+		if lines := strings.Split(view, "\n"); len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines with a filter, want at most %d:\n%s",
+				width, height, len(lines), height, view)
+		}
+	}
+}
+
 // TestRequestsFilterAtTerminalSize checks the filter still narrows the
 // sized feed and the note keeps the newest match visible.
 func TestRequestsFilterAtTerminalSize(t *testing.T) {

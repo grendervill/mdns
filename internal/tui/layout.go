@@ -353,6 +353,14 @@ func (m Model) wrapContent(content string) string {
 	if width <= 0 {
 		return content
 	}
+	// lipgloss pads the empty line a trailing newline produces, and that
+	// padded row would count in every height measurement (pushing the
+	// filter prompt out of the viewport). The newlines carry no content:
+	// contentLines drops them anyway, so trim before wrapping.
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return content
+	}
 	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(content)
 }
 
