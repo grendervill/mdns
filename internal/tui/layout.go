@@ -2,6 +2,7 @@ package tui
 
 import (
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -82,6 +83,10 @@ type railAnim struct {
 	to     int
 	frame  int
 	active bool
+	// scheduled records that a tick is already in flight; the Update
+	// wrapper starts the clock for animations begun outside switchScreen
+	// (back-navigation and the wizard) without double-scheduling.
+	scheduled bool
 }
 
 // railTickMsg advances the marker by one frame.
@@ -112,7 +117,7 @@ func (m Model) railColumnWidth() int {
 // overlay stay on the tab they belong to, so the rail never goes blank.
 func (m Model) railIndex(s screen) int {
 	switch s {
-	case screenFilterCatalog, screenModePicker:
+	case screenFilterCatalog, screenModePicker, screenUserRules:
 		s = screenFilters
 	case screenUpstreamCatalog, screenUpstreamForm, screenTransportPicker:
 		s = screenUpstreams
@@ -148,14 +153,27 @@ func (m *Model) switchScreen(s screen) tea.Cmd {
 		m.settleRail()
 		return nil
 	}
-	m.anim = railAnim{from: from, to: to, active: true}
+	m.anim = railAnim{from: from, to: to, active: true, scheduled: true}
 	return m.railTickCmd()
 }
 
-// settleRail snaps the marker to the active screen without motion.
-func (m *Model) settleRail() {
-	idx := m.railIndex(m.screen)
-	m.anim = railAnim{from: idx, to: idx}
+// settleRail moves the marker to the active screen, animating when the
+// rail is visible and motion is enabled. It returns the next tick so a
+// back-navigation or wizard transition eases exactly like a digit jump;
+// with animations disabled (tests) it snaps and returns nil.
+func (m *Model) settleRail() tea.Cmd {
+	return m.railTo(m.railIndex(m.screen), m.railMarkerRow())
+}
+
+// railTo eases the marker from the given row to to, or snaps when the
+// rail is hidden, motion is off, or the row does not change.
+func (m *Model) railTo(to, from int) tea.Cmd {
+	if !m.railVisible() || m.opts.DisableAnimations || from == to {
+		m.anim = railAnim{from: to, to: to}
+		return nil
+	}
+	m.anim = railAnim{from: from, to: to, active: true}
+	return m.railTickCmd()
 }
 
 // railTickCmd schedules the next marker frame.
@@ -174,6 +192,7 @@ func (m *Model) advanceRail() bool {
 		m.anim.frame = railFrames
 		m.anim.from = m.anim.to
 		m.anim.active = false
+		m.anim.scheduled = false
 		return false
 	}
 	return true
@@ -222,7 +241,7 @@ func (m Model) railView() string {
 		if m.railCompact() {
 			name = tab.short
 		}
-		label := itoa(i+1) + " " + name
+		label := strconv.Itoa(i+1) + " " + name
 		if w := lipgloss.Width(label); w < width-2 {
 			label += strings.Repeat(" ", width-2-w)
 		}
@@ -310,10 +329,53 @@ func (m Model) headerView() string {
 	return left + strings.Repeat(" ", gap) + headerMetaStyle.Render(right)
 }
 
+// paneInnerWidth is the number of display columns inside the content
+// pane. The shell wraps the body to this width before measuring it, so
+// the viewport counts painted rows rather than logical ones.
+func (m Model) paneInnerWidth() int {
+	if m.width <= 0 {
+		return 0
+	}
+	if m.railVisible() {
+		inner := m.width - m.railColumnWidth() - 1 - paneStyle.GetHorizontalFrameSize()
+		if inner < 1 {
+			inner = 1
+		}
+		return inner
+	}
+	return m.width
+}
+
+// wrapContent pane-wraps the body at the real content width. Every
+// height measurement in the shell runs on this wrapped form.
+func (m Model) wrapContent(content string) string {
+	width := m.paneInnerWidth()
+	if width <= 0 {
+		return content
+	}
+	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(content)
+}
+
+// bodyLines is the active screen rendered, wrapped and split into the
+// display rows the viewport scrolls through.
+func (m Model) bodyLines() []string {
+	return contentLines(m.wrapContent(m.viewContent()))
+}
+
+// contentHeight is the body height the shell can give the content; zero
+// means the terminal size is unknown.
+func (m Model) contentHeight() int {
+	if m.height <= 0 {
+		return 0
+	}
+	height, _, _ := m.contentViewport(0)
+	return height
+}
+
 // paneView frames the active screen in the content pane, truncating
 // lines that no longer fit beside the rail.
 func (m Model) paneView(body string) string {
-	inner := m.width - m.railColumnWidth() - 1 - paneStyle.GetHorizontalFrameSize()
+	inner := m.paneInnerWidth()
 	if inner < 1 {
 		inner = 1
 	}
@@ -339,21 +401,25 @@ func (m Model) shellChromeHeight() int {
 
 // contentViewport returns the visible body height, the clamped offset
 // and whether the content needs scrolling. A zero height means the
-// terminal size is unknown, so the whole content is rendered.
+// terminal size is unknown, so the whole content is rendered. The caller
+// wraps the content first, so lines are painted rows.
 func (m Model) contentViewport(lines int) (height, offset int, overflow bool) {
 	if m.height <= 0 {
 		return 0, 0, false
 	}
 	height = m.height - m.shellChromeHeight()
-	if height < 5 {
-		height = 5
+	if height < 0 {
+		height = 0
 	}
 	overflow = lines > height
 	if overflow {
-		// The scroll hint takes one more footer row.
-		height--
-		if height < 5 {
-			height = 5
+		if height > 2 {
+			// The scroll hint takes one more footer row.
+			height--
+		} else {
+			// At extreme heights a hidden hint is better than an
+			// overflowing frame: clip the body and advertise nothing.
+			overflow = false
 		}
 	}
 	offset = m.contentOffset
@@ -384,14 +450,14 @@ func (m *Model) clampContentOffset() {
 		m.contentOffset = 0
 		return
 	}
-	_, offset, _ := m.contentViewport(len(contentLines(m.viewContent())))
+	_, offset, _ := m.contentViewport(len(m.bodyLines()))
 	m.contentOffset = offset
 }
 
 // scrollContent moves the body by one page; it is a no-op when the
 // content already fits.
 func (m Model) scrollContent(dir int) Model {
-	lines := contentLines(m.viewContent())
+	lines := m.bodyLines()
 	height, offset, overflow := m.contentViewport(len(lines))
 	if !overflow || height < 1 {
 		return m
@@ -445,15 +511,21 @@ func (m Model) footerLine() string {
 
 // shellView composes header, navigation, content and footer. The header,
 // rail and footer stay pinned; only the body is clipped to the viewport.
+// The content is wrapped before it is measured, so a wrapped line counts
+// as a row and the header can never be pushed off the terminal.
 func (m Model) shellView(content string) string {
+	content = m.wrapContent(content)
 	lines := contentLines(content)
 	height, offset, overflow := m.contentViewport(len(lines))
-	if height > 0 {
+	switch {
+	case height > 0:
 		end := offset + height
 		if end > len(lines) {
 			end = len(lines)
 		}
 		lines = lines[offset:end]
+	case m.height > 0:
+		lines = nil
 	}
 	// Keep the pane at least as tall as the rail when the window allows
 	// it, so the frame never ends halfway down the navigation column.
@@ -469,7 +541,15 @@ func (m Model) shellView(content string) string {
 	b.WriteString("\n\n")
 
 	if m.railVisible() {
-		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, m.railView(), " ", m.paneView(body)))
+		pane := m.paneView(body)
+		rail := m.railView()
+		// A very short terminal can leave the pane shorter than the
+		// eight-row rail; clip the rail rather than overflow.
+		if paneRows := len(contentLines(pane)); paneRows < len(contentLines(rail)) {
+			railLines := contentLines(rail)
+			rail = strings.Join(railLines[:paneRows], "\n")
+		}
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, rail, " ", pane))
 	} else {
 		// Narrow terminals keep the original numeric tab line.
 		b.WriteString(m.tabsView())
@@ -488,5 +568,14 @@ func (m Model) shellView(content string) string {
 			b.WriteString(footerStyle.Render(truncateFooter("PgUp/PgDn — прокрутка", m.width)))
 		}
 	}
-	return b.String()
+	view := b.String()
+	// Last-resort guard for terminals below the minimum chrome height:
+	// the first m.height rows win, the header always stays on top.
+	if m.height > 0 {
+		rows := contentLines(view)
+		if len(rows) > m.height {
+			view = strings.Join(rows[:m.height], "\n")
+		}
+	}
+	return view
 }

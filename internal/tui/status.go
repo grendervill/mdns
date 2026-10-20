@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-
 	"mydns/internal/api"
 )
 
@@ -133,7 +131,7 @@ func narrowLinkLine(title, uri string, width int) string {
 		uriWidth = 8
 	}
 	uri = truncate(uri, uriWidth)
-	padding := strings.Repeat(" ", titleCol-len([]rune(title)))
+	padding := strings.Repeat(" ", max(0, titleCol-displayWidth(title)))
 	return "  " + dimStyle.Render(title) + padding + " " + uri + "\n"
 }
 
@@ -146,17 +144,15 @@ func narrowUpstreamLine(u api.UpstreamStatus, width int) string {
 	)
 	latency := formatLatency(u.LatencyMS)
 	state := healthLabel(u)
-	used := 2 + nameCol + 1 + transportCol + 1 + 1 + len([]rune(latency)) + 2 + lipgloss.Width(state)
+	used := 2 + nameCol + 1 + transportCol + 1 + 1 + displayWidth(latency) + 2 + displayWidth(state)
 	addressWidth := width - used
 	if addressWidth < 8 {
 		addressWidth = 8
 	}
-	name := truncate(u.Name, nameCol)
-	transport := truncate(u.Transport, transportCol)
-	address := truncate(u.Address, addressWidth)
-	return fmt.Sprintf("  %-*s %-*s %-*s %*s  %s\n",
-		nameCol, name, transportCol, transport, addressWidth, address,
-		len([]rune(latency)), latency, state)
+	name := padCells(truncate(u.Name, nameCol), nameCol)
+	transport := padCells(truncate(u.Transport, transportCol), transportCol)
+	address := padCells(truncate(u.Address, addressWidth), addressWidth)
+	return "  " + name + " " + transport + " " + address + " " + latency + "  " + state + "\n"
 }
 
 // formatLatency renders a latency in milliseconds.

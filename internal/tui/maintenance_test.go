@@ -517,10 +517,17 @@ func TestMaintenanceFooterAndHelp(t *testing.T) {
 	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 	m = step(m, key('?'))
 	help := m.View()
-	for _, want := range []string{"Обслуживание (экран 8)", "резервную копию", "сменить пароль", "применить текущую конфигурацию", "uptime"} {
+	for _, want := range []string{"Обслуживание (экран 8)", "резервную копию", "сменить пароль", "применить текущую конфигурацию"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help misses %q:\n%s", want, help)
 		}
+	}
+	// The expanded help is taller than 40 rows: scroll to its tail.
+	for i := 0; i < 4; i++ {
+		m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	if tail := m.View(); !strings.Contains(tail, "uptime") {
+		t.Errorf("scrolled help misses uptime:\n%s", tail)
 	}
 }
 

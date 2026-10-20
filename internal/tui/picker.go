@@ -1,9 +1,11 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
 )
 
 // pickerItem is one choice of a two-pane picker: the row text, a short
@@ -217,14 +219,14 @@ func (p *picker) listPane(width, height int) string {
 	} else {
 		start, rows, topMore, bottomMore := p.visible(height)
 		if topMore {
-			lines = append(lines, dimStyle.Render("↑ ещё "+itoa(start)))
+			lines = append(lines, dimStyle.Render("↑ ещё "+strconv.Itoa(start)))
 		}
 		end := start + rows
 		for i := start; i < end; i++ {
 			lines = append(lines, p.row(i, inner))
 		}
 		if bottomMore && len(lines) < height {
-			lines = append(lines, dimStyle.Render("↓ ещё "+itoa(len(p.items)-end)))
+			lines = append(lines, dimStyle.Render("↓ ещё "+strconv.Itoa(len(p.items)-end)))
 		}
 	}
 	for len(lines) < height {
@@ -307,8 +309,9 @@ func (p *picker) detailPane(width, height int) string {
 	return paneStyle.Render(strings.Join(lines, "\n"))
 }
 
-// wrapText breaks plain text into lines of at most width runes. Long
-// words are split; empty paragraphs stay as blank lines.
+// wrapText breaks plain text into lines of at most width display cells.
+// Long words are split without separating a wide rune from its pair;
+// empty paragraphs stay as blank lines.
 func wrapText(text string, width int) []string {
 	if width < 1 {
 		width = 1
@@ -321,14 +324,14 @@ func wrapText(text string, width int) []string {
 		}
 		line := ""
 		for _, word := range strings.Fields(para) {
-			for len([]rune(word)) > width {
+			for displayWidth(word) > width {
 				if line != "" {
 					out = append(out, line)
 					line = ""
 				}
-				runes := []rune(word)
-				out = append(out, string(runes[:width]))
-				word = string(runes[width:])
+				head, rest := splitCells(word, width)
+				out = append(out, head)
+				word = rest
 			}
 			if word == "" {
 				continue
@@ -336,7 +339,7 @@ func wrapText(text string, width int) []string {
 			switch {
 			case line == "":
 				line = word
-			case len([]rune(line))+1+len([]rune(word)) <= width:
+			case displayWidth(line)+1+displayWidth(word) <= width:
 				line += " " + word
 			default:
 				out = append(out, line)
@@ -346,6 +349,23 @@ func wrapText(text string, width int) []string {
 		out = append(out, line)
 	}
 	return out
+}
+
+// splitCells cuts s after at most width display cells and returns both
+// halves. A single rune wider than the budget is still emitted, so the
+// caller always makes progress.
+func splitCells(s string, width int) (head, rest string) {
+	used := 0
+	cut := len(s)
+	for i, r := range s {
+		w := runewidth.RuneWidth(r)
+		if used+w > width && i > 0 {
+			cut = i
+			break
+		}
+		used += w
+	}
+	return s[:cut], s[cut:]
 }
 
 // pickerContentWidth is the width available inside the shell's pane.
@@ -363,16 +383,25 @@ func (m Model) pickerContentWidth() int {
 	return m.width
 }
 
-// pickerContentHeight is the body height available to a picker.
+// pickerContentHeight is the pane content height that makes the whole
+// picker fit the body: the title, the two borders, the rows, the details
+// and the hint line all share the shell's body. A stacked layout adds
+// two more border rows, so it reserves them too.
 func (m Model) pickerContentHeight() int {
-	if m.height <= 0 {
-		return 24
+	h := m.contentHeight()
+	if h <= 0 {
+		return 20
 	}
-	h := m.height - 8 // header, footer, pane borders and the hint line
-	if h < 5 {
-		h = 5
+	chrome := 4 // title + hint + the pane's two border rows
+	left, right := pickerPaneWidths(m.pickerContentWidth())
+	if left+right+1 < pickerStackWidth {
+		chrome = 6 // two stacked panes: four border rows
 	}
-	return h
+	pane := h - chrome
+	if pane < 3 {
+		pane = 3
+	}
+	return pane
 }
 
 // pickerPaneWidths splits the content width: the list gets about 40%,

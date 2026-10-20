@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -55,8 +56,8 @@ func TestPickerScrollWindow(t *testing.T) {
 	items := make([]pickerItem, 30)
 	for i := range items {
 		items[i] = pickerItem{
-			Label:   "строка-" + itoa(i),
-			Details: []string{"детали " + itoa(i)},
+			Label:   "строка-" + strconv.Itoa(i),
+			Details: []string{"детали " + strconv.Itoa(i)},
 		}
 	}
 	p := picker{title: "Длинный", items: items, cursor: 20}
@@ -200,5 +201,72 @@ func TestPickerEnterEscCallbacks(t *testing.T) {
 	m = drainCmd(t, m, cmd)
 	if len(sc.updates) != 1 || sc.updates[0].Strategy != "failover" {
 		t.Errorf("updates = %+v, want one failover write", sc.updates)
+	}
+}
+
+// TestPickerCJKWidths checks a wide-rune label never pushes a picker row
+// past the pane at content widths 75 and 90: every line fits, the
+// borders stay on one line and the shell height is respected.
+func TestPickerCJKWidths(t *testing.T) {
+	for _, size := range [][2]int{{100, 30}, {115, 30}} {
+		width, height := size[0], size[1]
+		m := New(&stubClient{}, Options{DisableAnimations: true})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+		m.picker = picker{
+			title: "Провайдеры",
+			items: []pickerItem{
+				{Label: "AdGuard Chinese (中文)", Status: "сейчас", Details: []string{"Китайский фильтр AdGuard: 中文 домены."}},
+				{Label: "Cloudflare (безопасный)", Details: []string{"Обычный резолвер."}},
+			},
+		}
+		m.screen = screenStrategyPicker
+		m.settleRail()
+
+		if got := m.pickerContentWidth(); got != width-25 {
+			t.Fatalf("%dx%d: content width = %d, want %d", width, height, got, width-25)
+		}
+		view := m.View()
+		for _, line := range strings.Split(view, "\n") {
+			if w := lipgloss.Width(line); w > width {
+				t.Errorf("%dx%d: line width %d > %d: %q", width, height, w, width, line)
+			}
+			if strings.Count(line, "╭") != strings.Count(line, "╮") {
+				t.Errorf("%dx%d: unbalanced top border: %q", width, height, line)
+			}
+			if strings.Count(line, "╰") != strings.Count(line, "╯") {
+				t.Errorf("%dx%d: unbalanced bottom border: %q", width, height, line)
+			}
+		}
+		if n := strings.Count(view, "\n") + 1; n > height {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d", width, height, n, height)
+		}
+		if !strings.Contains(view, pickerHint) {
+			t.Errorf("%dx%d: the picker hint is clipped:\n%s", width, height, view)
+		}
+		if !strings.Contains(view, "╰") {
+			t.Errorf("%dx%d: the picker bottom border is clipped:\n%s", width, height, view)
+		}
+	}
+}
+
+// TestPickerFitsBodyHeight checks the picker hint and bottom border are
+// visible at 120x40 and 80x24: the panes no longer overshoot the body.
+func TestPickerFitsBodyHeight(t *testing.T) {
+	for _, size := range [][2]int{{120, 40}, {80, 24}} {
+		cfg := upstreamCfgWith()
+		m := upstreamModel(&stubClient{cfg: cfg}, cfg)
+		m = step(m, tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m = step(m, key('s'))
+
+		view := m.View()
+		if !strings.Contains(view, pickerHint) {
+			t.Errorf("%dx%d: the picker hint is clipped:\n%s", size[0], size[1], view)
+		}
+		if !strings.Contains(view, "╰") {
+			t.Errorf("%dx%d: the picker bottom border is clipped:\n%s", size[0], size[1], view)
+		}
+		if n := strings.Count(view, "\n") + 1; n > size[1] {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d", size[0], size[1], n, size[1])
+		}
 	}
 }

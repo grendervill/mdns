@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,9 @@ const (
 	// screenTransportPicker is the transport list opened by Enter on
 	// the transport field of the custom-upstream form.
 	screenTransportPicker
+	// screenUserRules lists the allow/block user rules opened with x on
+	// Filters; Enter deletes the selected rule.
+	screenUserRules
 	// screenHelp is not a tab: the ? key opens it as an overlay and
 	// Esc (or any digit) leaves it.
 	screenHelp
@@ -351,6 +355,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next := updated.(Model)
 	if next.screen != prev {
 		next.contentOffset = 0
+	}
+	// settleRail can start a marker transition on a child screen or a
+	// back-navigation; schedule its first frame here so every caller gets
+	// the animation without threading a command through the key handlers.
+	if next.anim.active && !next.anim.scheduled {
+		next.anim.scheduled = true
+		cmd = tea.Batch(cmd, next.railTickCmd())
 	}
 	// Live query events can arrive in bursts and re-rendering the whole
 	// screen per event would be wasteful; the renderer clamps anyway.
@@ -1032,17 +1043,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // openWizard opens (or re-shows) the embedded wizard over the control
 // API.
 func (m Model) openWizard() (tea.Model, tea.Cmd) {
+	from := m.railMarkerRow()
 	m.screen = screenWizard
-	m.settleRail()
+	animCmd := m.railTo(m.railIndex(screenWizard), from)
 	if m.wizard != nil {
-		return m, m.wizard.restartProbes() // resume the pings if parked
+		return m, tea.Batch(animCmd, m.wizard.restartProbes()) // resume the pings if parked
 	}
 	if m.wizardLoading {
-		return m, nil
+		return m, animCmd
 	}
 	m.wizardNote = ""
 	m.wizardLoading = true
-	return m, openWizardCmd(m.client)
+	return m, tea.Batch(animCmd, openWizardCmd(m.client))
 }
 
 // forwardToWizard hands a message to the embedded wizard.
@@ -1256,7 +1268,7 @@ func (m Model) tabsView() string {
 	active := m.railIndex(m.screen)
 	parts := make([]string, 0, len(screenTabs))
 	for i, tab := range screenTabs {
-		label := itoa(i+1) + " " + tab.name
+		label := strconv.Itoa(i+1) + " " + tab.name
 		if i == active {
 			parts = append(parts, activeTabStyle.Render(label))
 		} else {
@@ -1342,19 +1354,4 @@ func (m *Model) helpView() string {
 func (m Model) Run() error {
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
-}
-
-// itoa is a tiny int-to-string helper for the tab labels.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [4]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }

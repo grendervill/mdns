@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -8,7 +9,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"mydns/internal/api"
+	"mydns/internal/config"
 	"mydns/internal/links"
+	"mydns/internal/qlog"
 )
 
 // shellModel builds a loaded status model at the given terminal size
@@ -263,10 +266,10 @@ func fullStatus() api.Status {
 	st := sampleStatus()
 	for i := 0; i < 14; i++ {
 		st.Upstreams = append(st.Upstreams, api.UpstreamStatus{
-			ID:        "up" + itoa(i),
-			Name:      "Provider " + itoa(i),
+			ID:        "up" + strconv.Itoa(i),
+			Name:      "Provider " + strconv.Itoa(i),
 			Transport: "plain",
-			Address:   "198.51.100." + itoa(i) + ":53",
+			Address:   "198.51.100." + strconv.Itoa(i) + ":53",
 			Enabled:   true,
 			Healthy:   i%2 == 0,
 			LatencyMS: float64(10 + i),
@@ -336,11 +339,12 @@ func TestContentScrollKeys(t *testing.T) {
 	}
 
 	// Repeated PgDn stops at the last page.
-	height, _, overflow := m.contentViewport(len(contentLines(m.viewContent())))
+	lines := m.bodyLines()
+	height, _, overflow := m.contentViewport(len(lines))
 	if !overflow {
 		t.Fatalf("the test status does not overflow")
 	}
-	max := len(contentLines(m.viewContent())) - height
+	max := len(lines) - height
 	for i := 0; i < 20; i++ {
 		m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
 	}
@@ -417,5 +421,91 @@ func TestStatusNarrowKeepsOneLinePerUpstream(t *testing.T) {
 		if i+1 < len(lines) && lines[i+1] != "" {
 			t.Errorf("the long address wrapped onto a second line: %q", lines[i+1])
 		}
+	}
+}
+
+// assertShellFits fails when View() is taller than the terminal or the
+// header is not its first line.
+func assertShellFits(t *testing.T, m Model, width, height int) {
+	t.Helper()
+	lines := strings.Split(m.View(), "\n")
+	if len(lines) > height {
+		t.Errorf("%dx%d: View() has %d lines, want at most %d:\n%s", width, height, len(lines), height, m.View())
+	}
+	if !strings.HasPrefix(lines[0], "mdns") {
+		t.Errorf("%dx%d: the header is not the first line: %q", width, height, lines[0])
+	}
+}
+
+// TestEveryScreenFitsTerminalHeight is the generic guard against layout
+// drift: every tab fits its terminal after the body is pane-wrapped and
+// keeps the header pinned.
+func TestEveryScreenFitsTerminalHeight(t *testing.T) {
+	screens := []screen{
+		screenStatus, screenRequests, screenUpstreams,
+		screenSettings, screenHelp, screenMaintenance,
+	}
+	for _, size := range [][2]int{{80, 24}, {100, 30}} {
+		width, height := size[0], size[1]
+		m := shellModel(t, width, height)
+		cfg := config.Default()
+		m = step(m, configLoadedMsg{cfg: cfg})
+		m = step(m, filterConfigLoadedMsg{cfg: cfg})
+		m = step(m, maintenanceConfigMsg{cfg: cfg})
+		m = step(m, backupsLoadedMsg{backups: []BackupInfo{{Name: "snap-1.json"}, {Name: "snap-2.json"}}})
+		entries := make([]qlog.Entry, 0, 60)
+		for i := 0; i < 60; i++ {
+			entries = append(entries, qlog.Entry{
+				QName: strconv.Itoa(i) + ".example.com.", Proto: "udp",
+				ClientIP: "192.168.1.10", LatencyMS: 12.5,
+			})
+		}
+		m = step(m, requestsLoadedMsg{entries: entries})
+
+		for _, sc := range screens {
+			m.screen = sc
+			m.contentOffset = 0
+			m.settleRail()
+			assertShellFits(t, m, width, height)
+		}
+	}
+}
+
+// TestSmallTerminalViewFits checks the 40x12 fallback no longer spills
+// past the terminal.
+func TestSmallTerminalViewFits(t *testing.T) {
+	m := shellModel(t, 40, 12)
+	assertShellFits(t, m, 40, 12)
+}
+
+// TestBackNavigationAnimatesMarker checks settleRail starts the marker
+// transition (opening the wizard leaves the status row) instead of
+// snapping, and the tick chain still stops on the target row.
+func TestBackNavigationAnimatesMarker(t *testing.T) {
+	m := New(&stubClient{status: sampleStatus()}, Options{})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	updated, cmd := m.Update(key('2'))
+	m = updated.(Model)
+	if m.screen != screenWizard {
+		t.Fatalf("2 opened %v, want the wizard", m.screen)
+	}
+	if !m.anim.active || m.anim.from != 0 || m.anim.to != 1 {
+		t.Fatalf("settleRail animation = %+v, want 0→1 and active", m.anim)
+	}
+	if cmd == nil {
+		t.Fatalf("the wizard transition scheduled no command")
+	}
+	if !m.anim.scheduled {
+		t.Errorf("the marker animation has no tick in flight")
+	}
+	for frame := 0; frame < railFrames; frame++ {
+		m = step(m, railTickMsg{})
+	}
+	if m.anim.active {
+		t.Errorf("the marker animation is still active after %d frames", railFrames)
+	}
+	if got := m.railMarkerRow(); got != 1 {
+		t.Errorf("marker row = %d, want the wizard row 1", got)
 	}
 }
