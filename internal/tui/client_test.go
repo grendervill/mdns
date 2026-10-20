@@ -34,6 +34,9 @@ type stubController struct {
 	createdLabels []string
 	restoredNames []string
 	deletedNames  []string
+
+	stats   stats.Snapshot
+	started time.Time
 }
 
 func (s *stubController) Status(context.Context) (api.Status, error) { return s.status, nil }
@@ -47,8 +50,8 @@ func (s *stubController) Probe(context.Context, []providers.Endpoint) []probe.Re
 	return nil
 }
 func (s *stubController) Requests(int) []qlog.Entry { return nil }
-func (s *stubController) Stats() stats.Snapshot     { return stats.Snapshot{} }
-func (s *stubController) Started() time.Time        { return time.Time{} }
+func (s *stubController) Stats() stats.Snapshot     { return s.stats }
+func (s *stubController) Started() time.Time        { return s.started }
 func (s *stubController) RequestsQuery(qlog.Query, int, int) ([]qlog.Entry, int) {
 	return nil, 0
 }
@@ -119,6 +122,29 @@ func TestUnixClientStatus(t *testing.T) {
 	}
 	if st.Domain != "dns.example.com" {
 		t.Errorf("Domain = %q, want dns.example.com", st.Domain)
+	}
+}
+
+// TestUnixClientStats checks the /stats round-trip: the counters and the
+// daemon start time decode into api.StatsResponse.
+func TestUnixClientStats(t *testing.T) {
+	since := time.Date(2026, 10, 18, 9, 30, 0, 0, time.UTC)
+	ctl := &stubController{
+		stats:   stats.Snapshot{Total: 7, Outcomes: map[string]uint64{"blocked": 2}},
+		started: since,
+	}
+	sock, _ := startAPIServer(t, ctl)
+
+	c := tui.NewUnixClient(sock)
+	got, err := c.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("Stats() = %v, want nil", err)
+	}
+	if got.Total != 7 || got.Outcomes["blocked"] != 2 {
+		t.Errorf("stats = %+v, want total 7 and blocked 2", got)
+	}
+	if !got.Since.Equal(since) {
+		t.Errorf("Since = %v, want %v", got.Since, since)
 	}
 }
 

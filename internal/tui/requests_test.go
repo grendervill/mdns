@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/miekg/dns"
 
 	"mydns/internal/api"
 	"mydns/internal/qlog"
@@ -267,12 +269,13 @@ func TestRequestsFilterPromptVisible(t *testing.T) {
 	}
 }
 
-// TestRequestsRowWidth checks the journal table against its width
-// budget: every row and the header stay within 113 columns.
+// TestRequestsRowWidth checks the journal table against the real pane
+// budget: every row and the header stay within the content width.
 func TestRequestsRowWidth(t *testing.T) {
-	const budget = 113
-
 	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	budget := m.pickerContentWidth()
+
 	entries := []qlog.Entry{
 		{
 			QName: strings.Repeat("very-long-label.", 8) + "example.com.", Proto: "dot",
@@ -287,18 +290,18 @@ func TestRequestsRowWidth(t *testing.T) {
 	}
 
 	for _, e := range entries {
-		if line := m.requestLine(e); utf8.RuneCountInString(line) > budget {
-			t.Errorf("row is %d columns, want <= %d: %q", utf8.RuneCountInString(line), budget, line)
+		if line := m.requestLine(e); lipgloss.Width(line) > budget {
+			t.Errorf("row is %d columns, want <= %d: %q", lipgloss.Width(line), budget, line)
 		}
 		m = step(m, requestEvent(e))
 	}
-	if got := utf8.RuneCountInString(requestsHeader()); got != budget {
+	if got := lipgloss.Width(m.requestsHeader()); got != budget {
 		t.Errorf("header is %d columns, want %d", got, budget)
 	}
 
 	for _, line := range strings.Split(m.View(), "\n") {
-		if strings.Contains(line, "example.com.") && utf8.RuneCountInString(line) > budget {
-			t.Errorf("rendered row is %d columns, want <= %d: %q", utf8.RuneCountInString(line), budget, line)
+		if strings.Contains(line, "example.com.") && lipgloss.Width(line) > m.width {
+			t.Errorf("rendered row is %d columns, want <= %d: %q", lipgloss.Width(line), m.width, line)
 		}
 	}
 }
@@ -358,5 +361,223 @@ func TestRequestsScrollStops(t *testing.T) {
 	}
 	if view := m.View(); !strings.Contains(view, "d0.example.com.") {
 		t.Errorf("View() is blank at full scroll:\n%s", view)
+	}
+}
+
+// requestEntries builds n synthetic journal entries, oldest first.
+func requestEntries(n int) []qlog.Entry {
+	out := make([]qlog.Entry, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, qlog.Entry{
+			QName:     fmt.Sprintf("d%d.example.com.", i),
+			Proto:     "udp",
+			ClientIP:  "192.168.1.10",
+			Rcode:     dns.RcodeSuccess,
+			QType:     dns.TypeA,
+			LatencyMS: float64(i),
+		})
+	}
+	return out
+}
+
+// TestRequestsNewestVisible drives the 60-entry feed at 200x50 and checks
+// the newest entry is rendered on open, first among the rows.
+func TestRequestsNewestVisible(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 200, Height: 50})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+
+	view := m.View()
+	newest := strings.Index(view, "d59.example.com.")
+	older := strings.Index(view, "d58.example.com.")
+	if newest < 0 {
+		t.Fatalf("the newest entry is not visible on open:\n%s", view)
+	}
+	if older < 0 || newest > older {
+		t.Errorf("the feed is not newest first (d59 at %d, d58 at %d)", newest, older)
+	}
+	if m.requestsScroll != 0 {
+		t.Errorf("requestsScroll = %d on open, want 0", m.requestsScroll)
+	}
+}
+
+// TestRequestsOneLinePerEntryAt120 checks the single-line table at
+// 120x40: the rows fit the pane, nothing wraps, and the shell stays
+// within 40 lines with the header pinned.
+func TestRequestsOneLinePerEntryAt120(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > 40 {
+		t.Errorf("View() has %d lines at 120x40, want at most 40:\n%s", len(lines), view)
+	}
+	if !strings.HasPrefix(lines[0], "mdns") {
+		t.Errorf("the header is not the first line: %q", lines[0])
+	}
+	if !strings.Contains(view, "время") {
+		t.Errorf("the column header is missing:\n%s", view)
+	}
+	rows := 0
+	for _, line := range lines {
+		if lipgloss.Width(line) > 120 {
+			t.Errorf("line overflows 120 columns (%d): %q", lipgloss.Width(line), line)
+		}
+		if strings.Contains(line, "d59.example.com.") || strings.Contains(line, "00:00:00") {
+			rows++
+			if n := strings.Count(line, "00:00:00"); n > 1 {
+				t.Errorf("a wrapped row has %d timestamps: %q", n, line)
+			}
+		}
+	}
+	if rows == 0 {
+		t.Fatalf("no rendered request rows:\n%s", view)
+	}
+	if !strings.Contains(view, "d59.example.com.") {
+		t.Errorf("the newest entry is clipped:\n%s", view)
+	}
+}
+
+// TestRequestsLiveUpdateKeepsNewest checks a live event keeps the newest
+// row visible and scrolling skips it from the newest end.
+func TestRequestsLiveUpdateKeepsNewest(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+
+	m = step(m, requestEvent(qlog.Entry{QName: "live.example.com.", Proto: "udp"}))
+	if m.requestsScroll != 0 {
+		t.Fatalf("a live event left requestsScroll = %d", m.requestsScroll)
+	}
+	if view := m.View(); !strings.Contains(view, "live.example.com.") {
+		t.Errorf("the live entry is not visible:\n%s", view)
+	}
+
+	m = step(m, key('k'))
+	if m.requestsScroll != 1 {
+		t.Fatalf("k set requestsScroll = %d, want 1", m.requestsScroll)
+	}
+	view := m.View()
+	if strings.Contains(view, "live.example.com.") {
+		t.Errorf("scrolling up did not skip the newest row:\n%s", view)
+	}
+	if !strings.Contains(view, "d59.example.com.") {
+		t.Errorf("the second-newest row is not at the top after one scroll:\n%s", view)
+	}
+}
+
+// TestRequestsScrollKeptOnLiveEvent checks a reader who scrolled up is
+// not yanked back to the tail when a live entry arrives.
+func TestRequestsScrollKeptOnLiveEvent(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+	m = step(m, key('k'))
+	m = step(m, key('k'))
+	if m.requestsScroll != 2 {
+		t.Fatalf("requestsScroll = %d after two k, want 2", m.requestsScroll)
+	}
+
+	m = step(m, requestEvent(qlog.Entry{QName: "live.example.com.", Proto: "udp"}))
+	if m.requestsScroll != 3 {
+		t.Errorf("a live event left requestsScroll at %d, want 3 (one new row above keeps the view)", m.requestsScroll)
+	}
+	if strings.Contains(m.View(), "live.example.com.") {
+		t.Errorf("the scrolled-up reader jumped to the newest entry:\n%s", m.View())
+	}
+}
+
+// TestRequestsFilterPromptFitsTerminal pins the prompt to the last
+// visible row on both target sizes with a full feed and an active filter.
+func TestRequestsFilterPromptFitsTerminal(t *testing.T) {
+	for _, size := range [][2]int{{120, 40}, {80, 24}} {
+		width, height := size[0], size[1]
+
+		// Full feed, prompt open with typed text, no committed filter.
+		m := New(&stubClient{}, Options{Initial: "requests"})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+		m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+		m = step(m, key('f'))
+		m = typeText(m, "d4")
+
+		view := m.View()
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): d4▏") {
+			t.Errorf("%dx%d: the prompt is not rendered:\n%s", width, height, view)
+		}
+		lines := strings.Split(view, "\n")
+		if len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d:\n%s", width, height, len(lines), height, view)
+		}
+		if strings.Contains(view, "PgUp/PgDn — прокрутка") {
+			t.Errorf("%dx%d: the prompt was pushed into the scroll region:\n%s", width, height, view)
+		}
+		if m.contentOffset != 0 {
+			t.Errorf("%dx%d: contentOffset = %d, want 0", width, height, m.contentOffset)
+		}
+
+		// A committed filter stays visible while its prompt is reopened.
+		m = step(m, enterKey())
+		m = step(m, key('f'))
+		view = m.View()
+		if !strings.Contains(view, "Фильтр: «d4»") {
+			t.Errorf("%dx%d: the filter note vanished:\n%s", width, height, view)
+		}
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): d4▏") {
+			t.Errorf("%dx%d: the prompt is clipped with an active filter:\n%s", width, height, view)
+		}
+		if lines := strings.Split(view, "\n"); len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines with a filter, want at most %d:\n%s",
+				width, height, len(lines), height, view)
+		}
+	}
+}
+
+// TestRequestsFilterAtTerminalSize checks the filter still narrows the
+// sized feed and the note keeps the newest match visible.
+func TestRequestsFilterAtTerminalSize(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "requests"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+
+	m = step(m, key('f'))
+	m = typeText(m, "d42")
+	m = step(m, enterKey())
+	view := m.View()
+	if !strings.Contains(view, "найдено 1 из 60") {
+		t.Errorf("the sized feed lost the filter note:\n%s", view)
+	}
+	if !strings.Contains(view, "d42.example.com.") || strings.Contains(view, "d41.example.com.") {
+		t.Errorf("the sized feed did not narrow:\n%s", view)
+	}
+}
+
+// TestRequestsLongFilterPromptFits pins the prompt with a committed
+// filter whose note itself wraps at 80 columns.
+func TestRequestsLongFilterPromptFits(t *testing.T) {
+	for _, size := range [][2]int{{120, 40}, {80, 24}} {
+		width, height := size[0], size[1]
+		m := New(&stubClient{}, Options{Initial: "requests"})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+		m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+		m = step(m, key('f'))
+		m = typeText(m, "example.com")
+		m = step(m, enterKey())
+		m = step(m, key('f'))
+
+		view := m.View()
+		if !strings.Contains(view, "Фильтр: «example.com»") {
+			t.Errorf("%dx%d: the committed filter note is missing:\n%s", width, height, view)
+		}
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): example.com▏") {
+			t.Errorf("%dx%d: the reopened prompt is clipped:\n%s", width, height, view)
+		}
+		if strings.Contains(view, "PgUp/PgDn — прокрутка") {
+			t.Errorf("%dx%d: the prompt was pushed into the scroll region:\n%s", width, height, view)
+		}
+		if lines := strings.Split(view, "\n"); len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d:\n%s", width, height, len(lines), height, view)
+		}
 	}
 }

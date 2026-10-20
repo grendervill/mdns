@@ -7,7 +7,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
+	"mydns/internal/api"
 	"mydns/internal/auth"
 	"mydns/internal/config"
 )
@@ -348,14 +350,151 @@ func TestMaintenancePasswordEsc(t *testing.T) {
 	})
 }
 
+// TestMaintenanceShowsVersionAndUptime checks the daemon identity line:
+// the version comes from the loaded status and uptime from /stats since.
+func TestMaintenanceShowsVersionAndUptime(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg()}
+	m := maintenanceModel(sc, sc.cfg)
+	m = step(m, statusLoadedMsg{st: api.Status{Version: "0.7.0", Domain: "dns.example.com"}})
+	m = step(m, statsLoadedMsg{stats: api.StatsResponse{Since: time.Now().Add(-2*time.Hour - 5*time.Minute)}})
+
+	view := m.View()
+	for _, want := range []string{"версия v0.7.0", "uptime 2 ч 5 мин"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() misses %q:\n%s", want, view)
+		}
+	}
+
+	m = step(m, statsLoadedMsg{err: errors.New("stats: daemon down")})
+	if view := m.View(); !strings.Contains(view, "uptime недоступен") {
+		t.Errorf("View() misses the stats error note:\n%s", view)
+	}
+}
+
+// TestMaintenanceVersionPrefixOnce pins the shared version formatting:
+// a daemon version that already carries the "v" prefix is not doubled.
+func TestMaintenanceVersionPrefixOnce(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg()}
+	m := maintenanceModel(sc, sc.cfg)
+	m = step(m, statusLoadedMsg{st: api.Status{Version: "v0.7.0", Domain: "dns.example.com"}})
+
+	view := m.View()
+	if !strings.Contains(view, "версия v0.7.0") {
+		t.Errorf("View() misses the version:\n%s", view)
+	}
+	if strings.Contains(view, "vv0.7.0") {
+		t.Errorf("View() doubles the version prefix:\n%s", view)
+	}
+}
+
+// TestMaintenanceFooterFits checks the long key line ends at the
+// terminal width and never cuts a word in the middle.
+func TestMaintenanceFooterFits(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg()}
+	m := maintenanceModel(sc, sc.cfg)
+	m = step(m, backupsLoadedMsg{backups: nil})
+
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	footer := lines[len(lines)-1]
+	if w := lipgloss.Width(footer); w > 120 {
+		t.Errorf("footer width = %d > 120: %q", w, footer)
+	}
+	if !strings.Contains(footer, "p — пароль панели") {
+		t.Errorf("footer at 120 lost the tail entry: %q", footer)
+	}
+
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	lines = strings.Split(m.View(), "\n")
+	footer = lines[len(lines)-1]
+	if w := lipgloss.Width(footer); w > 80 {
+		t.Errorf("footer width = %d > 80: %q", w, footer)
+	}
+	if !strings.HasSuffix(footer, " …") {
+		t.Errorf("the shortened footer is not ellipsised at a key boundary: %q", footer)
+	}
+}
+
+// TestMaintenanceReapply checks a re-reads the live config and PUTs that
+// exact copy back, then reports success.
+func TestMaintenanceReapply(t *testing.T) {
+	cfg := maintenanceCfg()
+	cfg.Domain = "fresh.example.test"
+	sc := &stubClient{cfg: cfg}
+	m := maintenanceModel(sc, cfg)
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("a returned no reapply command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if len(sc.updates) != 1 {
+		t.Fatalf("UpdateConfig calls = %d, want 1", len(sc.updates))
+	}
+	if got := sc.updates[0].Domain; got != "fresh.example.test" {
+		t.Errorf("applied domain = %q, want the fetched config", got)
+	}
+	if view := m.View(); !strings.Contains(view, "конфигурация применена заново") {
+		t.Errorf("View() misses the reapply note:\n%s", view)
+	}
+}
+
+// TestMaintenanceReapplyError checks a rejected reapply surfaces the API
+// message and clears the success note.
+func TestMaintenanceReapplyError(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg(), updateErr: errors.New("validation: bad domain")}
+	m := maintenanceModel(sc, sc.cfg)
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("a returned no reapply command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if m.maintenanceNote != "" {
+		t.Errorf("note = %q, want it cleared on error", m.maintenanceNote)
+	}
+	if view := m.View(); !strings.Contains(view, "validation: bad domain") {
+		t.Errorf("View() misses the reapply error:\n%s", view)
+	}
+}
+
+// TestMaintenanceReapplyLoadError checks a failed config read never
+// reaches UpdateConfig.
+func TestMaintenanceReapplyLoadError(t *testing.T) {
+	sc := &stubClient{configErr: errors.New("config: unreadable")}
+	m := maintenanceModel(sc, maintenanceCfg())
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatalf("a returned no reapply command")
+	}
+	updated, _ = m.Update(cmd())
+	m = updated.(Model)
+
+	if len(sc.updates) != 0 {
+		t.Errorf("UpdateConfig calls = %d, want 0", len(sc.updates))
+	}
+	if view := m.View(); !strings.Contains(view, "config: unreadable") {
+		t.Errorf("View() misses the config read error:\n%s", view)
+	}
+}
+
 // TestMaintenanceFooterAndHelp checks the tab 8 keys are discoverable.
 func TestMaintenanceFooterAndHelp(t *testing.T) {
 	sc := &stubClient{cfg: maintenanceCfg()}
 	m := maintenanceModel(sc, sc.cfg)
-	m = step(m, tea.WindowSizeMsg{Width: 140, Height: 40})
+	m = step(m, tea.WindowSizeMsg{Width: 170, Height: 40})
 
 	view := m.View()
-	for _, want := range []string{"c — создать", "enter — восстановить", "d — удалить", "p — пароль панели"} {
+	for _, want := range []string{"c — создать", "enter — восстановить", "d — удалить", "a — применить заново", "p — пароль панели"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("maintenance footer misses %q:\n%s", want, view)
 		}
@@ -378,10 +517,17 @@ func TestMaintenanceFooterAndHelp(t *testing.T) {
 	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
 	m = step(m, key('?'))
 	help := m.View()
-	for _, want := range []string{"Обслуживание (экран 8)", "резервную копию", "сменить пароль"} {
+	for _, want := range []string{"Обслуживание (экран 8)", "резервную копию", "сменить пароль", "применить текущую конфигурацию"} {
 		if !strings.Contains(help, want) {
 			t.Errorf("help misses %q:\n%s", want, help)
 		}
+	}
+	// The expanded help is taller than 40 rows: scroll to its tail.
+	for i := 0; i < 4; i++ {
+		m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	if tail := m.View(); !strings.Contains(tail, "uptime") {
+		t.Errorf("scrolled help misses uptime:\n%s", tail)
 	}
 }
 

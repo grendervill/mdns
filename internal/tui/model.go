@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"mydns/internal/api"
 	"mydns/internal/config"
@@ -37,24 +39,40 @@ const (
 	// screenUpstreamForm is the custom-upstream form opened from the
 	// upstreams screen; it is not a tab.
 	screenUpstreamForm
+	// screenStrategyPicker is the routing-strategy list opened with s
+	// from Upstreams or Settings.
+	screenStrategyPicker
+	// screenModePicker is the block-mode list opened with m on Filters.
+	screenModePicker
+	// screenTimezonePicker is the timezone list opened by Enter on the
+	// settings timezone field.
+	screenTimezonePicker
+	// screenTransportPicker is the transport list opened by Enter on
+	// the transport field of the custom-upstream form.
+	screenTransportPicker
+	// screenUserRules lists the allow/block user rules opened with x on
+	// Filters; Enter deletes the selected rule.
+	screenUserRules
 	// screenHelp is not a tab: the ? key opens it as an overlay and
 	// Esc (or any digit) leaves it.
 	screenHelp
 )
 
-// screenTabs is the navigation order; digits 1-8 select these.
+// screenTabs is the navigation order; digits 1-8 select these. short is
+// the two-letter label the compact rail uses on 64-99 column terminals.
 var screenTabs = []struct {
 	name   string
+	short  string
 	screen screen
 }{
-	{"Статус", screenStatus},
-	{"Визард", screenWizard},
-	{"Запросы", screenRequests},
-	{"Upstream'ы", screenUpstreams},
-	{"Фильтры", screenFilters},
-	{"Настройки", screenSettings},
-	{"Диагностика", screenDiag},
-	{"Обслуживание", screenMaintenance},
+	{"Статус", "Ст", screenStatus},
+	{"Визард", "Ви", screenWizard},
+	{"Запросы", "За", screenRequests},
+	{"Upstream'ы", "Up", screenUpstreams},
+	{"Фильтры", "Фи", screenFilters},
+	{"Настройки", "На", screenSettings},
+	{"Диагностика", "Ди", screenDiag},
+	{"Обслуживание", "Об", screenMaintenance},
 }
 
 // Options configure the model.
@@ -62,6 +80,9 @@ type Options struct {
 	// Initial names the starting screen ("status", "requests", ...);
 	// empty means status.
 	Initial string
+	// DisableAnimations freezes the rail marker instantly, keeping View
+	// deterministic for tests.
+	DisableAnimations bool
 }
 
 // Model is the root bubbletea model of the TUI.
@@ -72,12 +93,23 @@ type Model struct {
 	screen screen
 	width  int
 	height int
+	// contentOffset is the first visible body line of a screen taller
+	// than the terminal. The shell chrome never scrolls.
+	contentOffset int
 
 	// helpReturn is the screen the ? overlay was opened from.
 	helpReturn screen
 
 	status    api.Status
 	statusErr error
+
+	// stats carries the daemon counters and start time; uptime is the
+	// duration measured when the stats arrived, so rendering is stable.
+	stats       api.StatsResponse
+	statsErr    error
+	statsLoaded bool
+	uptime      time.Duration
+	uptimeKnown bool
 
 	events <-chan api.Event
 
@@ -94,8 +126,7 @@ type Model struct {
 	filterErr    error
 	// filterCfg is the live configuration the filter edits work on; it
 	// is reloaded whenever the screen is entered.
-	filterCfg     *config.Config
-	catalogCursor int
+	filterCfg *config.Config
 	// filterNewID carries the custom-list ID from the first input step
 	// to the URL step.
 	filterNewID string
@@ -110,15 +141,17 @@ type Model struct {
 	upstreamCursor int
 	upstreamErr    error
 
-	// upstreamCatalogCursor is the highlighted row of the provider
-	// endpoint picker.
-	upstreamCatalogCursor int
-
 	// upstreamForm is the state of the custom-upstream form, carrying
 	// every typed field until ctrl+s applies it.
 	upstreamForm      upstreamFormState
 	upstreamFormField int
 	upstreamFormErr   error
+
+	// picker is the shared state of the active enumeration picker; only
+	// one picker screen is visible at a time. pickerReturn is the
+	// screen Enter and Esc return to.
+	picker       picker
+	pickerReturn screen
 
 	// probeUpstream/probeResult hold the last probe's target and its
 	// rendered outcome, shown under the table.
@@ -146,6 +179,10 @@ type Model struct {
 	wizard        *WizardModel
 	wizardLoading bool
 	wizardNote    string
+
+	// anim is the sliding rail marker; the active text style is set
+	// immediately, the copper bar catches up over a few frames.
+	anim railAnim
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -203,6 +240,9 @@ type (
 	filterConfigLoadedMsg struct {
 		cfg *config.Config
 		err error
+		// keepErr preserves an error set before the reload (a rejected
+		// config write); ordinary loads clear the screen error.
+		keepErr bool
 	}
 	filterUpdatedMsg struct{ err error }
 
@@ -228,6 +268,13 @@ type (
 		err     error
 	}
 
+	// statsLoadedMsg carries the cumulative counters and the daemon
+	// start time (the maintenance uptime).
+	statsLoadedMsg struct {
+		stats api.StatsResponse
+		err   error
+	}
+
 	// eventsRetryMsg re-opens the event stream after eventsRetryDelay.
 	eventsRetryMsg struct{}
 
@@ -236,6 +283,8 @@ type (
 		backups []BackupInfo
 		err     error
 	}
+	// configReappliedMsg reports the re-read-and-PUT maintenance action.
+	configReappliedMsg struct{ err error }
 	// backupDoneMsg reports one create/restore/delete mutation.
 	backupDoneMsg struct {
 		action string
@@ -301,8 +350,32 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(fetchStatus(m.client), subscribe(m.client, m.ctx), m.lazyLoadCmd())
 }
 
-// Update implements tea.Model.
+// Update implements tea.Model. It pins the shell chrome by keeping the
+// content offset in range and clearing it whenever the screen changes.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prev := m.screen
+	updated, cmd := m.update(msg)
+	next := updated.(Model)
+	if next.screen != prev {
+		next.contentOffset = 0
+	}
+	// settleRail can start a marker transition on a child screen or a
+	// back-navigation; schedule its first frame here so every caller gets
+	// the animation without threading a command through the key handlers.
+	if next.anim.active && !next.anim.scheduled {
+		next.anim.scheduled = true
+		cmd = tea.Batch(cmd, next.railTickCmd())
+	}
+	// Live query events can arrive in bursts and re-rendering the whole
+	// screen per event would be wasteful; the renderer clamps anyway.
+	if _, live := msg.(eventMsg); !live {
+		next.clampContentOffset()
+	}
+	return next, cmd
+}
+
+// update folds one message into the model.
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// The embedded wizard owns keys while its tab is active; its probes
 	// keep refreshing even when the user looks at other screens.
 	if m.wizard != nil {
@@ -334,6 +407,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 
+	case railTickMsg:
+		if m.advanceRail() {
+			return m, m.railTickCmd()
+		}
+		return m, nil
+
 	case wizardOpenedMsg:
 		m.wizardLoading = false
 		if msg.err != nil {
@@ -351,8 +430,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.wizardNote = "Мастер: настройки сохранены и применены."
 		m.settingsCfg = nil // the settings screen reloads the fresh config
-		m.screen = screenStatus
-		return m, fetchStatus(m.client)
+		animCmd := m.switchScreen(screenStatus)
+		return m, tea.Batch(animCmd, fetchStatus(m.client))
 
 	case statusLoadedMsg:
 		if msg.err != nil {
@@ -398,7 +477,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.filterCfg = msg.cfg
-		m.filterErr = nil
+		if !msg.keepErr {
+			m.filterErr = nil
+		}
 		if rows := m.filterRows(); len(rows) > 0 && m.filterCursor >= len(rows) {
 			m.filterCursor = len(rows) - 1
 		}
@@ -420,10 +501,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.upstreamFormErr = msg.err
 			// The daemon refused the change: reload the live config so
 			// the filter screens never edit a rejected copy.
-			if m.screen == screenFilters || m.screen == screenFilterCatalog {
+			switch {
+			case m.screen == screenUserRules:
+				// Drop the rejected copy at once (an Enter before the
+				// reload lands must not write it again) and keep the
+				// error visible over the reloaded list.
+				m.filterCfg = nil
+				return m, loadFilterConfigKeepErr(m.client)
+			case m.screen == screenFilters || m.screen == screenFilterCatalog:
 				return m, loadFilterConfig(m.client)
-			}
-			if isUpstreamScreen(m.screen) {
+			case isUpstreamScreen(m.screen):
 				return m, loadUpstreamConfig(m.client)
 			}
 			return m, nil
@@ -468,6 +555,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case statsLoadedMsg:
+		m.statsLoaded = true
+		m.statsErr = msg.err
+		if msg.err == nil {
+			m.stats = msg.stats
+			m.uptimeKnown = !msg.stats.Since.IsZero()
+			m.uptime = 0
+			if m.uptimeKnown {
+				if d := time.Since(msg.stats.Since); d > 0 {
+					m.uptime = d
+				}
+			}
+		}
+		return m, nil
+
 	case diagLoadedMsg:
 		m.diagChecks = buildDiagChecks(msg)
 		m.diagLoaded = true
@@ -489,6 +591,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, nil
+
+	case configReappliedMsg:
+		if msg.err != nil {
+			m.maintenanceNote = ""
+			m.maintenanceErr = fmt.Errorf("не удалось применить конфигурацию: %w", msg.err)
+			return m, nil
+		}
+		m.maintenanceErr = nil
+		m.maintenanceNote = "конфигурация применена заново"
+		return m, fetchStatus(m.client)
 
 	case backupDoneMsg:
 		if msg.err != nil {
@@ -581,7 +693,7 @@ func (m Model) refreshCmd() tea.Cmd {
 	case screenDiag:
 		cmds = append(cmds, loadDiag(m.client))
 	case screenMaintenance:
-		cmds = append(cmds, loadBackups(m.client), loadMaintenanceConfig(m.client))
+		cmds = append(cmds, loadBackups(m.client), loadMaintenanceConfig(m.client), loadStats(m.client))
 	}
 	return tea.Batch(cmds...)
 }
@@ -610,7 +722,7 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 			return loadDiag(m.client)
 		}
 	case screenMaintenance:
-		return tea.Batch(loadBackups(m.client), loadMaintenanceConfig(m.client))
+		return tea.Batch(loadBackups(m.client), loadMaintenanceConfig(m.client), loadStats(m.client))
 	}
 	return nil
 }
@@ -619,6 +731,13 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.inputActive {
 		return m.handleInputKey(msg)
+	}
+
+	switch msg.String() {
+	case "pgup", "ctrl+u":
+		return m.scrollContent(-1), nil
+	case "pgdown", "ctrl+d":
+		return m.scrollContent(1), nil
 	}
 
 	switch msg.String() {
@@ -640,14 +759,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.helpReturn = m.screen
 		}
 		m.screen = screenHelp
+		m.settleRail()
 		return m, nil
 	case "1", "2", "3", "4", "5", "6", "7", "8":
 		idx := int(msg.String()[0] - '1')
-		m.screen = screenTabs[idx].screen
-		if m.screen == screenWizard {
+		if screenTabs[idx].screen == screenWizard {
+			// The wizard owns the whole screen; no rail transition.
 			return m.openWizard()
 		}
-		return m, m.lazyLoadCmd()
+		animCmd := m.switchScreen(screenTabs[idx].screen)
+		return m, tea.Batch(animCmd, m.lazyLoadCmd())
 	}
 
 	switch m.screen {
@@ -695,13 +816,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "u":
 			return m, filterUpdateCmd(m.client, "")
 		case "m":
-			next := nextBlockMode(m.status.Filter.Mode)
-			m.status.Filter.Mode = next // optimistic until the reload lands
-			return m, applyModeCmd(m.client, next)
+			return m.openModePicker()
 		case "a":
-			m.screen = screenFilterCatalog
-			m.catalogCursor = 0
-			m.filterErr = nil
+			m.openFilterCatalog()
 			return m, loadFilterConfig(m.client)
 		case "c":
 			return m.startCustomList()
@@ -709,23 +826,51 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.removeSelectedFilterList()
 		case "e":
 			return m.toggleFilterEnabled()
+		case "x":
+			return m.openUserRules()
 		}
 
 	case screenFilterCatalog:
 		switch msg.String() {
 		case "j", "down":
-			if m.catalogCursor < len(filter.Catalog())-1 {
-				m.catalogCursor++
-			}
+			m.picker.moveDown()
 		case "k", "up":
-			if m.catalogCursor > 0 {
-				m.catalogCursor--
-			}
+			m.picker.moveUp()
 		case "enter":
 			return m.toggleCatalogList()
 		case "esc":
 			m.screen = screenFilters
+			m.settleRail()
 			m.filterErr = nil
+		}
+
+	case screenModePicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyModePick()
+		case "esc":
+			m.screen = screenFilters
+			m.settleRail()
+			m.filterErr = nil
+		}
+
+	case screenUserRules:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.deleteSelectedUserRule()
+		case "esc":
+			m.screen = screenFilters
+			m.settleRail()
+			// A rejected deletion's error stays visible until a new
+			// successful action replaces it.
 		}
 
 	case screenUpstreams:
@@ -745,34 +890,72 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "p":
 			return m.startUpstreamPriority()
 		case "s":
-			return m.cycleUpstreamStrategy()
+			return m.openStrategyPicker()
 		case "t":
 			return m.probeSelectedUpstream()
 		case "a":
-			m.screen = screenUpstreamCatalog
-			m.upstreamCatalogCursor = 0
-			m.upstreamErr = nil
+			m.openUpstreamCatalog()
 			return m, loadUpstreamConfig(m.client)
 		case "c":
 			return m.startUpstreamForm()
 		}
 
 	case screenUpstreamCatalog:
-		entries := upstreamCatalogEntries()
 		switch msg.String() {
 		case "j", "down":
-			if m.upstreamCatalogCursor < len(entries)-1 {
-				m.upstreamCatalogCursor++
-			}
+			m.picker.moveDown()
 		case "k", "up":
-			if m.upstreamCatalogCursor > 0 {
-				m.upstreamCatalogCursor--
-			}
+			m.picker.moveUp()
 		case "enter":
 			return m.addCatalogEndpoint()
 		case "esc":
 			m.screen = screenUpstreams
+			m.settleRail()
 			m.upstreamErr = nil
+		}
+
+	case screenStrategyPicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyStrategyPick()
+		case "esc":
+			m.screen = m.pickerReturn
+			if m.screen == screenStrategyPicker {
+				m.screen = screenUpstreams
+			}
+			m.settleRail()
+			m.upstreamErr = nil
+			m.settingsErr = nil
+		}
+
+	case screenTimezonePicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyTimezonePick()
+		case "esc":
+			m.screen = screenSettings
+			m.settleRail()
+		}
+
+	case screenTransportPicker:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.applyTransportPick()
+		case "esc":
+			m.screen = screenUpstreamForm
+			m.settleRail()
 		}
 
 	case screenUpstreamForm:
@@ -787,8 +970,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.upstreamFormField == upstreamFormTransport {
-				m.upstreamForm.Transport = nextUpstreamTransport(m.upstreamForm.Transport)
-				return m, nil
+				return m.openTransportPicker()
 			}
 			m.inputActive = true
 			m.inputMode = inputUpstreamFormField
@@ -806,6 +988,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.applyUpstreamForm()
 		case "esc":
 			m.screen = screenUpstreams
+			m.settleRail()
 			m.upstreamFormErr = nil
 			m.upstreamErr = nil
 		}
@@ -829,10 +1012,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				f.toggle(m.settingsCfg)
 				return m, nil
 			}
+			if f.name == timezoneFieldName {
+				return m.openTimezonePicker()
+			}
 			m.inputActive = true
 			m.inputMode = inputSettingsField
 			m.inputField = m.settingsCursor
 			m.input = ""
+		case "s":
+			return m.openStrategyPicker()
 		case "ctrl+s":
 			if m.settingsCfg == nil {
 				return m, nil
@@ -840,6 +1028,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, applySettingsCmd(m.client, cloneConfig(m.settingsCfg))
 		case "w":
 			return m.openWizard()
+		case "g":
+			// Client-side DoH path suggestion: staged, applied by ctrl+s.
+			if m.settingsCfg == nil {
+				return m, m.lazyLoadCmd()
+			}
+			field := m.settingsFields()[m.settingsCursor]
+			if field.name != dohPathFieldName {
+				return m, nil
+			}
+			if err := commitSettingsField(field, m.settingsCfg, randomDoHPath()); err != nil {
+				m.settingsErr = err
+			} else {
+				m.settingsErr = nil
+			}
+			return m, nil
 		}
 
 	case screenMaintenance:
@@ -862,6 +1065,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.deleteSelectedBackup()
 		case "p":
 			return m.startPasswordChange()
+		case "a":
+			m.maintenanceErr = nil
+			m.maintenanceNote = ""
+			return m, reapplyConfigCmd(m.client)
 		}
 
 	case screenHelp:
@@ -870,6 +1077,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.screen == screenHelp {
 				m.screen = screenStatus
 			}
+			m.settleRail()
 		}
 	}
 	return m, nil
@@ -878,16 +1086,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // openWizard opens (or re-shows) the embedded wizard over the control
 // API.
 func (m Model) openWizard() (tea.Model, tea.Cmd) {
+	from := m.railMarkerRow()
 	m.screen = screenWizard
+	animCmd := m.railTo(m.railIndex(screenWizard), from)
+	if animCmd != nil {
+		// railTo started the transition and handed back its first tick:
+		// mark it in flight so Update's wrapper does not start a second
+		// tick chain for the same animation.
+		m.anim.scheduled = true
+	}
 	if m.wizard != nil {
-		return m, m.wizard.restartProbes() // resume the pings if parked
+		return m, tea.Batch(animCmd, m.wizard.restartProbes()) // resume the pings if parked
 	}
 	if m.wizardLoading {
-		return m, nil
+		return m, animCmd
 	}
 	m.wizardNote = ""
 	m.wizardLoading = true
-	return m, openWizardCmd(m.client)
+	return m, tea.Batch(animCmd, openWizardCmd(m.client))
 }
 
 // forwardToWizard hands a message to the embedded wizard.
@@ -995,7 +1211,13 @@ func (m *Model) applyEvent(e api.Event) {
 		if len(m.requests) > requestsCap {
 			m.requests = m.requests[1:]
 		}
-		m.requestsScroll = 0 // follow the tail
+		// A reader who scrolled up keeps their place; at scroll 0 the
+		// newest entry is rendered first, so the tail follows naturally.
+		// Incrementing the offset compensates for the row prepended at
+		// the newest end.
+		if m.requestsScroll > 0 {
+			m.requestsScroll++
+		}
 	case tlscert.Status:
 		m.status.Cert = data
 	}
@@ -1008,51 +1230,60 @@ func (m Model) View() string {
 	if m.screen == screenWizard && m.wizard != nil {
 		return m.wizard.View()
 	}
+	return m.shellView(m.viewContent())
+}
 
-	var b strings.Builder
-	b.WriteString(m.tabsView())
-	b.WriteString("\n\n")
+// viewContent renders the active screen plus the wizard note that the
+// shell shows under it.
+func (m Model) viewContent() string {
+	content := m.screenView()
+	if m.wizardNote != "" {
+		content += "\n" + titleStyle.Render(m.wizardNote)
+	}
+	return content
+}
 
+// screenView renders the active screen's body; the shell adds the
+// header, navigation and footer around it.
+func (m *Model) screenView() string {
 	switch m.screen {
 	case screenStatus:
-		b.WriteString(m.statusView())
+		return m.statusView()
 	case screenWizard:
-		b.WriteString(m.wizardView())
+		return m.wizardView()
 	case screenRequests:
-		b.WriteString(m.requestsView())
+		return m.requestsView()
 	case screenUpstreams:
-		b.WriteString(m.upstreamsView())
+		return m.upstreamsView()
 	case screenUpstreamCatalog:
-		b.WriteString(m.upstreamCatalogView())
+		return m.upstreamCatalogView()
 	case screenUpstreamForm:
-		b.WriteString(m.upstreamFormView())
+		return m.upstreamFormView()
+	case screenStrategyPicker:
+		return m.strategyPickerView()
+	case screenTransportPicker:
+		return m.transportPickerView()
 	case screenFilters:
-		b.WriteString(m.filtersView())
+		return m.filtersView()
 	case screenFilterCatalog:
-		b.WriteString(m.catalogView())
+		return m.catalogView()
+	case screenModePicker:
+		return m.modePickerView()
+	case screenUserRules:
+		return m.userRulesView()
 	case screenSettings:
-		b.WriteString(m.settingsView())
+		return m.settingsView()
+	case screenTimezonePicker:
+		return m.timezonePickerView()
 	case screenDiag:
-		b.WriteString(m.diagView())
+		return m.diagView()
 	case screenMaintenance:
-		b.WriteString(m.maintenanceView())
+		return m.maintenanceView()
 	case screenHelp:
-		b.WriteString(m.helpView())
+		return m.helpView()
 	default:
-		b.WriteString(dimStyle.Render("Этот экран появится в следующем обновлении."))
-		b.WriteString("\n")
+		return dimStyle.Render("Этот экран появится в следующем обновлении.") + "\n"
 	}
-
-	if m.wizardNote != "" {
-		b.WriteString("\n")
-		b.WriteString(titleStyle.Render(m.wizardNote))
-	}
-
-	if m.width > 0 {
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(m.footerText()))
-	}
-	return b.String()
 }
 
 // footerText is the per-screen key reference. Each line names only keys
@@ -1068,34 +1299,62 @@ func (m Model) footerText() string {
 	case screenRequests:
 		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
 	case screenFilters:
-		return "q — выход · r — правило · enter/u — обновить · ? — помощь · ↑↓ — прокрутка"
+		return "q — выход · r — правило · x — правила · enter/u — обновить · m — режим · ? — помощь · ↑↓ — прокрутка"
 	case screenUpstreams:
 		return "space — вкл/выкл · d — удалить · p — приоритет · s — стратегия · t — проверить · a — каталог · c — свой · j/k — выбор · ? — помощь"
 	case screenUpstreamForm:
-		return "j/k — поля · enter — изменить/сменить транспорт · ctrl+s — применить · esc — отмена"
-	case screenUpstreamCatalog, screenFilterCatalog:
+		return "j/k — поля · enter — изменить/выбрать транспорт · ctrl+s — применить · esc — отмена"
+	case screenUpstreamCatalog:
+		return "j/k — выбор · enter — добавить · esc — назад · ? — помощь"
+	case screenFilterCatalog:
 		return "j/k — выбор · enter — добавить/удалить · esc — назад · ? — помощь"
+	case screenStrategyPicker, screenModePicker, screenTimezonePicker, screenTransportPicker:
+		return "j/k — выбор · enter — выбрать · esc — назад · ? — помощь"
+	case screenUserRules:
+		return "j/k — выбор · enter — удалить правило · esc — назад · ? — помощь"
 	case screenSettings:
-		return "q — выход · r — обновить · enter — изменить · ctrl+s — применить · ? — помощь"
+		return "q — выход · r — обновить · enter — изменить · s — стратегия · w — мастер · ctrl+s — применить · ? — помощь"
 	case screenMaintenance:
-		return "j/k — выбор · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
+		return "a — применить заново · c — создать · enter — восстановить · d — удалить · p — пароль панели · ? — помощь"
 	default:
 		return "q — выход · r — обновить · ? — помощь"
 	}
 }
 
-// tabsView renders the top navigation bar.
+// tabsView renders the numeric tab line used on narrow terminals. The
+// labels wrap when the terminal is narrower than the whole line.
 func (m Model) tabsView() string {
+	active := m.railIndex(m.screen)
 	parts := make([]string, 0, len(screenTabs))
 	for i, tab := range screenTabs {
-		label := itoa(i+1) + " " + tab.name
-		if tab.screen == m.screen {
+		label := strconv.Itoa(i+1) + " " + tab.name
+		if i == active {
 			parts = append(parts, activeTabStyle.Render(label))
 		} else {
 			parts = append(parts, tabStyle.Render(label))
 		}
 	}
-	return strings.Join(parts, "  ")
+	if m.width <= 0 {
+		return strings.Join(parts, "  ")
+	}
+
+	lines := make([]string, 0, len(parts))
+	cur := ""
+	for _, part := range parts {
+		switch {
+		case cur == "":
+			cur = part
+		case lipgloss.Width(cur)+2+lipgloss.Width(part) <= m.width:
+			cur += "  " + part
+		default:
+			lines = append(lines, cur)
+			cur = part
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // helpView is the shortcut reference, shown by the ? overflow screen.
@@ -1103,7 +1362,8 @@ func (m *Model) helpView() string {
 	lines := []string{
 		titleStyle.Render("mdns — горячие клавиши"),
 		"",
-		"  1-8   переключение экранов (7 — Диагностика, 8 — Обслуживание)",
+		"  1–8 — разделы: 1 Статус · 2 Визард · 3 Запросы · 4 Upstream'ы",
+		"       5 Фильтры · 6 Настройки · 7 Диагностика · 8 Обслуживание",
 		"  r     перечитать данные с демона",
 		"  f     фильтр ленты «Запросы» (Enter — применить, esc — отменить)",
 		"  esc   сбросить фильтр ленты / выйти из справки",
@@ -1112,29 +1372,36 @@ func (m *Model) helpView() string {
 		"  ↑↓    прокрутка ленты",
 		"",
 		titleStyle.Render("Фильтры (экран 5)"),
-		"  a     каталог списков (enter — добавить/удалить, esc — назад)",
+		"  a     каталог списков (две панели: enter — добавить/удалить, esc — назад)",
 		"  c     свой список: ID, затем https-URL",
 		"  d     удалить выбранный список",
 		"  e     включить или выключить фильтрацию",
+		"  m     режим блокировки: zero / nxdomain / refused",
 		"  r     добавить правило (block домен / allow домен)",
+		"  x     правила пользователя: список allow/block (enter — удалить)",
 		"  u     обновить все списки · enter — выбранный",
 		"",
 		titleStyle.Render("Upstream'ы (экран 4)"),
 		"  a     каталог провайдеров (enter — добавить, esc — назад)",
 		"  c     свой upstream: ID, название, транспорт, адрес, SNI, приоритет",
 		"  пробел включить/выключить выбранный (последний включённый не выключается)",
-		"  d     удалить выбранный upstream · p — приоритет · s — стратегия",
+		"  d     удалить выбранный upstream · p — приоритет",
+		"  s     стратегия: fastest / failover / round_robin / random",
 		"  t     проверить выбранный upstream (probe)",
 		"",
 		titleStyle.Render("Обслуживание (экран 8)"),
+		"  a     применить текущую конфигурацию заново (без изменений)",
 		"  j/k   выбор копии · enter — восстановить · d — удалить",
 		"  c     создать резервную копию (метка manual)",
 		"  p     сменить пароль веб-панели (два скрытых ввода, esc — отмена)",
+		dimStyle.Render("  Версия и uptime демона — в шапке экрана (uptime из /stats)"),
 		dimStyle.Render("  Восстановление заменяет конфигурацию целиком, снапшот создаётся автоматически"),
 		"",
 		titleStyle.Render("Настройки (экран 6)"),
-		"  enter — изменить поле, ctrl+s — применить",
-		dimStyle.Render("  Часовой пояс: IANA-зона, напр. Europe/Moscow, Europe/London, UTC (пусто — системная)"),
+		"  enter — изменить поле (часовой пояс — список зон), ctrl+s — применить",
+		"  s     стратегия маршрутизации (список с описанием; ctrl+s — применить)",
+		"  w     мастер настройки · g — подсказать путь DoH",
+		dimStyle.Render("  Часовой пояс: список зон, пусто — системная зона сервера"),
 		"  ?     эта справка",
 		"  q     выход",
 		"",
@@ -1148,19 +1415,4 @@ func (m *Model) helpView() string {
 func (m Model) Run() error {
 	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
-}
-
-// itoa is a tiny int-to-string helper for the tab labels.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [4]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }

@@ -330,10 +330,26 @@ func TestUpstreamPriorityAndStrategy(t *testing.T) {
 		t.Errorf("an empty priority submit applied a change (cmd=%v, updates=%d)", cmd != nil, len(sc.updates))
 	}
 
-	// The strategy starts as fastest and cycles forwards.
+	// The strategy picker starts on the current value and applies the
+	// highlighted one with Enter.
 	m = upstreamModel(sc, sc.cfg)
 	updated, cmd = m.Update(key('s'))
 	m = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("s returned a command, want the strategy picker")
+	}
+	if m.screen != screenStrategyPicker {
+		t.Fatalf("screen = %v, want the strategy picker", m.screen)
+	}
+	if !strings.Contains(m.View(), "сейчас") {
+		t.Errorf("strategy picker View() does not mark the current strategy:\n%s", m.View())
+	}
+	m = step(m, key('j')) // fastest → failover
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	if m.screen != screenUpstreams {
+		t.Errorf("screen = %v after Enter, want upstreams", m.screen)
+	}
 	m = drainCmd(t, m, cmd)
 	if len(sc.updates) != 2 || sc.updates[1].Strategy != "failover" {
 		t.Fatalf("strategy update = %+v, want failover", sc.updates)
@@ -408,6 +424,94 @@ func TestUpstreamProbe(t *testing.T) {
 			t.Errorf("probe called UpdateConfig %d times, want 0", len(sc.updates))
 		}
 	})
+}
+
+// TestUpstreamCatalogDetails checks the right pane carries the trust
+// rating and source, and that an added endpoint gains the duplicate
+// marker; Esc returns without touching the config.
+func TestUpstreamCatalogDetails(t *testing.T) {
+	cfg := upstreamCfgWith()
+	sc := &stubClient{cfg: cfg}
+	m := upstreamModel(sc, cfg)
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+
+	view := m.View()
+	for _, want := range []string{"Cloudflare", "Доверие:", "Privacy Guides", "Обезличенные данные"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("catalog View() misses %q:\n%s", want, view)
+		}
+	}
+
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if !strings.Contains(m.View(), "Дубль:") {
+		t.Errorf("catalog View() misses the duplicate marker after the add:\n%s", m.View())
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenUpstreams {
+		t.Errorf("esc left the catalog on %v, want upstreams", m.screen)
+	}
+	if len(sc.updates) != 1 {
+		t.Errorf("UpdateConfig calls = %d, want 1 (esc must not add)", len(sc.updates))
+	}
+}
+
+// TestTransportPicker checks that Enter on the transport field opens the
+// list, Enter sets the form value and nothing is applied before ctrl+s.
+func TestTransportPicker(t *testing.T) {
+	cfg := upstreamCfgWith()
+	sc := &stubClient{cfg: cfg}
+	m := upstreamModel(sc, cfg)
+
+	m = step(m, key('c'))
+	m = step(m, key('j'))
+	m = step(m, key('j')) // the transport field
+
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatalf("enter on the transport field returned a command")
+	}
+	if m.screen != screenTransportPicker {
+		t.Fatalf("screen = %v, want the transport picker", m.screen)
+	}
+	if !strings.Contains(m.View(), "сейчас") || !strings.Contains(m.View(), "host:port") {
+		t.Errorf("transport picker View() misses the current marker or the address format:\n%s", m.View())
+	}
+
+	m = step(m, key('j'))
+	m = step(m, key('j')) // plain → doh
+	if !strings.Contains(m.View(), "https-URL") {
+		t.Errorf("transport picker View() misses the DoH note:\n%s", m.View())
+	}
+	updated, _ = m.Update(enterKey())
+	m = updated.(Model)
+	if m.screen != screenUpstreamForm {
+		t.Errorf("screen = %v after Enter, want the form", m.screen)
+	}
+	if m.upstreamForm.Transport != "doh" {
+		t.Errorf("form transport = %q, want doh", m.upstreamForm.Transport)
+	}
+	if len(sc.updates) != 0 {
+		t.Errorf("the transport picker applied the config before ctrl+s")
+	}
+
+	// Esc from the picker keeps the form value.
+	m = step(m, enterKey())
+	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.screen != screenUpstreamForm {
+		t.Errorf("esc left the picker on %v, want the form", m.screen)
+	}
+	if m.upstreamForm.Transport != "doh" {
+		t.Errorf("esc reset the transport to %q, want doh", m.upstreamForm.Transport)
+	}
 }
 
 // TestUpstreamsFooterAndHelp checks the new keys are discoverable.

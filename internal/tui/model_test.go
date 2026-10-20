@@ -35,8 +35,14 @@ type stubClient struct {
 	filters   []string
 	updateErr error
 	updates   []*config.Config
+	// updateCalls counts every write attempt, accepted or refused.
+	updateCalls int
 
 	requestEntries []qlog.Entry
+
+	stats      api.StatsResponse
+	statsErr   error
+	statsCalls int
 
 	filterLists []filter.ListStatus
 	filterErr   error
@@ -93,6 +99,7 @@ func (s *stubClient) Config(context.Context) (*config.Config, error) {
 	return config.Default(), nil
 }
 func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
+	s.updateCalls++
 	if s.updateErr != nil {
 		return s.updateErr
 	}
@@ -122,6 +129,10 @@ func (s *stubClient) Probe(ctx context.Context, eps []providers.Endpoint) ([]pro
 }
 func (s *stubClient) Requests(context.Context, int) ([]qlog.Entry, error) {
 	return s.requestEntries, nil
+}
+func (s *stubClient) Stats(context.Context) (api.StatsResponse, error) {
+	s.statsCalls++
+	return s.stats, s.statsErr
 }
 func (s *stubClient) FilterStatus(context.Context) ([]filter.ListStatus, error) {
 	return s.filterLists, s.filterErr
@@ -491,5 +502,21 @@ func TestTUIWizardParkedProbes(t *testing.T) {
 	m = updated.(Model)
 	if cmd == nil {
 		t.Errorf("reopening the wizard did not restart the probes")
+	}
+}
+
+// TestHeaderPrintsVersionOnce pins that a version string that already
+// carries the "v" prefix is not shown as "vv…" in the shell header.
+func TestHeaderPrintsVersionOnce(t *testing.T) {
+	m := New(&stubClient{}, Options{})
+	m = step(m, statusLoadedMsg{st: api.Status{Domain: "dns.example.com", Version: "v0.8.0"}})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	view := m.View()
+	if !strings.Contains(view, "v0.8.0") {
+		t.Fatalf("the header does not show the version:\n%s", view)
+	}
+	if strings.Contains(view, "vv0.8.0") {
+		t.Errorf("the header doubles the version prefix:\n%s", view)
 	}
 }

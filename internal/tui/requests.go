@@ -23,64 +23,130 @@ func loadRequests(c Client) tea.Cmd {
 	}
 }
 
-// requestsView renders the live query journal.
+// requestsView renders the live query journal newest first: the newest
+// entry sits directly under the header, and scrolling up (k) skips
+// entries from the newest end.
 func (m *Model) requestsView() string {
 	var b strings.Builder
 
 	shown := m.filteredRequests()
 
-	if m.requestsPaused {
-		b.WriteString(warnStyle.Render("Лента на паузе (пробел — продолжить)") + "\n")
-	}
-	if m.requestsFilter != "" {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("Фильтр: «%s» · найдено %d из %d · f — изменить · esc — сбросить", m.requestsFilter, len(shown), len(m.requests))))
-		b.WriteString("\n")
-	}
-	if m.requestsPaused || m.requestsFilter != "" {
-		b.WriteString("\n")
-	}
+	noteLines := m.requestsNoteLines(len(shown))
+	width := m.pickerContentWidth()
 
 	if len(m.requests) == 0 {
+		m.writeRequestsNote(&b, noteLines, width)
 		b.WriteString(dimStyle.Render("Запросов пока нет.") + "\n")
 		m.writeRequestsInput(&b)
 		return b.String()
 	}
 	if len(shown) == 0 {
+		m.writeRequestsNote(&b, noteLines, width)
 		b.WriteString(dimStyle.Render(fmt.Sprintf("Нет запросов по фильтру «%s» (esc — сбросить).", m.requestsFilter)) + "\n")
 		m.writeRequestsInput(&b)
 		return b.String()
 	}
 
-	b.WriteString(dimStyle.Render(requestsHeader()))
+	m.writeRequestsNote(&b, noteLines, width)
+
+	// Reserve exactly the rows that stay pinned around the scrolling
+	// rows: the note block (wrapped to the pane width), the column
+	// header, the optional scroll note and the filter prompt. Every
+	// reserved row is counted the way it is written, so the prompt never
+	// falls past the last visible row.
+	fixed := noteRows(noteLines, width) + 1 // note rows + column header
+	if m.inputActive && m.inputMode == inputRequestsFilter {
+		prompt := "Фильтр ленты (домен/клиент/upstream/прото): " + m.input + "▏"
+		fixed += 1 + len(wrapText(prompt, m.pickerContentWidth()))
+	}
+	limit := len(shown)
+	if height := m.contentHeight(); height > 0 {
+		limit = height - fixed
+		if m.requestsScroll > 0 {
+			limit-- // the scroll note takes one row
+		}
+		if limit < 0 {
+			limit = 0
+		}
+		if limit > len(shown) {
+			limit = len(shown)
+		}
+	}
+
+	b.WriteString(dimStyle.Render(m.requestsHeader()))
 	b.WriteString("\n")
 
-	// Show the last lines that fit; scroll counts lines up from the
-	// newest entry.
-	limit := len(shown)
-	if m.height > 4 && limit > m.height-4 {
-		limit = m.height - 4
-	}
-	end := len(shown) - m.requestsScroll
-	if end < 0 {
-		end = 0
-	}
-	start := end - limit
-	if start < 0 {
-		start = 0
-	}
-
-	for _, e := range shown[start:end] {
-		b.WriteString(m.requestLine(e))
+	// Newest first: index len-1 is the newest entry and requestsScroll
+	// counts how many of the newest rows the reader has scrolled past.
+	for i := 0; i < limit; i++ {
+		idx := len(shown) - 1 - m.requestsScroll - i
+		if idx < 0 {
+			break
+		}
+		b.WriteString(m.requestLine(shown[idx]))
 		b.WriteString("\n")
 	}
 
-	if m.requestsScroll > 0 {
+	if m.requestsScroll > 0 && limit > 0 {
 		b.WriteString(dimStyle.Render(fmt.Sprintf("… прокрутка вверх на %d строк (↓ — вниз)", m.requestsScroll)))
 		b.WriteString("\n")
 	}
 
 	m.writeRequestsInput(&b)
 	return b.String()
+}
+
+// requestsNoteLines returns the note block as plain lines; a non-empty
+// block ends with a blank separator line.
+func (m *Model) requestsNoteLines(shown int) []string {
+	var lines []string
+	if m.requestsPaused {
+		lines = append(lines, "Лента на паузе (пробел — продолжить)")
+	}
+	if m.requestsFilter != "" {
+		lines = append(lines, fmt.Sprintf("Фильтр: «%s» · найдено %d из %d · f — изменить · esc — сбросить", m.requestsFilter, shown, len(m.requests)))
+	}
+	if len(lines) > 0 {
+		lines = append(lines, "")
+	}
+	return lines
+}
+
+// noteRows counts the display rows a plain note block occupies once
+// wrapped to width.
+func noteRows(lines []string, width int) int {
+	rows := 0
+	for _, line := range lines {
+		if line == "" {
+			rows++
+			continue
+		}
+		rows += len(wrapText(line, width))
+	}
+	return rows
+}
+
+// writeRequestsNote writes the note block wrapped to width, styling the
+// pause line and the filter line. It returns the rows written.
+func (m *Model) writeRequestsNote(b *strings.Builder, lines []string, width int) int {
+	rows := 0
+	for _, line := range lines {
+		if line == "" {
+			b.WriteString("\n")
+			rows++
+			continue
+		}
+		style := dimStyle
+		if strings.HasPrefix(line, "Лента на паузе") {
+			style = warnStyle
+		}
+		for _, part := range wrapText(line, width) {
+			b.WriteString(style.Render(part))
+			b.WriteString("\n")
+			rows++
+		}
+	}
+	return rows
 }
 
 // writeRequestsInput appends the feed filter prompt while it is open.
@@ -95,24 +161,66 @@ func (m *Model) writeRequestsInput(b *strings.Builder) {
 	b.WriteString("\n")
 }
 
-// Column widths of the journal table: time, protocol, client, domain,
-// type, result, source and latency. The total stays inside a
-// 120-column terminal.
+// Column widths of the journal table. The client, domain and source
+// columns share the rest of the content pane, so the whole row always
+// fits the pane width: at 120 columns one entry is exactly one line.
 const (
+	colTime   = 8
 	colProto  = 5
-	colClient = 18
-	colDomain = 24
 	colType   = 5
-	colResult = 17
-	colOrigin = 20
-	colMS     = 6
+	colResult = 9
+	colMS     = 7
+	// requestsSeparators is the fixed cost of the gaps between the eight
+	// columns: 2+2+2+1+1+1+1 cells.
+	requestsSeparators = 10
 )
 
-// requestsHeader renders the column captions.
-func requestsHeader() string {
-	return fmt.Sprintf("%-8s  %-*s  %-*s  %-*s %-*s %-*s %-*s %*s",
-		"время", colProto, "прото", colClient, "клиент", colDomain, "домен",
-		colType, "тип", colResult, "результат", colOrigin, "источник", colMS, "мс")
+// requestsColumnWidths splits the content width between the three
+// variable columns; the fixed columns and the gaps are charged first.
+func requestsColumnWidths(content int) (client, domain, source int) {
+	rest := content - (colTime + colProto + colType + colResult + colMS + requestsSeparators)
+	if rest < 3 {
+		rest = 3
+	}
+	client = rest * 30 / 100
+	domain = rest * 42 / 100
+	source = rest - client - domain
+	if client < 1 {
+		client = 1
+	}
+	if domain < 1 {
+		domain = 1
+	}
+	if source < 1 {
+		source = 1
+	}
+	return client, domain, source
+}
+
+// requestsHeader renders the column captions for the current width.
+func (m *Model) requestsHeader() string {
+	client, domain, source := requestsColumnWidths(m.pickerContentWidth())
+	return cell("время", colTime, false) + "  " +
+		cell("прото", colProto, false) + "  " +
+		cell("клиент", client, false) + "  " +
+		cell("домен", domain, false) + " " +
+		cell("тип", colType, false) + " " +
+		cell("результат", colResult, false) + " " +
+		cell("источник", source, false) + " " +
+		cell("мс", colMS, true)
+}
+
+// cell pads text to exactly width display cells, optionally right
+// aligned. Wide runes are measured in cells, never in runes.
+func cell(text string, width int, right bool) string {
+	text = truncate(text, width)
+	if right {
+		if pad := width - displayWidth(text); pad > 0 {
+			return strings.Repeat(" ", pad) + text
+		}
+		return text
+	}
+	return padCells(text, width)
 }
 
 // filteredRequests returns the entries matching the feed filter.
@@ -142,7 +250,8 @@ func entryMatches(e qlog.Entry, needle string) bool {
 	return false
 }
 
-// requestLine formats one journal entry.
+// requestLine formats one journal entry into a single row that fits the
+// content pane.
 func (m *Model) requestLine(e qlog.Entry) string {
 	qtype := dns.TypeToString[e.QType]
 	if qtype == "" {
@@ -154,17 +263,18 @@ func (m *Model) requestLine(e qlog.Entry) string {
 		result = fmt.Sprintf("rcode %d", e.Rcode)
 	}
 
-	origin := ""
+	origin, originText := "", ""
 	switch {
 	case e.Blocked:
-		origin = errStyle.Render("БЛОК(" + e.BlockSource + ")")
+		origin, originText = "БЛОК("+e.BlockSource+")", errStyle.Render("БЛОК("+e.BlockSource+")")
 	case e.CacheHit:
-		origin = okStyle.Render("кеш")
+		origin, originText = "кеш", okStyle.Render("кеш")
 	default:
 		origin = e.Upstream
 		if origin == "" {
 			origin = "—"
 		}
+		originText = origin
 	}
 
 	client := e.ClientIP
@@ -172,26 +282,37 @@ func (m *Model) requestLine(e qlog.Entry) string {
 		client = "—"
 	}
 
-	return fmt.Sprintf("%s  %-*s  %-*s  %-*s %-*s %-*s %-*s %*.1f",
-		e.Time.Format(time.TimeOnly),
-		colProto, e.Proto,
-		colClient, truncate(client, colClient),
-		colDomain, truncate(e.QName, colDomain),
-		colType, qtype,
-		colResult, result,
-		colOrigin, truncate(origin, colOrigin),
-		colMS, e.LatencyMS,
-	)
+	clientWidth, domainWidth, originWidth := requestsColumnWidths(m.pickerContentWidth())
+	return cell(e.Time.Format(time.TimeOnly), colTime, false) + "  " +
+		cell(e.Proto, colProto, false) + "  " +
+		cell(client, clientWidth, false) + "  " +
+		cell(e.QName, domainWidth, false) + " " +
+		cell(qtype, colType, false) + " " +
+		cell(result, colResult, false) + " " +
+		trimCell(originText, origin, originWidth) + " " +
+		cell(fmt.Sprintf("%.1f", e.LatencyMS), colMS, true)
 }
 
-// truncate shortens s to at most n runes, adding an ellipsis.
-func truncate(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+// trimCell truncates the plain form for the width budget and returns the
+// matching styled form, padded to the same width.
+func trimCell(styled, plain string, width int) string {
+	if displayWidth(plain) <= width {
+		return curatedStyle(styled, plain, width)
 	}
-	if n <= 1 {
-		return string(runes[:n])
+	trimmed := truncate(plain, width)
+	if trimmed == plain {
+		return curatedStyle(styled, plain, width)
 	}
-	return string(runes[:n-1]) + "…"
+	// A truncated styled value drops its styling: the escaped string
+	// cannot be sliced safely, and the plain prefix is unambiguous.
+	return padCells(trimmed, width)
+}
+
+// curatedStyle pads a styled string to the column width, using the plain
+// text only for the cell count.
+func curatedStyle(styled, plain string, width int) string {
+	if pad := width - displayWidth(plain); pad > 0 {
+		return styled + strings.Repeat(" ", pad)
+	}
+	return styled
 }
