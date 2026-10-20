@@ -31,40 +31,30 @@ func (m *Model) requestsView() string {
 
 	shown := m.filteredRequests()
 
-	var note strings.Builder
-	if m.requestsPaused {
-		note.WriteString(warnStyle.Render("Лента на паузе (пробел — продолжить)") + "\n")
-	}
-	if m.requestsFilter != "" {
-		note.WriteString(dimStyle.Render(fmt.Sprintf("Фильтр: «%s» · найдено %d из %d · f — изменить · esc — сбросить", m.requestsFilter, len(shown), len(m.requests))))
-		note.WriteString("\n")
-	}
-	if m.requestsPaused || m.requestsFilter != "" {
-		note.WriteString("\n")
-	}
+	noteLines := m.requestsNoteLines(len(shown))
+	width := m.pickerContentWidth()
 
 	if len(m.requests) == 0 {
-		b.WriteString(note.String())
+		m.writeRequestsNote(&b, noteLines, width)
 		b.WriteString(dimStyle.Render("Запросов пока нет.") + "\n")
 		m.writeRequestsInput(&b)
 		return b.String()
 	}
 	if len(shown) == 0 {
-		b.WriteString(note.String())
+		m.writeRequestsNote(&b, noteLines, width)
 		b.WriteString(dimStyle.Render(fmt.Sprintf("Нет запросов по фильтру «%s» (esc — сбросить).", m.requestsFilter)) + "\n")
 		m.writeRequestsInput(&b)
 		return b.String()
 	}
 
-	b.WriteString(note.String())
+	m.writeRequestsNote(&b, noteLines, width)
 
 	// Reserve exactly the rows that stay pinned around the scrolling
-	// rows: the note block, the column header, the optional scroll note
-	// and the filter prompt. Every reserved row is counted the way it is
-	// written (including the blank line before the prompt and any wrap
-	// of a long typed filter), so the prompt never falls past the last
-	// visible row.
-	fixed := strings.Count(note.String(), "\n") + 1 // note rows + column header
+	// rows: the note block (wrapped to the pane width), the column
+	// header, the optional scroll note and the filter prompt. Every
+	// reserved row is counted the way it is written, so the prompt never
+	// falls past the last visible row.
+	fixed := noteRows(noteLines, width) + 1 // note rows + column header
 	if m.inputActive && m.inputMode == inputRequestsFilter {
 		prompt := "Фильтр ленты (домен/клиент/upstream/прото): " + m.input + "▏"
 		fixed += 1 + len(wrapText(prompt, m.pickerContentWidth()))
@@ -104,6 +94,59 @@ func (m *Model) requestsView() string {
 
 	m.writeRequestsInput(&b)
 	return b.String()
+}
+
+// requestsNoteLines returns the note block as plain lines; a non-empty
+// block ends with a blank separator line.
+func (m *Model) requestsNoteLines(shown int) []string {
+	var lines []string
+	if m.requestsPaused {
+		lines = append(lines, "Лента на паузе (пробел — продолжить)")
+	}
+	if m.requestsFilter != "" {
+		lines = append(lines, fmt.Sprintf("Фильтр: «%s» · найдено %d из %d · f — изменить · esc — сбросить", m.requestsFilter, shown, len(m.requests)))
+	}
+	if len(lines) > 0 {
+		lines = append(lines, "")
+	}
+	return lines
+}
+
+// noteRows counts the display rows a plain note block occupies once
+// wrapped to width.
+func noteRows(lines []string, width int) int {
+	rows := 0
+	for _, line := range lines {
+		if line == "" {
+			rows++
+			continue
+		}
+		rows += len(wrapText(line, width))
+	}
+	return rows
+}
+
+// writeRequestsNote writes the note block wrapped to width, styling the
+// pause line and the filter line. It returns the rows written.
+func (m *Model) writeRequestsNote(b *strings.Builder, lines []string, width int) int {
+	rows := 0
+	for _, line := range lines {
+		if line == "" {
+			b.WriteString("\n")
+			rows++
+			continue
+		}
+		style := dimStyle
+		if strings.HasPrefix(line, "Лента на паузе") {
+			style = warnStyle
+		}
+		for _, part := range wrapText(line, width) {
+			b.WriteString(style.Render(part))
+			b.WriteString("\n")
+			rows++
+		}
+	}
+	return rows
 }
 
 // writeRequestsInput appends the feed filter prompt while it is open.

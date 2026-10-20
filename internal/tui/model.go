@@ -1213,6 +1213,11 @@ func (m *Model) applyEvent(e api.Event) {
 		}
 		// A reader who scrolled up keeps their place; at scroll 0 the
 		// newest entry is rendered first, so the tail follows naturally.
+		// Incrementing the offset compensates for the row prepended at
+		// the newest end.
+		if m.requestsScroll > 0 {
+			m.requestsScroll++
+		}
 	case tlscert.Status:
 		m.status.Cert = data
 	}

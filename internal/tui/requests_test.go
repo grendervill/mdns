@@ -481,8 +481,8 @@ func TestRequestsScrollKeptOnLiveEvent(t *testing.T) {
 	}
 
 	m = step(m, requestEvent(qlog.Entry{QName: "live.example.com.", Proto: "udp"}))
-	if m.requestsScroll != 2 {
-		t.Errorf("a live event reset requestsScroll to %d, want 2 kept", m.requestsScroll)
+	if m.requestsScroll != 3 {
+		t.Errorf("a live event left requestsScroll at %d, want 3 (one new row above keeps the view)", m.requestsScroll)
 	}
 	if strings.Contains(m.View(), "live.example.com.") {
 		t.Errorf("the scrolled-up reader jumped to the newest entry:\n%s", m.View())
@@ -550,5 +550,34 @@ func TestRequestsFilterAtTerminalSize(t *testing.T) {
 	}
 	if !strings.Contains(view, "d42.example.com.") || strings.Contains(view, "d41.example.com.") {
 		t.Errorf("the sized feed did not narrow:\n%s", view)
+	}
+}
+
+// TestRequestsLongFilterPromptFits pins the prompt with a committed
+// filter whose note itself wraps at 80 columns.
+func TestRequestsLongFilterPromptFits(t *testing.T) {
+	for _, size := range [][2]int{{120, 40}, {80, 24}} {
+		width, height := size[0], size[1]
+		m := New(&stubClient{}, Options{Initial: "requests"})
+		m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+		m = step(m, requestsLoadedMsg{entries: requestEntries(60)})
+		m = step(m, key('f'))
+		m = typeText(m, "example.com")
+		m = step(m, enterKey())
+		m = step(m, key('f'))
+
+		view := m.View()
+		if !strings.Contains(view, "Фильтр: «example.com»") {
+			t.Errorf("%dx%d: the committed filter note is missing:\n%s", width, height, view)
+		}
+		if !strings.Contains(view, "Фильтр ленты (домен/клиент/upstream/прото): example.com▏") {
+			t.Errorf("%dx%d: the reopened prompt is clipped:\n%s", width, height, view)
+		}
+		if strings.Contains(view, "PgUp/PgDn — прокрутка") {
+			t.Errorf("%dx%d: the prompt was pushed into the scroll region:\n%s", width, height, view)
+		}
+		if lines := strings.Split(view, "\n"); len(lines) > height {
+			t.Errorf("%dx%d: View() has %d lines, want at most %d:\n%s", width, height, len(lines), height, view)
+		}
 	}
 }
