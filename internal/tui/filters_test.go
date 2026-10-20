@@ -848,6 +848,117 @@ func TestUserRulesPickerDeletes(t *testing.T) {
 	}
 }
 
+// TestFilterCatalogConfigErrorVisible checks a failed config load gets
+// its own error screen at 120x40 instead of a note clipped below the
+// full-body picker.
+func TestFilterCatalogConfigErrorVisible(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "filters"})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, key('a'))
+	if m.screen != screenFilterCatalog {
+		t.Fatalf("a opened %v, want the catalog", m.screen)
+	}
+
+	loadErr := errors.New("connection refused: daemon is down")
+	m = step(m, filterConfigLoadedMsg{err: loadErr})
+
+	view := m.View()
+	if !strings.Contains(view, loadErr.Error()) {
+		t.Errorf("the catalog error is not visible:\n%s", view)
+	}
+	if !strings.Contains(view, "Каталог списков") {
+		t.Errorf("the error screen lost its title:\n%s", view)
+	}
+	if strings.Contains(view, "PgUp/PgDn — прокрутка") {
+		t.Errorf("the error screen does not fit the viewport:\n%s", view)
+	}
+	if lines := strings.Split(view, "\n"); len(lines) > 40 {
+		t.Errorf("View() has %d lines at 120x40, want at most 40:\n%s", len(lines), view)
+	}
+}
+
+// TestUserRuleRejectedDelete checks a refused deletion reloads the live
+// config, keeps the rule and shows the error, and cannot write the
+// rejected copy again before a fresh action.
+func TestUserRuleRejectedDelete(t *testing.T) {
+	cfg := config.Default()
+	cfg.Filter.UserAllow = []string{"allow.example.com"}
+	sc := &stubClient{cfg: cfg, updateErr: errors.New("конфигурация только для чтения")}
+	m := New(sc, Options{Initial: "filters"})
+	m = step(m, filterConfigLoadedMsg{cfg: cfg})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = step(m, key('x'))
+	if m.screen != screenUserRules {
+		t.Fatalf("x opened %v, want the user-rules picker", m.screen)
+	}
+
+	updated, writeCmd := m.Update(enterKey())
+	m = updated.(Model)
+	if writeCmd == nil {
+		t.Fatalf("the delete issued no write command")
+	}
+	updated, reloadCmd := m.Update(writeCmd())
+	m = updated.(Model)
+	if sc.updateCalls != 1 {
+		t.Fatalf("writes = %d, want 1", sc.updateCalls)
+	}
+	if reloadCmd == nil {
+		t.Fatalf("a rejected delete scheduled no config reload")
+	}
+	if m.filterErr == nil || !strings.Contains(m.filterErr.Error(), "только для чтения") {
+		t.Errorf("filterErr = %v, want the daemon refusal", m.filterErr)
+	}
+	view := m.View()
+	if !strings.Contains(view, "только для чтения") {
+		t.Errorf("the rules screen hides the refusal:\n%s", view)
+	}
+
+	// Before the reload lands nothing safe is left to delete from: an
+	// Enter must not write the rejected copy again.
+	updated, retryCmd := m.Update(enterKey())
+	m = updated.(Model)
+	if retryCmd != nil || sc.updateCalls != 1 {
+		t.Errorf("Enter before the reload wrote again: calls=%d cmd=%v", sc.updateCalls, retryCmd)
+	}
+
+	updated, _ = m.Update(reloadCmd())
+	m = updated.(Model)
+	view = m.View()
+	if !strings.Contains(view, "allow allow.example.com") {
+		t.Errorf("the rejected rule did not reappear:\n%s", view)
+	}
+	if !strings.Contains(view, "только для чтения") {
+		t.Errorf("the reloaded config hid the refusal:\n%s", view)
+	}
+	if lines := strings.Split(view, "\n"); len(lines) > 40 {
+		t.Errorf("View() has %d lines at 120x40, want at most 40:\n%s", len(lines), view)
+	}
+
+	// Esc keeps the error until a new successful action replaces it.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.screen != screenFilters {
+		t.Fatalf("esc left %v, want filters", m.screen)
+	}
+	if m.filterErr == nil {
+		t.Errorf("esc hid the refused deletion before it was acknowledged")
+	}
+
+	// The next successful write clears the error.
+	sc.updateErr = nil
+	updated, _ = m.Update(key('x'))
+	m = updated.(Model)
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if m.filterErr != nil {
+		t.Errorf("a successful delete left filterErr = %v", m.filterErr)
+	}
+	if sc.updateCalls != 2 {
+		t.Errorf("writes = %d, want exactly one more after the refusal", sc.updateCalls)
+	}
+}
+
 // TestTimezonePickerCustomZone checks a configured zone outside the
 // preset list gets its own current row and never marks «системный».
 func TestTimezonePickerCustomZone(t *testing.T) {

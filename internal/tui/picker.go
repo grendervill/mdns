@@ -423,6 +423,23 @@ func pickerPaneWidths(content int) (left, right int) {
 
 // pickerView renders p at the shell's current size.
 func (m *Model) pickerView(p *picker) string {
+	return m.pickerViewAt(p, m.pickerContentHeight())
+}
+
+// pickerViewAt renders p with an explicit pane content height.
+func (m *Model) pickerViewAt(p *picker, height int) string {
 	left, right := pickerPaneWidths(m.pickerContentWidth())
-	return p.Render(left, right, m.pickerContentHeight())
+	return p.Render(left, right, height)
+}
+
+// pickerViewWithNote pins the note above the picker and shrinks the
+// picker by the wrapped note's rows, so a status or error line is never
+// appended below a full-body picker where the viewport would clip it.
+func (m *Model) pickerViewWithNote(p *picker, note string) string {
+	lines := wrapText(note, m.pickerContentWidth())
+	height := m.pickerContentHeight() - len(lines)
+	if height < 3 {
+		height = 3
+	}
+	return errStyle.Render(strings.Join(lines, "\n")) + "\n" + m.pickerViewAt(p, height)
 }

@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -443,7 +444,7 @@ func assertShellFits(t *testing.T, m Model, width, height int) {
 func TestEveryScreenFitsTerminalHeight(t *testing.T) {
 	screens := []screen{
 		screenStatus, screenRequests, screenUpstreams,
-		screenSettings, screenHelp, screenMaintenance,
+		screenSettings, screenHelp, screenMaintenance, screenDiag,
 	}
 	for _, size := range [][2]int{{80, 24}, {100, 30}} {
 		width, height := size[0], size[1]
@@ -453,6 +454,7 @@ func TestEveryScreenFitsTerminalHeight(t *testing.T) {
 		m = step(m, filterConfigLoadedMsg{cfg: cfg})
 		m = step(m, maintenanceConfigMsg{cfg: cfg})
 		m = step(m, backupsLoadedMsg{backups: []BackupInfo{{Name: "snap-1.json"}, {Name: "snap-2.json"}}})
+		m = step(m, diagLoadedMsg{status: fullStatus(), cfg: cfg})
 		entries := make([]qlog.Entry, 0, 60)
 		for i := 0; i < 60; i++ {
 			entries = append(entries, qlog.Entry{
@@ -476,6 +478,57 @@ func TestEveryScreenFitsTerminalHeight(t *testing.T) {
 func TestSmallTerminalViewFits(t *testing.T) {
 	m := shellModel(t, 40, 12)
 	assertShellFits(t, m, 40, 12)
+}
+
+// countRailTickCmds runs the batch members and counts the commands that
+// produce a rail tick. It is only used by the one-chain guard.
+func countRailTickCmds(t *testing.T, cmd tea.Cmd) int {
+	t.Helper()
+	if cmd == nil {
+		return 0
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		if _, tick := msg.(railTickMsg); tick {
+			return 1
+		}
+		return 0
+	}
+	n := 0
+	for _, member := range batch {
+		if member == nil {
+			continue
+		}
+		if _, tick := member().(railTickMsg); tick {
+			n++
+		}
+	}
+	return n
+}
+
+// TestWizardTransitionSchedulesOneTick pins the single marker tick chain:
+// openWizard returns railTo's tick, so Update must not schedule a second
+// one for the same transition.
+func TestWizardTransitionSchedulesOneTick(t *testing.T) {
+	old := railFrameDelay
+	railFrameDelay = time.Millisecond
+	defer func() { railFrameDelay = old }()
+
+	m := New(&stubClient{status: sampleStatus()}, Options{})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	updated, cmd := m.Update(key('2'))
+	m = updated.(Model)
+	if m.screen != screenWizard {
+		t.Fatalf("2 opened %v, want the wizard", m.screen)
+	}
+	if !m.anim.active || !m.anim.scheduled {
+		t.Fatalf("animation = %+v, want active with a tick in flight", m.anim)
+	}
+	if got := countRailTickCmds(t, cmd); got != 1 {
+		t.Errorf("the wizard transition scheduled %d tick chains, want exactly 1", got)
+	}
 }
 
 // TestBackNavigationAnimatesMarker checks settleRail starts the marker

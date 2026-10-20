@@ -66,6 +66,16 @@ func loadFilterConfig(c Client) tea.Cmd {
 	}
 }
 
+// loadFilterConfigKeepErr reloads the live config but preserves the error
+// the caller already set: a rejected write must stay visible after the
+// fresh copy arrives (and the rejected copy must be replaced).
+func loadFilterConfigKeepErr(c Client) tea.Cmd {
+	return func() tea.Msg {
+		cfg, err := c.Config(context.Background())
+		return filterConfigLoadedMsg{cfg: cfg, err: err, keepErr: true}
+	}
+}
+
 // hasFilterList reports whether id is already configured.
 func hasFilterList(lists []config.FilterList, id string) bool {
 	for _, l := range lists {
@@ -287,14 +297,31 @@ func (m *Model) filtersView() string {
 	return b.String()
 }
 
-// catalogView renders the built-in list picker.
+// catalogView renders the built-in list picker. A config load failure
+// gets a small error screen instead of a picker that cannot be trusted;
+// a rejected action keeps the picker and pins its error above it.
 func (m *Model) catalogView() string {
 	m.filterCatalogPicker()
-	out := m.pickerView(&m.picker)
-	if m.filterErr != nil {
-		out += "\n" + errStyle.Render(m.filterErr.Error())
+	if m.filterErr == nil {
+		return m.pickerView(&m.picker)
 	}
-	return out
+	if m.filterCfg == nil {
+		return m.filterConfigErrorView()
+	}
+	return m.pickerViewWithNote(&m.picker, m.filterErr.Error())
+}
+
+// filterConfigErrorView renders the catalog's config-loading failure on
+// its own, so the text is visible without scrolling.
+func (m *Model) filterConfigErrorView() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("Каталог списков") + "\n\n")
+	b.WriteString(errStyle.Render("Не удалось загрузить конфигурацию фильтра:") + "\n")
+	for _, line := range wrapText(m.filterErr.Error(), m.pickerContentWidth()) {
+		b.WriteString(errStyle.Render(line) + "\n")
+	}
+	b.WriteString("\n" + dimStyle.Render("esc — назад") + "\n")
+	return b.String()
 }
 
 // openFilterCatalog opens the catalog picker on its first row.
@@ -379,10 +406,14 @@ func (m *Model) userRuleRows() []userRule {
 	return out
 }
 
-// userRulesView renders the user-rule picker.
+// userRulesView renders the user-rule picker, with a failed deletion's
+// error pinned above the rows so Esc cannot hide it unseen.
 func (m *Model) userRulesView() string {
 	m.userRulesPicker()
-	return m.pickerView(&m.picker)
+	if m.filterErr == nil {
+		return m.pickerView(&m.picker)
+	}
+	return m.pickerViewWithNote(&m.picker, m.filterErr.Error())
 }
 
 // openUserRules opens the allow/block rule list on the filters screen.

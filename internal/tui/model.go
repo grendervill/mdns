@@ -240,6 +240,9 @@ type (
 	filterConfigLoadedMsg struct {
 		cfg *config.Config
 		err error
+		// keepErr preserves an error set before the reload (a rejected
+		// config write); ordinary loads clear the screen error.
+		keepErr bool
 	}
 	filterUpdatedMsg struct{ err error }
 
@@ -474,7 +477,9 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.filterCfg = msg.cfg
-		m.filterErr = nil
+		if !msg.keepErr {
+			m.filterErr = nil
+		}
 		if rows := m.filterRows(); len(rows) > 0 && m.filterCursor >= len(rows) {
 			m.filterCursor = len(rows) - 1
 		}
@@ -496,10 +501,16 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.upstreamFormErr = msg.err
 			// The daemon refused the change: reload the live config so
 			// the filter screens never edit a rejected copy.
-			if m.screen == screenFilters || m.screen == screenFilterCatalog {
+			switch {
+			case m.screen == screenUserRules:
+				// Drop the rejected copy at once (an Enter before the
+				// reload lands must not write it again) and keep the
+				// error visible over the reloaded list.
+				m.filterCfg = nil
+				return m, loadFilterConfigKeepErr(m.client)
+			case m.screen == screenFilters || m.screen == screenFilterCatalog:
 				return m, loadFilterConfig(m.client)
-			}
-			if isUpstreamScreen(m.screen) {
+			case isUpstreamScreen(m.screen):
 				return m, loadUpstreamConfig(m.client)
 			}
 			return m, nil
@@ -858,7 +869,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.screen = screenFilters
 			m.settleRail()
-			m.filterErr = nil
+			// A rejected deletion's error stays visible until a new
+			// successful action replaces it.
 		}
 
 	case screenUpstreams:
@@ -1077,6 +1089,12 @@ func (m Model) openWizard() (tea.Model, tea.Cmd) {
 	from := m.railMarkerRow()
 	m.screen = screenWizard
 	animCmd := m.railTo(m.railIndex(screenWizard), from)
+	if animCmd != nil {
+		// railTo started the transition and handed back its first tick:
+		// mark it in flight so Update's wrapper does not start a second
+		// tick chain for the same animation.
+		m.anim.scheduled = true
+	}
 	if m.wizard != nil {
 		return m, tea.Batch(animCmd, m.wizard.restartProbes()) // resume the pings if parked
 	}
@@ -1193,7 +1211,8 @@ func (m *Model) applyEvent(e api.Event) {
 		if len(m.requests) > requestsCap {
 			m.requests = m.requests[1:]
 		}
-		m.requestsScroll = 0 // follow the tail
+		// A reader who scrolled up keeps their place; at scroll 0 the
+		// newest entry is rendered first, so the tail follows naturally.
 	case tlscert.Status:
 		m.status.Cert = data
 	}

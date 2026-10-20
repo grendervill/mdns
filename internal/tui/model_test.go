@@ -35,6 +35,8 @@ type stubClient struct {
 	filters   []string
 	updateErr error
 	updates   []*config.Config
+	// updateCalls counts every write attempt, accepted or refused.
+	updateCalls int
 
 	requestEntries []qlog.Entry
 
@@ -97,6 +99,7 @@ func (s *stubClient) Config(context.Context) (*config.Config, error) {
 	return config.Default(), nil
 }
 func (s *stubClient) UpdateConfig(_ context.Context, c *config.Config) error {
+	s.updateCalls++
 	if s.updateErr != nil {
 		return s.updateErr
 	}
