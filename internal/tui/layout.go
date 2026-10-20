@@ -262,13 +262,22 @@ func (m Model) headerStatus() string {
 		return ""
 	}
 	if m.status.Version != "" {
-		version := m.status.Version
-		if !strings.HasPrefix(version, "v") {
-			version = "v" + version
-		}
-		return version + " · подключено"
+		return versionLabel(m.status.Version) + " · подключено"
 	}
 	return "подключено"
+}
+
+// versionLabel formats a daemon version with exactly one leading v, so
+// the header and the maintenance screen never print "vv…".
+func versionLabel(version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return ""
+	}
+	if strings.HasPrefix(version, "v") || strings.HasPrefix(version, "V") {
+		return version
+	}
+	return "v" + version
 }
 
 // headerView renders the brand, domain and the optional status note.
@@ -303,19 +312,123 @@ func (m Model) headerView() string {
 
 // paneView frames the active screen in the content pane, truncating
 // lines that no longer fit beside the rail.
-func (m Model) paneView(content string) string {
+func (m Model) paneView(body string) string {
 	inner := m.width - m.railColumnWidth() - 1 - paneStyle.GetHorizontalFrameSize()
 	if inner < 1 {
 		inner = 1
 	}
-	content = strings.TrimRight(content, "\n")
-	// Keep the pane at least as tall as the rail so the frame never ends
-	// halfway down the navigation column.
-	if lines := strings.Count(content, "\n") + 1; lines < len(screenTabs) {
-		content += strings.Repeat("\n", len(screenTabs)-lines)
-	}
-	body := lipgloss.NewStyle().Width(inner).MaxWidth(inner).Render(content)
+	body = lipgloss.NewStyle().Width(inner).MaxWidth(inner).Render(body)
 	return paneStyle.Render(body)
+}
+
+// shellChromeHeight is the number of rows the pinned chrome occupies:
+// the header and its blank line, the footer, and the pane border or the
+// narrow tab line.
+func (m Model) shellChromeHeight() int {
+	rows := 2 // header + blank line
+	if m.width > 0 {
+		rows++ // footer
+	}
+	if m.railVisible() {
+		rows += paneStyle.GetVerticalFrameSize()
+	} else {
+		rows += strings.Count(m.tabsView(), "\n") + 2 // tabs + blank line
+	}
+	return rows
+}
+
+// contentViewport returns the visible body height, the clamped offset
+// and whether the content needs scrolling. A zero height means the
+// terminal size is unknown, so the whole content is rendered.
+func (m Model) contentViewport(lines int) (height, offset int, overflow bool) {
+	if m.height <= 0 {
+		return 0, 0, false
+	}
+	height = m.height - m.shellChromeHeight()
+	if height < 5 {
+		height = 5
+	}
+	overflow = lines > height
+	if overflow {
+		// The scroll hint takes one more footer row.
+		height--
+		if height < 5 {
+			height = 5
+		}
+	}
+	offset = m.contentOffset
+	if offset < 0 {
+		offset = 0
+	}
+	if max := lines - height; offset > max {
+		offset = max
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return height, offset, overflow
+}
+
+// contentLines splits rendered content into display rows.
+func contentLines(content string) []string {
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return nil
+	}
+	return strings.Split(content, "\n")
+}
+
+// clampContentOffset keeps the stored offset inside the current body.
+func (m *Model) clampContentOffset() {
+	if m.screen == screenWizard && m.wizard != nil {
+		m.contentOffset = 0
+		return
+	}
+	_, offset, _ := m.contentViewport(len(contentLines(m.viewContent())))
+	m.contentOffset = offset
+}
+
+// scrollContent moves the body by one page; it is a no-op when the
+// content already fits.
+func (m Model) scrollContent(dir int) Model {
+	lines := contentLines(m.viewContent())
+	height, offset, overflow := m.contentViewport(len(lines))
+	if !overflow || height < 1 {
+		return m
+	}
+	offset += dir * height
+	if max := len(lines) - height; offset > max {
+		offset = max
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	m.contentOffset = offset
+	return m
+}
+
+// truncateFooter shortens a key line at a " · " boundary, falling back
+// to a character truncation only when even the first entry is too long.
+func truncateFooter(text string, width int) string {
+	if width <= 0 || lipgloss.Width(text) <= width {
+		return text
+	}
+	parts := strings.Split(text, " · ")
+	out := ""
+	for _, part := range parts {
+		candidate := part
+		if out != "" {
+			candidate = out + " · " + part
+		}
+		if lipgloss.Width(candidate)+2 > width {
+			break
+		}
+		out = candidate
+	}
+	if out != "" {
+		return out + " …"
+	}
+	return truncate(text, width)
 }
 
 // footerLine prefixes the per-screen keys with the rail hint.
@@ -325,29 +438,55 @@ func (m Model) footerLine() string {
 		text = "1–8 — разделы · " + text
 	}
 	if m.width > 0 {
-		text = truncate(text, m.width)
+		text = truncateFooter(text, m.width)
 	}
 	return text
 }
 
-// shellView composes header, navigation, content and footer.
+// shellView composes header, navigation, content and footer. The header,
+// rail and footer stay pinned; only the body is clipped to the viewport.
 func (m Model) shellView(content string) string {
+	lines := contentLines(content)
+	height, offset, overflow := m.contentViewport(len(lines))
+	if height > 0 {
+		end := offset + height
+		if end > len(lines) {
+			end = len(lines)
+		}
+		lines = lines[offset:end]
+	}
+	// Keep the pane at least as tall as the rail when the window allows
+	// it, so the frame never ends halfway down the navigation column.
+	if m.railVisible() && (height == 0 || height >= len(screenTabs)) {
+		for len(lines) < len(screenTabs) {
+			lines = append(lines, "")
+		}
+	}
+	body := strings.Join(lines, "\n")
+
 	var b strings.Builder
 	b.WriteString(m.headerView())
 	b.WriteString("\n\n")
 
 	if m.railVisible() {
-		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, m.railView(), " ", m.paneView(content)))
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, m.railView(), " ", m.paneView(body)))
 	} else {
 		// Narrow terminals keep the original numeric tab line.
 		b.WriteString(m.tabsView())
 		b.WriteString("\n\n")
-		b.WriteString(content)
+		if m.width > 0 {
+			body = lipgloss.NewStyle().MaxWidth(m.width).Render(body)
+		}
+		b.WriteString(body)
 	}
 
 	if m.width > 0 {
 		b.WriteString("\n")
 		b.WriteString(footerStyle.Render(m.footerLine()))
+		if overflow {
+			b.WriteString("\n")
+			b.WriteString(footerStyle.Render(truncateFooter("PgUp/PgDn — прокрутка", m.width)))
+		}
 	}
 	return b.String()
 }

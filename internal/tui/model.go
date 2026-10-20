@@ -89,6 +89,9 @@ type Model struct {
 	screen screen
 	width  int
 	height int
+	// contentOffset is the first visible body line of a screen taller
+	// than the terminal. The shell chrome never scrolls.
+	contentOffset int
 
 	// helpReturn is the screen the ? overlay was opened from.
 	helpReturn screen
@@ -340,8 +343,25 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(fetchStatus(m.client), subscribe(m.client, m.ctx), m.lazyLoadCmd())
 }
 
-// Update implements tea.Model.
+// Update implements tea.Model. It pins the shell chrome by keeping the
+// content offset in range and clearing it whenever the screen changes.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	prev := m.screen
+	updated, cmd := m.update(msg)
+	next := updated.(Model)
+	if next.screen != prev {
+		next.contentOffset = 0
+	}
+	// Live query events can arrive in bursts and re-rendering the whole
+	// screen per event would be wasteful; the renderer clamps anyway.
+	if _, live := msg.(eventMsg); !live {
+		next.clampContentOffset()
+	}
+	return next, cmd
+}
+
+// update folds one message into the model.
+func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// The embedded wizard owns keys while its tab is active; its probes
 	// keep refreshing even when the user looks at other screens.
 	if m.wizard != nil {
@@ -689,6 +709,13 @@ func (m Model) lazyLoadCmd() tea.Cmd {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.inputActive {
 		return m.handleInputKey(msg)
+	}
+
+	switch msg.String() {
+	case "pgup", "ctrl+u":
+		return m.scrollContent(-1), nil
+	case "pgdown", "ctrl+d":
+		return m.scrollContent(1), nil
 	}
 
 	switch msg.String() {
@@ -1136,12 +1163,17 @@ func (m Model) View() string {
 	if m.screen == screenWizard && m.wizard != nil {
 		return m.wizard.View()
 	}
+	return m.shellView(m.viewContent())
+}
 
+// viewContent renders the active screen plus the wizard note that the
+// shell shows under it.
+func (m Model) viewContent() string {
 	content := m.screenView()
 	if m.wizardNote != "" {
 		content += "\n" + titleStyle.Render(m.wizardNote)
 	}
-	return m.shellView(content)
+	return content
 }
 
 // screenView renders the active screen's body; the shell adds the
@@ -1212,7 +1244,7 @@ func (m Model) footerText() string {
 	case screenSettings:
 		return "q — выход · r — обновить · enter — изменить · s — стратегия · ctrl+s — применить · ? — помощь"
 	case screenMaintenance:
-		return "j/k — выбор · a — применить заново · c — создать · enter — восстановить · d — удалить · p — пароль панели · r — обновить · ? — помощь"
+		return "a — применить заново · c — создать · enter — восстановить · d — удалить · p — пароль панели · ? — помощь"
 	default:
 		return "q — выход · r — обновить · ? — помощь"
 	}

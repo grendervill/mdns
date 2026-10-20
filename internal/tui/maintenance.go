@@ -242,8 +242,8 @@ func humanUptime(d time.Duration) string {
 // status and uptime from the stats start time.
 func (m Model) maintenanceMeta() string {
 	version := "неизвестна"
-	if m.status.Version != "" {
-		version = "v" + m.status.Version
+	if label := versionLabel(m.status.Version); label != "" {
+		version = label
 	}
 	meta := "версия " + version
 	switch {

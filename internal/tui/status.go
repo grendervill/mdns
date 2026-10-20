@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/lipgloss"
+
 	"mydns/internal/api"
 )
 
@@ -18,7 +20,11 @@ func (m *Model) statusView() string {
 
 	var b strings.Builder
 
-	b.WriteString(titleStyle.Render("mdns " + m.status.Version + " · " + m.status.Domain))
+	title := "mdns"
+	if version := versionLabel(m.status.Version); version != "" {
+		title += " " + version
+	}
+	b.WriteString(titleStyle.Render(title + " · " + m.status.Domain))
 	b.WriteString("\n")
 
 	if len(m.status.Listeners) > 0 {
@@ -33,11 +39,18 @@ func (m *Model) statusView() string {
 	}
 	b.WriteString("\n")
 
+	width := m.pickerContentWidth()
+	narrow := m.width > 0 && width < 90
+
 	if len(m.status.Links) > 0 {
 		b.WriteString(titleStyle.Render("Ссылки для устройств"))
 		b.WriteString("\n")
 		for _, l := range m.status.Links {
-			b.WriteString(fmt.Sprintf("  %-28s %s\n", dimStyle.Render(l.Title), l.URI))
+			if narrow {
+				b.WriteString(narrowLinkLine(l.Title, l.URI, width))
+			} else {
+				b.WriteString(fmt.Sprintf("  %-28s %s\n", dimStyle.Render(l.Title), l.URI))
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -46,9 +59,13 @@ func (m *Model) statusView() string {
 		b.WriteString(titleStyle.Render("Upstream'ы"))
 		b.WriteString("\n")
 		for _, u := range m.status.Upstreams {
-			b.WriteString(fmt.Sprintf("  %-22s %-6s %-22s %8s  %s\n",
-				u.Name, u.Transport, u.Address,
-				formatLatency(u.LatencyMS), healthLabel(u)))
+			if narrow {
+				b.WriteString(narrowUpstreamLine(u, width))
+			} else {
+				b.WriteString(fmt.Sprintf("  %-22s %-6s %-22s %8s  %s\n",
+					u.Name, u.Transport, u.Address,
+					formatLatency(u.LatencyMS), healthLabel(u)))
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -104,6 +121,42 @@ func (m *Model) offlineView() string {
 	b.WriteString("  r         — попробовать переподключиться\n")
 	b.WriteString("  mdns setup — первичная настройка, если демон ещё не запускался\n")
 	return b.String()
+}
+
+// narrowLinkLine renders one device link on a single row, trimming the
+// title and the URI instead of letting lipgloss wrap them.
+func narrowLinkLine(title, uri string, width int) string {
+	const titleCol = 24
+	title = truncate(title, titleCol)
+	uriWidth := width - 2 - titleCol - 1
+	if uriWidth < 8 {
+		uriWidth = 8
+	}
+	uri = truncate(uri, uriWidth)
+	padding := strings.Repeat(" ", titleCol-len([]rune(title)))
+	return "  " + dimStyle.Render(title) + padding + " " + uri + "\n"
+}
+
+// narrowUpstreamLine packs one upstream into a single row at narrow
+// widths: name, transport, a truncated address, latency and state.
+func narrowUpstreamLine(u api.UpstreamStatus, width int) string {
+	const (
+		nameCol      = 18
+		transportCol = 6
+	)
+	latency := formatLatency(u.LatencyMS)
+	state := healthLabel(u)
+	used := 2 + nameCol + 1 + transportCol + 1 + 1 + len([]rune(latency)) + 2 + lipgloss.Width(state)
+	addressWidth := width - used
+	if addressWidth < 8 {
+		addressWidth = 8
+	}
+	name := truncate(u.Name, nameCol)
+	transport := truncate(u.Transport, transportCol)
+	address := truncate(u.Address, addressWidth)
+	return fmt.Sprintf("  %-*s %-*s %-*s %*s  %s\n",
+		nameCol, name, transportCol, transport, addressWidth, address,
+		len([]rune(latency)), latency, state)
 }
 
 // formatLatency renders a latency in milliseconds.

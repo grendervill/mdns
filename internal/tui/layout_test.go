@@ -6,6 +6,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"mydns/internal/api"
+	"mydns/internal/links"
 )
 
 // shellModel builds a loaded status model at the given terminal size
@@ -251,6 +254,168 @@ func TestShellFitsTerminalWidth(t *testing.T) {
 						size[0], size[1], tab.name, w, size[0], line)
 				}
 			}
+		}
+	}
+}
+
+// fullStatus is a status screen taller than an 80x24 terminal.
+func fullStatus() api.Status {
+	st := sampleStatus()
+	for i := 0; i < 14; i++ {
+		st.Upstreams = append(st.Upstreams, api.UpstreamStatus{
+			ID:        "up" + itoa(i),
+			Name:      "Provider " + itoa(i),
+			Transport: "plain",
+			Address:   "198.51.100." + itoa(i) + ":53",
+			Enabled:   true,
+			Healthy:   i%2 == 0,
+			LatencyMS: float64(10 + i),
+		})
+	}
+	return st
+}
+
+// TestShortTerminalKeepsChromeAndFits pins the whole shell to the
+// terminal: the header, rail and footer never scroll off, and the body
+// is clipped instead.
+func TestShortTerminalKeepsChromeAndFits(t *testing.T) {
+	m := New(&stubClient{status: fullStatus()}, Options{DisableAnimations: true})
+	m = step(m, statusLoadedMsg{st: fullStatus()})
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	if len(lines) > 24 {
+		t.Errorf("view has %d lines, want at most 24:\n%s", len(lines), view)
+	}
+	if !strings.HasPrefix(lines[0], "mdns") {
+		t.Errorf("the header scrolled off the first row: %q", lines[0])
+	}
+	// At 80 columns the rail is compact, so the active tab is "1 Ст".
+	if !strings.Contains(view, "1 Ст") {
+		t.Errorf("the rail lost the active tab:\n%s", view)
+	}
+	for _, tab := range screenTabs {
+		if !strings.Contains(view, tab.short) {
+			t.Errorf("the rail lost %q:\n%s", tab.short, view)
+		}
+	}
+	if !strings.Contains(view, "PgUp/PgDn — прокрутка") {
+		t.Errorf("the overflowing body has no scroll hint:\n%s", view)
+	}
+}
+
+// TestContentScrollKeys checks PgUp/PgDn move the body a page, clamp at
+// the edges and reset when the screen changes.
+func TestContentScrollKeys(t *testing.T) {
+	m := New(&stubClient{status: fullStatus()}, Options{DisableAnimations: true})
+	m = step(m, statusLoadedMsg{st: fullStatus()})
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	if m.contentOffset != 0 {
+		t.Fatalf("initial offset = %d, want 0", m.contentOffset)
+	}
+	m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.contentOffset == 0 {
+		t.Fatalf("PgDn did not advance the offset")
+	}
+	paged := m.contentOffset
+	m = step(m, tea.KeyMsg{Type: tea.KeyPgUp})
+	if m.contentOffset != 0 {
+		t.Errorf("PgUp offset = %d, want 0", m.contentOffset)
+	}
+
+	// Ctrl+D/Ctrl+U mirror the page keys.
+	m = step(m, tea.KeyMsg{Type: tea.KeyCtrlD})
+	if m.contentOffset != paged {
+		t.Errorf("ctrl+d offset = %d, want %d", m.contentOffset, paged)
+	}
+	m = step(m, tea.KeyMsg{Type: tea.KeyCtrlU})
+	if m.contentOffset != 0 {
+		t.Errorf("ctrl+u offset = %d, want 0", m.contentOffset)
+	}
+
+	// Repeated PgDn stops at the last page.
+	height, _, overflow := m.contentViewport(len(contentLines(m.viewContent())))
+	if !overflow {
+		t.Fatalf("the test status does not overflow")
+	}
+	max := len(contentLines(m.viewContent())) - height
+	for i := 0; i < 20; i++ {
+		m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	}
+	if m.contentOffset != max {
+		t.Errorf("clamped offset = %d, want %d", m.contentOffset, max)
+	}
+
+	// A screen switch clears the offset.
+	m = step(m, key('5'))
+	if m.contentOffset != 0 {
+		t.Errorf("offset = %d after switching screens, want 0", m.contentOffset)
+	}
+}
+
+// TestContentOffsetClampsOnResize checks a grown terminal drops a stale
+// offset instead of leaving the user on a blank page.
+func TestContentOffsetClampsOnResize(t *testing.T) {
+	m := New(&stubClient{status: fullStatus()}, Options{DisableAnimations: true})
+	m = step(m, statusLoadedMsg{st: fullStatus()})
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.contentOffset = 999
+
+	m = step(m, tea.WindowSizeMsg{Width: 200, Height: 80})
+	if m.contentOffset != 0 {
+		t.Errorf("offset = %d after growing the terminal, want 0", m.contentOffset)
+	}
+}
+
+// TestShortScreenHasNoScrollHint checks a body that fits advertises no
+// scrolling and ignores the page keys.
+func TestShortScreenHasNoScrollHint(t *testing.T) {
+	m := shellModel(t, 120, 40)
+	if strings.Contains(m.View(), "PgUp/PgDn — прокрутка") {
+		t.Errorf("a fitting body shows the scroll hint:\n%s", m.View())
+	}
+	m = step(m, tea.KeyMsg{Type: tea.KeyPgDown})
+	if m.contentOffset != 0 {
+		t.Errorf("PgDn moved a fitting body to offset %d", m.contentOffset)
+	}
+}
+
+// TestStatusNarrowKeepsOneLinePerUpstream checks that an 80-column
+// status truncates a long address and link instead of wrapping them.
+func TestStatusNarrowKeepsOneLinePerUpstream(t *testing.T) {
+	const longAddress = "resolver-with-a-very-long-name.example.net:853"
+	const longLink = "https://dns.example.com/dns-query?device=living-room-tv&token=abcdef"
+
+	st := sampleStatus()
+	st.Upstreams = []api.UpstreamStatus{{
+		ID: "long", Name: "Cloudflare", Transport: "dot", Address: longAddress,
+		Enabled: true, Healthy: true, LatencyMS: 12.5, Sent: 10,
+	}}
+	st.Links = []links.Link{{Proto: "doh", Title: "DoH для большого телевизора в гостиной", URI: longLink}}
+
+	m := New(&stubClient{status: st}, Options{DisableAnimations: true})
+	m = step(m, statusLoadedMsg{st: st})
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	view := m.View()
+	if strings.Contains(view, longAddress) || strings.Contains(view, longLink) {
+		t.Errorf("a narrow status still contains the untruncated value:\n%s", view)
+	}
+
+	content := strings.TrimRight(m.statusView(), "\n")
+	lines := strings.Split(content, "\n")
+	width := m.pickerContentWidth()
+	for i, line := range lines {
+		if w := lipgloss.Width(line); w > width {
+			t.Errorf("status line %d width = %d > %d: %q", i, w, width, line)
+		}
+		if !strings.Contains(line, "Cloudflare") {
+			continue
+		}
+		if i+1 < len(lines) && lines[i+1] != "" {
+			t.Errorf("the long address wrapped onto a second line: %q", lines[i+1])
 		}
 	}
 }

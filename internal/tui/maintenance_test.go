@@ -7,6 +7,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"mydns/internal/api"
 	"mydns/internal/auth"
@@ -367,6 +368,51 @@ func TestMaintenanceShowsVersionAndUptime(t *testing.T) {
 	m = step(m, statsLoadedMsg{err: errors.New("stats: daemon down")})
 	if view := m.View(); !strings.Contains(view, "uptime недоступен") {
 		t.Errorf("View() misses the stats error note:\n%s", view)
+	}
+}
+
+// TestMaintenanceVersionPrefixOnce pins the shared version formatting:
+// a daemon version that already carries the "v" prefix is not doubled.
+func TestMaintenanceVersionPrefixOnce(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg()}
+	m := maintenanceModel(sc, sc.cfg)
+	m = step(m, statusLoadedMsg{st: api.Status{Version: "v0.7.0", Domain: "dns.example.com"}})
+
+	view := m.View()
+	if !strings.Contains(view, "версия v0.7.0") {
+		t.Errorf("View() misses the version:\n%s", view)
+	}
+	if strings.Contains(view, "vv0.7.0") {
+		t.Errorf("View() doubles the version prefix:\n%s", view)
+	}
+}
+
+// TestMaintenanceFooterFits checks the long key line ends at the
+// terminal width and never cuts a word in the middle.
+func TestMaintenanceFooterFits(t *testing.T) {
+	sc := &stubClient{cfg: maintenanceCfg()}
+	m := maintenanceModel(sc, sc.cfg)
+	m = step(m, backupsLoadedMsg{backups: nil})
+
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	view := m.View()
+	lines := strings.Split(view, "\n")
+	footer := lines[len(lines)-1]
+	if w := lipgloss.Width(footer); w > 120 {
+		t.Errorf("footer width = %d > 120: %q", w, footer)
+	}
+	if !strings.Contains(footer, "p — пароль панели") {
+		t.Errorf("footer at 120 lost the tail entry: %q", footer)
+	}
+
+	m = step(m, tea.WindowSizeMsg{Width: 80, Height: 24})
+	lines = strings.Split(m.View(), "\n")
+	footer = lines[len(lines)-1]
+	if w := lipgloss.Width(footer); w > 80 {
+		t.Errorf("footer width = %d > 80: %q", w, footer)
+	}
+	if !strings.HasSuffix(footer, " …") {
+		t.Errorf("the shortened footer is not ellipsised at a key boundary: %q", footer)
 	}
 }
 
