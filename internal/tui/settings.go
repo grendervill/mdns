@@ -2,6 +2,8 @@ package tui
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -25,7 +27,10 @@ type settingField struct {
 
 // timezoneFieldName is the settings label of the timezone field; the
 // view uses it to render the example zones.
-const timezoneFieldName = "Часовой пояс (IANA, пусто = системный)"
+const (
+	timezoneFieldName = "Часовой пояс (IANA, пусто = системный)"
+	dohPathFieldName  = "Путь DoH"
+)
 
 // timezoneChoice is one row of the timezone picker; an empty value means
 // the server's own zone.
@@ -60,7 +65,7 @@ func (m *Model) settingsFields() []settingField {
 		intField("Порт plain", func(c *config.Config) *int { return &c.Protocols.Plain.Port }),
 		protocolToggle("Plain включён", func(c *config.Config) *config.Protocol { return &c.Protocols.Plain }),
 		intField("Порт DoH", func(c *config.Config) *int { return &c.Protocols.DoH.Port }),
-		stringAllowEmptyField("Путь DoH", func(c *config.Config) *string { return &c.Protocols.DoH.Path }),
+		stringAllowEmptyField(dohPathFieldName, func(c *config.Config) *string { return &c.Protocols.DoH.Path }),
 		protocolToggle("DoH включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoH }),
 		intField("Порт DoT", func(c *config.Config) *int { return &c.Protocols.DoT.Port }),
 		protocolToggle("DoT включён", func(c *config.Config) *config.Protocol { return &c.Protocols.DoT }),
@@ -330,6 +335,44 @@ func (m *Model) timezonePickerView() string {
 	return m.pickerView(&m.picker)
 }
 
+// randomDoHPath suggests a fresh DoH path client-side: the daemon does
+// not expose a generator, so the value is only staged until ctrl+s.
+func randomDoHPath() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "/dns-query"
+	}
+	return "/dns-query-" + hex.EncodeToString(b[:])
+}
+
+// timezonePickerChoices returns the preset zones plus, when the
+// configured zone is not among them, a dynamic row carrying the custom
+// value. «Своё…» stays the free-text entry, and «системный» is never
+// marked for a custom zone.
+func timezonePickerChoices(current string) []timezoneChoice {
+	out := append([]timezoneChoice(nil), timezoneChoices...)
+	if current == "" {
+		return out
+	}
+	for _, c := range timezoneChoices {
+		if !c.custom && c.value == current {
+			return out
+		}
+	}
+	custom := timezoneChoice{label: "Своё: " + current, value: current}
+	out = append(out[:len(out)-1], custom, out[len(out)-1])
+	return out
+}
+
+// timezoneChoicesFor is timezonePickerChoices for the staged config.
+func (m *Model) timezoneChoicesFor() []timezoneChoice {
+	current := ""
+	if m.settingsCfg != nil {
+		current = m.settingsCfg.Timezone
+	}
+	return timezonePickerChoices(current)
+}
+
 // openTimezonePicker opens the zone list on the configured value.
 func (m Model) openTimezonePicker() (tea.Model, tea.Cmd) {
 	if m.settingsCfg == nil {
@@ -338,7 +381,7 @@ func (m Model) openTimezonePicker() (tea.Model, tea.Cmd) {
 	m.pickerReturn = screenSettings
 	m.picker = picker{title: "Часовой пояс"}
 	m.timezonePickerItems()
-	for i, c := range timezoneChoices {
+	for i, c := range m.timezoneChoicesFor() {
 		if !c.custom && c.value == m.settingsCfg.Timezone {
 			m.picker.cursor = i
 		}
@@ -354,8 +397,9 @@ func (m *Model) timezonePickerItems() {
 	if m.settingsCfg != nil {
 		current = m.settingsCfg.Timezone
 	}
-	items := make([]pickerItem, 0, len(timezoneChoices))
-	for _, c := range timezoneChoices {
+	choices := m.timezoneChoicesFor()
+	items := make([]pickerItem, 0, len(choices))
+	for _, c := range choices {
 		status := ""
 		if !c.custom && c.value == current {
 			status = "сейчас"
@@ -434,10 +478,11 @@ func formatUTCOffset(offset int) string {
 // applyTimezonePick stages the highlighted zone in the settings copy and
 // returns; ctrl+s on the settings screen applies it.
 func (m Model) applyTimezonePick() (tea.Model, tea.Cmd) {
-	if m.picker.cursor < 0 || m.picker.cursor >= len(timezoneChoices) {
+	choices := m.timezoneChoicesFor()
+	if m.picker.cursor < 0 || m.picker.cursor >= len(choices) {
 		return m, nil
 	}
-	choice := timezoneChoices[m.picker.cursor]
+	choice := choices[m.picker.cursor]
 	m.screen = screenSettings
 	m.settleRail()
 

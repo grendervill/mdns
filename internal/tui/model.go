@@ -815,6 +815,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.removeSelectedFilterList()
 		case "e":
 			return m.toggleFilterEnabled()
+		case "x":
+			return m.openUserRules()
 		}
 
 	case screenFilterCatalog:
@@ -839,6 +841,20 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.picker.moveUp()
 		case "enter":
 			return m.applyModePick()
+		case "esc":
+			m.screen = screenFilters
+			m.settleRail()
+			m.filterErr = nil
+		}
+
+	case screenUserRules:
+		switch msg.String() {
+		case "j", "down":
+			m.picker.moveDown()
+		case "k", "up":
+			m.picker.moveUp()
+		case "enter":
+			return m.deleteSelectedUserRule()
 		case "esc":
 			m.screen = screenFilters
 			m.settleRail()
@@ -1000,6 +1016,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, applySettingsCmd(m.client, cloneConfig(m.settingsCfg))
 		case "w":
 			return m.openWizard()
+		case "g":
+			// Client-side DoH path suggestion: staged, applied by ctrl+s.
+			if m.settingsCfg == nil {
+				return m, m.lazyLoadCmd()
+			}
+			field := m.settingsFields()[m.settingsCursor]
+			if field.name != dohPathFieldName {
+				return m, nil
+			}
+			if err := commitSettingsField(field, m.settingsCfg, randomDoHPath()); err != nil {
+				m.settingsErr = err
+			} else {
+				m.settingsErr = nil
+			}
+			return m, nil
 		}
 
 	case screenMaintenance:
@@ -1214,6 +1245,8 @@ func (m *Model) screenView() string {
 		return m.catalogView()
 	case screenModePicker:
 		return m.modePickerView()
+	case screenUserRules:
+		return m.userRulesView()
 	case screenSettings:
 		return m.settingsView()
 	case screenTimezonePicker:
@@ -1242,7 +1275,7 @@ func (m Model) footerText() string {
 	case screenRequests:
 		return "q — выход · r — обновить · ? — помощь · пробел — пауза ленты · x — очистить · ↑↓ — прокрутка"
 	case screenFilters:
-		return "q — выход · r — правило · enter/u — обновить · m — режим · ? — помощь · ↑↓ — прокрутка"
+		return "q — выход · r — правило · x — правила · enter/u — обновить · m — режим · ? — помощь · ↑↓ — прокрутка"
 	case screenUpstreams:
 		return "space — вкл/выкл · d — удалить · p — приоритет · s — стратегия · t — проверить · a — каталог · c — свой · j/k — выбор · ? — помощь"
 	case screenUpstreamForm:
@@ -1253,8 +1286,10 @@ func (m Model) footerText() string {
 		return "j/k — выбор · enter — добавить/удалить · esc — назад · ? — помощь"
 	case screenStrategyPicker, screenModePicker, screenTimezonePicker, screenTransportPicker:
 		return "j/k — выбор · enter — выбрать · esc — назад · ? — помощь"
+	case screenUserRules:
+		return "j/k — выбор · enter — удалить правило · esc — назад · ? — помощь"
 	case screenSettings:
-		return "q — выход · r — обновить · enter — изменить · s — стратегия · ctrl+s — применить · ? — помощь"
+		return "q — выход · r — обновить · enter — изменить · s — стратегия · w — мастер · ctrl+s — применить · ? — помощь"
 	case screenMaintenance:
 		return "a — применить заново · c — создать · enter — восстановить · d — удалить · p — пароль панели · ? — помощь"
 	default:
@@ -1319,6 +1354,7 @@ func (m *Model) helpView() string {
 		"  e     включить или выключить фильтрацию",
 		"  m     режим блокировки: zero / nxdomain / refused",
 		"  r     добавить правило (block домен / allow домен)",
+		"  x     правила пользователя: список allow/block (enter — удалить)",
 		"  u     обновить все списки · enter — выбранный",
 		"",
 		titleStyle.Render("Upstream'ы (экран 4)"),
@@ -1339,7 +1375,8 @@ func (m *Model) helpView() string {
 		"",
 		titleStyle.Render("Настройки (экран 6)"),
 		"  enter — изменить поле (часовой пояс — список зон), ctrl+s — применить",
-		"  s     стратегия маршрутизации (список с описанием)",
+		"  s     стратегия маршрутизации (список с описанием; ctrl+s — применить)",
+		"  w     мастер настройки · g — подсказать путь DoH",
 		dimStyle.Render("  Часовой пояс: список зон, пусто — системная зона сервера"),
 		"  ?     эта справка",
 		"  q     выход",

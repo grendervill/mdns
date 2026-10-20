@@ -487,7 +487,8 @@ func TestFilterCatalogDetails(t *testing.T) {
 }
 
 // TestSettingsStrategyPicker checks that s on Settings opens the strategy
-// list, marks the current value and applies the chosen one.
+// list, marks the current value and stages the chosen one; ctrl+s then
+// applies it like the timezone picker.
 func TestSettingsStrategyPicker(t *testing.T) {
 	sc := &stubClient{}
 	m := New(sc, Options{Initial: "settings"})
@@ -510,9 +511,21 @@ func TestSettingsStrategyPicker(t *testing.T) {
 	if m.screen != screenSettings {
 		t.Errorf("screen = %v after Enter, want settings", m.screen)
 	}
+	if cmd != nil {
+		t.Errorf("staging the strategy returned a command")
+	}
+	if len(sc.updates) != 0 {
+		t.Fatalf("staging the strategy wrote the config: %+v", sc.updates)
+	}
+	if got := m.settingsCfg.Strategy; got != "random" {
+		t.Errorf("staged strategy = %q, want random", got)
+	}
+
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = updated.(Model)
 	m = drainCmd(t, m, cmd)
 	if len(sc.updates) != 1 || sc.updates[0].Strategy != "random" {
-		t.Fatalf("updates = %+v, want one random strategy write", sc.updates)
+		t.Fatalf("updates = %+v, want one random strategy write after ctrl+s", sc.updates)
 	}
 }
 
@@ -775,5 +788,160 @@ func TestFilterCatalogLargeCounts(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Errorf("catalog View() misses %q:\n%s", want, view)
 		}
+	}
+}
+
+// TestUserRulesPickerDeletes checks x on Filters: the picker lists the
+// allow and block rules with details, Enter deletes exactly the selected
+// row through UpdateConfig, and Esc returns.
+func TestUserRulesPickerDeletes(t *testing.T) {
+	cfg := config.Default()
+	cfg.Filter.UserAllow = []string{"allow.example.com"}
+	cfg.Filter.UserBlock = []string{"block.example.com", "ads.example.com"}
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "filters"})
+	m = step(m, filterConfigLoadedMsg{cfg: cfg})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	m = step(m, key('x'))
+	if m.screen != screenUserRules {
+		t.Fatalf("x opened %v, want the user-rules picker", m.screen)
+	}
+	view := m.View()
+	for _, want := range []string{"allow allow.example.com", "block block.example.com", "Тип: allow", "enter — удалить"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("rules picker misses %q:\n%s", want, view)
+		}
+	}
+
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 {
+		t.Fatalf("UpdateConfig calls = %d, want 1", len(sc.updates))
+	}
+	if got := sc.updates[0].Filter.UserAllow; len(got) != 0 {
+		t.Errorf("user_allow after delete = %v, want empty", got)
+	}
+	if got := sc.updates[0].Filter.UserBlock; len(got) != 2 {
+		t.Errorf("user_block changed: %v", got)
+	}
+
+	// The cursor now sits on the first block rule.
+	view = m.View()
+	if !strings.Contains(view, "block block.example.com") {
+		t.Fatalf("the block rules vanished after deleting the allow rule:\n%s", view)
+	}
+	updated, cmd = m.Update(enterKey())
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 2 {
+		t.Fatalf("UpdateConfig calls = %d, want 2", len(sc.updates))
+	}
+	if got := sc.updates[1].Filter.UserBlock; len(got) != 1 || got[0] != "ads.example.com" {
+		t.Errorf("user_block after delete = %v, want [ads.example.com]", got)
+	}
+
+	m = step(m, tea.KeyMsg{Type: tea.KeyEsc})
+	if m.screen != screenFilters {
+		t.Errorf("esc left the picker on %v, want filters", m.screen)
+	}
+}
+
+// TestTimezonePickerCustomZone checks a configured zone outside the
+// preset list gets its own current row and never marks «системный».
+func TestTimezonePickerCustomZone(t *testing.T) {
+	cfg := config.Default()
+	cfg.Timezone = "Australia/Sydney"
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "settings"})
+	m = step(m, configLoadedMsg{cfg: cfg})
+
+	m = moveToSettingsField(t, m, timezoneFieldName)
+	m = step(m, enterKey())
+	if m.screen != screenTimezonePicker {
+		t.Fatalf("screen = %v, want the timezone picker", m.screen)
+	}
+	items := m.timezoneChoicesFor()
+	if m.picker.cursor <= 0 || m.picker.cursor >= len(items) {
+		t.Fatalf("cursor = %d, want the dynamic custom row", m.picker.cursor)
+	}
+	if got := items[m.picker.cursor].value; got != "Australia/Sydney" {
+		t.Errorf("cursor row = %q, want Australia/Sydney", got)
+	}
+	if got := items[m.picker.cursor].label; !strings.Contains(got, "Australia/Sydney") {
+		t.Errorf("dynamic row label = %q, want the zone shown", got)
+	}
+	view := m.View()
+	if !strings.Contains(view, "Своё: Australia/Sydney") || !strings.Contains(view, "сейчас") {
+		t.Errorf("custom zone row is not marked current:\n%s", view)
+	}
+	if strings.HasPrefix(items[0].label, "Своё") {
+		t.Fatalf("test assumption broken: first row is the custom row")
+	}
+
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	if cmd != nil {
+		t.Errorf("picking the current custom zone returned a command")
+	}
+	if len(sc.updates) != 0 {
+		t.Errorf("picking the current custom zone wrote the config")
+	}
+	if m.settingsCfg.Timezone != "Australia/Sydney" {
+		t.Errorf("staged timezone = %q, want Australia/Sydney", m.settingsCfg.Timezone)
+	}
+}
+
+// TestFilterCatalogNeedsConfig checks Enter in the catalog before the
+// live config arrives reports the state instead of doing nothing.
+func TestFilterCatalogNeedsConfig(t *testing.T) {
+	m := New(&stubClient{}, Options{Initial: "filters"})
+	m = step(m, key('a'))
+	if m.screen != screenFilterCatalog {
+		t.Fatalf("a opened %v, want the catalog", m.screen)
+	}
+	updated, cmd := m.Update(enterKey())
+	m = updated.(Model)
+	if cmd == nil {
+		t.Errorf("enter without a config returned no reload command")
+	}
+	if m.filterErr == nil || !strings.Contains(m.filterErr.Error(), "не загружена") {
+		t.Errorf("filterErr = %v, want the not-loaded message", m.filterErr)
+	}
+	if !strings.Contains(m.View(), "не загружена") {
+		t.Errorf("the catalog view hides the not-loaded message:\n%s", m.View())
+	}
+}
+
+// TestSettingsFooterAndDoHPath checks the footer advertises the wizard
+// and g stages a generated DoH path without a write.
+func TestSettingsFooterAndDoHPath(t *testing.T) {
+	cfg := config.Default()
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "settings"})
+	m = step(m, configLoadedMsg{cfg: cfg})
+	m = step(m, tea.WindowSizeMsg{Width: 170, Height: 40})
+
+	if view := m.View(); !strings.Contains(view, "w — мастер") {
+		t.Errorf("settings footer misses the wizard key:\n%s", view)
+	}
+
+	m = moveToSettingsField(t, m, dohPathFieldName)
+	before := m.settingsCfg.Protocols.DoH.Path
+	m = step(m, key('g'))
+	after := m.settingsCfg.Protocols.DoH.Path
+	if after == before || !strings.HasPrefix(after, "/dns-query-") {
+		t.Errorf("g suggested %q, want a fresh /dns-query-… path", after)
+	}
+	if len(sc.updates) != 0 {
+		t.Errorf("g wrote the config without ctrl+s")
+	}
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+	if len(sc.updates) != 1 || sc.updates[0].Protocols.DoH.Path != after {
+		t.Errorf("ctrl+s did not apply the suggested path: %+v", sc.updates)
 	}
 }

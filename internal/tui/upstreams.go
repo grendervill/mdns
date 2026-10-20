@@ -897,11 +897,12 @@ func (m Model) applyStrategyPick() (tea.Model, tea.Cmd) {
 			m.settingsErr = errors.New("конфигурация ещё не загружена")
 			return m, loadConfig(m.client)
 		}
+		// Stage the choice like the timezone picker: ctrl+s applies it.
 		next := cloneConfig(m.settingsCfg)
 		next.Strategy = strategy
 		m.settingsCfg = next
 		m.settingsErr = nil
-		return m, applySettingsCmd(m.client, cloneConfig(next))
+		return m, nil
 	}
 
 	m.screen = screenUpstreams

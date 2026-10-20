@@ -265,7 +265,7 @@ func (m *Model) filtersView() string {
 
 	b.WriteString("\n")
 	b.WriteString(dimStyle.Render("enter — обновить список · u — обновить все · m — режим блокировки") + "\n")
-	b.WriteString(dimStyle.Render("a — каталог · c — свой список · d — удалить · e — вкл/выкл · r — правило") + "\n")
+	b.WriteString(dimStyle.Render("a — каталог · c — свой список · d — удалить · x — правила · e — вкл/выкл · r — правило") + "\n")
 
 	if m.inputActive {
 		switch m.inputMode {
@@ -353,6 +353,94 @@ func (m *Model) filterStatusByID(id string) *filter.ListStatus {
 		}
 	}
 	return nil
+}
+
+// userRule is one allow/block entry of the live config; index is its
+// position in the matching slice.
+type userRule struct {
+	kind   string // "allow" or "block"
+	index  int
+	domain string
+}
+
+// userRuleRows lists the user rules in render order: allow rules first,
+// then block rules.
+func (m *Model) userRuleRows() []userRule {
+	if m.filterCfg == nil {
+		return nil
+	}
+	out := make([]userRule, 0, len(m.filterCfg.Filter.UserAllow)+len(m.filterCfg.Filter.UserBlock))
+	for i, d := range m.filterCfg.Filter.UserAllow {
+		out = append(out, userRule{kind: "allow", index: i, domain: d})
+	}
+	for i, d := range m.filterCfg.Filter.UserBlock {
+		out = append(out, userRule{kind: "block", index: i, domain: d})
+	}
+	return out
+}
+
+// userRulesView renders the user-rule picker.
+func (m *Model) userRulesView() string {
+	m.userRulesPicker()
+	return m.pickerView(&m.picker)
+}
+
+// openUserRules opens the allow/block rule list on the filters screen.
+func (m Model) openUserRules() (tea.Model, tea.Cmd) {
+	if m.filterCfg == nil {
+		m.filterErr = errors.New("конфигурация ещё не загружена")
+		return m, loadFilterConfig(m.client)
+	}
+	m.pickerReturn = screenFilters
+	m.picker = picker{title: "Правила пользователя"}
+	m.userRulesPicker()
+	m.filterErr = nil
+	m.screen = screenUserRules
+	m.settleRail()
+	return m, nil
+}
+
+// userRulesPicker fills the rows; every row's details name the action
+// Enter performs so a delete is never blind.
+func (m *Model) userRulesPicker() {
+	rows := m.userRuleRows()
+	items := make([]pickerItem, 0, len(rows))
+	for _, r := range rows {
+		label := r.kind + " " + r.domain
+		status := ""
+		details := []string{
+			"Тип: " + r.kind + " (правило пользователя)",
+			"Домен: " + r.domain,
+			"",
+			"enter — удалить это правило и применить конфигурацию.",
+			"Списки фильтра не затрагиваются.",
+		}
+		items = append(items, pickerItem{Label: label, Status: status, Details: details})
+	}
+	m.picker.setItems(items)
+}
+
+// deleteSelectedUserRule removes the rule under the cursor from the live
+// config copy and applies it. Duplicates are deleted one at a time by
+// their exact index.
+func (m Model) deleteSelectedUserRule() (tea.Model, tea.Cmd) {
+	rows := m.userRuleRows()
+	if m.picker.cursor < 0 || m.picker.cursor >= len(rows) {
+		return m, nil
+	}
+	if m.filterCfg == nil {
+		m.filterErr = errors.New("конфигурация ещё не загружена")
+		return m, loadFilterConfig(m.client)
+	}
+	row := rows[m.picker.cursor]
+	next := cloneConfig(m.filterCfg)
+	if row.kind == "allow" {
+		next.Filter.UserAllow = append(next.Filter.UserAllow[:row.index], next.Filter.UserAllow[row.index+1:]...)
+	} else {
+		next.Filter.UserBlock = append(next.Filter.UserBlock[:row.index], next.Filter.UserBlock[row.index+1:]...)
+	}
+	m.filterErr = nil
+	return m.applyFilterCfg(next)
 }
 
 // modePickerView renders the block-mode picker.
@@ -471,7 +559,11 @@ func (m Model) applyFilterCfg(next *config.Config) (tea.Model, tea.Cmd) {
 // toggleCatalogList adds the highlighted catalog list or removes it.
 func (m Model) toggleCatalogList() (tea.Model, tea.Cmd) {
 	entries := filter.Catalog()
-	if m.filterCfg == nil || m.picker.cursor < 0 || m.picker.cursor >= len(entries) {
+	if m.filterCfg == nil {
+		m.filterErr = errors.New("конфигурация ещё не загружена")
+		return m, loadFilterConfig(m.client)
+	}
+	if m.picker.cursor < 0 || m.picker.cursor >= len(entries) {
 		return m, nil
 	}
 	id := entries[m.picker.cursor].ID
