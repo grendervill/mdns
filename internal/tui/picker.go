@@ -235,6 +235,9 @@ func (p *picker) listPane(width, height int) string {
 	if len(lines) > height {
 		lines = lines[:height]
 	}
+	for i, line := range lines {
+		lines[i] = lipgloss.NewStyle().Width(inner).Render(line)
+	}
 	return paneStyle.Render(strings.Join(lines, "\n"))
 }
 
@@ -305,6 +308,9 @@ func (p *picker) detailPane(width, height int) string {
 	}
 	for len(lines) < height {
 		lines = append(lines, "")
+	}
+	for i, line := range lines {
+		lines[i] = lipgloss.NewStyle().Width(inner).Render(line)
 	}
 	return paneStyle.Render(strings.Join(lines, "\n"))
 }

@@ -409,6 +409,12 @@ func (m *Model) userRuleRows() []userRule {
 // userRulesView renders the user-rule picker, with a failed deletion's
 // error pinned above the rows so Esc cannot hide it unseen.
 func (m *Model) userRulesView() string {
+	if m.filterErr == nil && len(m.userRuleRows()) == 0 {
+		// An empty two-pane picker would render two tiny boxes and hide
+		// its own hint; a plain message is clearer and keeps the footer.
+		return titleStyle.Render("Правила пользователя") + "\n\n" +
+			dimStyle.Render("Правил пока нет — r добавит правило allow/block.") + "\n"
+	}
 	m.userRulesPicker()
 	if m.filterErr == nil {
 		return m.pickerView(&m.picker)
