@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -329,7 +330,7 @@ func (m *Model) filterCatalogPicker() {
 			details = append(details, "Статус: не установлен — enter добавит список.")
 		}
 		if live := m.filterStatusByID(e.ID); live != nil {
-			applied, skipped := itoa(live.Applied), itoa(live.Skipped)
+			applied, skipped := strconv.Itoa(live.Applied), strconv.Itoa(live.Skipped)
 			details = append(details, "Правил: применено "+applied+" · пропущено "+skipped)
 			if live.Error != "" {
 				details = append(details, "Ошибка: "+live.Error)

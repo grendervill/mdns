@@ -262,7 +262,11 @@ func (m Model) headerStatus() string {
 		return ""
 	}
 	if m.status.Version != "" {
-		return "v" + m.status.Version + " · подключено"
+		version := m.status.Version
+		if !strings.HasPrefix(version, "v") {
+			version = "v" + version
+		}
+		return version + " · подключено"
 	}
 	return "подключено"
 }

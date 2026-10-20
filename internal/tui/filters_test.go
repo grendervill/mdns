@@ -751,3 +751,29 @@ func TestHelpMentionsFilterKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestFilterCatalogLargeCounts pins the regression where the tiny itoa
+// helper (four-byte buffer) panicked on list counters with five or more
+// digits.
+func TestFilterCatalogLargeCounts(t *testing.T) {
+	cfg := config.Default()
+	cfg.Filter.Lists = []config.FilterList{{ID: "adguard-dns-filter"}}
+	sc := &stubClient{cfg: cfg}
+	m := New(sc, Options{Initial: "filters"})
+	m = step(m, filterConfigLoadedMsg{cfg: cfg})
+	m = step(m, filterLoadedMsg{lists: []filter.ListStatus{{
+		ID: "adguard-dns-filter", Applied: 185628, Skipped: 25347,
+	}}})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	updated, cmd := m.Update(key('a'))
+	m = updated.(Model)
+	m = drainCmd(t, m, cmd)
+
+	view := m.View()
+	for _, want := range []string{"применено 185628", "пропущено 25347"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("catalog View() misses %q:\n%s", want, view)
+		}
+	}
+}

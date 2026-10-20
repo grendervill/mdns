@@ -501,3 +501,19 @@ func TestTUIWizardParkedProbes(t *testing.T) {
 		t.Errorf("reopening the wizard did not restart the probes")
 	}
 }
+
+// TestHeaderPrintsVersionOnce pins that a version string that already
+// carries the "v" prefix is not shown as "vv…" in the shell header.
+func TestHeaderPrintsVersionOnce(t *testing.T) {
+	m := New(&stubClient{}, Options{})
+	m = step(m, statusLoadedMsg{st: api.Status{Domain: "dns.example.com", Version: "v0.8.0"}})
+	m = step(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+
+	view := m.View()
+	if !strings.Contains(view, "v0.8.0") {
+		t.Fatalf("the header does not show the version:\n%s", view)
+	}
+	if strings.Contains(view, "vv0.8.0") {
+		t.Errorf("the header doubles the version prefix:\n%s", view)
+	}
+}
